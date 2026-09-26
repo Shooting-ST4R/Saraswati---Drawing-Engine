@@ -36,6 +36,7 @@ struct Layer {
   float opacity = 1.0f;
   BlendMode mode = BlendMode::Normal;
   bool lockAlpha = false;  // paint only where the layer already has pixels
+  uint32_t parentId = 0;   // sublayer of this layer (e.g. a speech bubble under its text); moves with it
   // conservative bounds of painted pixels (empty when x0 >= x1)
   int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
   // small preview for the layer panel (rendered on the GPU)
@@ -145,6 +146,7 @@ class Renderer {
   void deleteLayer(int index);
   void moveLayer(int index, int delta) { moveLayerTo(index, index + delta); }
   void moveLayerTo(int from, int to);  // one undo step
+  void reorderLayers(const std::vector<uint32_t>& idsBottomToTop);  // one undo step
   int indexOf(uint32_t id) const { return findLayer(id); }
   void closeDocument() { destroyDocument(); runDeferred(true); }
   void recordLayerProps(int index);  // call before changing name/visibility/opacity/mode/lock (undo step)

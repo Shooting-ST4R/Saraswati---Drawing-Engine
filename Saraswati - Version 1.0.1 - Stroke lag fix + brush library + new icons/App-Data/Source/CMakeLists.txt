@@ -116,6 +116,7 @@ add_executable(Saraswati WIN32
   src/edit_ops.cpp
   src/text.cpp
   src/text_tool.cpp
+  src/bubble.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp

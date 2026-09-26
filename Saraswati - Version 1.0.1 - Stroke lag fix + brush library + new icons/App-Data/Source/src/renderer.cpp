@@ -1115,6 +1115,27 @@ void Renderer::moveLayerTo(int index, int j) {
   cachesDirty = true;
 }
 
+void Renderer::reorderLayers(const std::vector<uint32_t>& ids) {
+  if (ids.size() != layers.size()) return;
+  bool same = true;
+  for (size_t i = 0; i < ids.size(); ++i) same &= layers[i].id == ids[i];
+  if (same) return;
+  UndoEntry e;
+  e.kind = UndoKind::Order;
+  for (auto& l : layers) e.order.push_back(l.id);
+  std::vector<Layer> next;
+  next.reserve(layers.size());
+  for (uint32_t id : ids) {
+    int i = indexOf(id);
+    if (i < 0) return;  // unknown id: leave everything as it is
+    next.push_back(std::move(layers[size_t(i)]));
+    layers[size_t(i)].id = 0;
+  }
+  pushUndo(std::move(e));
+  layers = std::move(next);
+  cachesDirty = true;
+}
+
 bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* rgba, std::string& err) {
   if (index < 0 || index >= int(layers.size())) return false;
   // clip to the document

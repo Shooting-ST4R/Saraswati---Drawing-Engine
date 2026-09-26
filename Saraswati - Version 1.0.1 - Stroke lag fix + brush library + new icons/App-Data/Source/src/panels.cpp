@@ -367,3 +367,64 @@ void App::drawToolGroup() {
   drawBrushLibraryButtons();
   ImGui::End();
 }
+
+// ---------------------------------------------------------------------------
+// Sublayers
+
+uint32_t App::topLevelId(int index) const {
+  const Layer& l = R.layers[size_t(index)];
+  return isSublayer(l) ? l.parentId : l.id;
+}
+
+// top-level order (bottom to top) -> full order with every sublayer right below its parent
+void App::applyTopOrder(const std::vector<uint32_t>& top) {
+  std::vector<uint32_t> ids;
+  for (uint32_t t : top) {
+    for (const Layer& l : R.layers)
+      if (isSublayer(l) && l.parentId == t) ids.push_back(l.id);
+    ids.push_back(t);
+  }
+  uint32_t act = R.layers[size_t(active)].id;
+  R.reorderLayers(ids);
+  active = std::max(0, R.indexOf(act));
+}
+
+static std::vector<uint32_t> topOrder(const Renderer& R) {
+  std::vector<uint32_t> top;
+  for (const Layer& l : R.layers)
+    if (!(l.parentId && R.indexOf(l.parentId) >= 0)) top.push_back(l.id);
+  return top;
+}
+
+void App::moveLayerBlock(int index, int dir) {
+  std::vector<uint32_t> top = topOrder(R);
+  auto it = std::find(top.begin(), top.end(), topLevelId(index));
+  if (it == top.end()) return;
+  size_t i = size_t(it - top.begin());
+  if (dir > 0 && i + 1 < top.size()) std::swap(top[i], top[i + 1]);
+  else if (dir < 0 && i > 0) std::swap(top[i], top[i - 1]);
+  else return;
+  applyTopOrder(top);
+}
+
+void App::dropLayerBlock(int from, int onto) {
+  if (from == onto) return;
+  std::vector<uint32_t> top = topOrder(R);
+  uint32_t a = topLevelId(from), b = topLevelId(onto);
+  if (a == b) return;
+  top.erase(std::find(top.begin(), top.end(), a));
+  auto pos = std::find(top.begin(), top.end(), b);
+  top.insert(from < onto ? pos + 1 : pos, a);  // dragged up: above the target, down: below it
+  applyTopOrder(top);
+}
+
+void App::deleteLayerBlock(int index) {
+  uint32_t id = R.layers[size_t(index)].id;
+  std::vector<uint32_t> kids;
+  for (const Layer& l : R.layers)
+    if (l.parentId == id) kids.push_back(l.id);
+  if (R.layers.size() <= 1 + kids.size()) return;
+  for (uint32_t k : kids) R.deleteLayer(R.indexOf(k));
+  R.deleteLayer(R.indexOf(id));
+  active = std::clamp(active, 0, int(R.layers.size()) - 1);
+}

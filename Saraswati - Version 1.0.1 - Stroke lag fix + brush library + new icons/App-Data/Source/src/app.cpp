@@ -791,10 +791,17 @@ void App::drawLayerPanel() {
     if (ImGui::BeginDragDropTarget()) {
       if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("SARASWATI_LAYER")) {
         int from = *static_cast<const int*>(pl->Data);
-        R.moveLayerTo(from, i);
-        active = i;
+        active = from;
+        dropLayerBlock(from, i);
       }
       ImGui::EndDragDropTarget();
+    }
+    float ind = 0;
+    if (isSublayer(l)) {  // sublayer: thumbnail and name indented, with a connector to its parent above
+      ind = 18;
+      ImU32 lc = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+      dl->AddLine(ImVec2(p.x + 36, p.y - 2), ImVec2(p.x + 36, p.y + rowH / 2), lc, 1.5f);
+      dl->AddLine(ImVec2(p.x + 36, p.y + rowH / 2), ImVec2(p.x + 30 + ind, p.y + rowH / 2), lc, 1.5f);
     }
     // eye (visibility)
     ImGui::SetCursorScreenPos(ImVec2(p.x + 2, p.y + (rowH - 22) / 2));
@@ -808,7 +815,7 @@ void App::drawLayerPanel() {
       float a = float(l.thumb.width) / float(l.thumb.height);
       if (a >= 1) th = thumb / a; else tw = thumb * a;
     }
-    ImVec2 t0(p.x + 30 + (thumb - tw) / 2, p.y + 3 + (thumb - th) / 2), t1(t0.x + tw, t0.y + th);
+    ImVec2 t0(p.x + 30 + ind + (thumb - tw) / 2, p.y + 3 + (thumb - th) / 2), t1(t0.x + tw, t0.y + th);
     dl->AddRectFilled(t0, t1, IM_COL32(205, 205, 205, 255));
     for (float yy = 0; yy < th; yy += 6)
       for (float xx = (int(yy / 6) % 2) * 6.0f; xx < tw; xx += 12)
@@ -816,7 +823,7 @@ void App::drawLayerPanel() {
     if (l.thumbTex) dl->AddImage(ImTextureRef(ImTextureID(uint64_t(l.thumbTex))), t0, t1);
     dl->AddRect(t0, t1, ImGui::GetColorU32(ImGuiCol_Border));
     // name + details
-    float tx = p.x + 38 + thumb;
+    float tx = p.x + 38 + ind + thumb;
     dl->AddText(ImVec2(tx, p.y + rowH / 2 - ImGui::GetTextLineHeight() - 1), ImGui::GetColorU32(ImGuiCol_Text), l.name.c_str());
     char info[96];
     snprintf(info, sizeof info, "%s  %.0f%%%s", blendModeName(l.mode), l.opacity * 100, l.lockAlpha ? "  locked" : "");
@@ -857,14 +864,11 @@ void App::drawLayerPanel() {
       if (i < 0) error(err); else active = i;
     }
     ImGui::SameLine();
-    if (iconBtn("##del", "Delete layer (undoable)", R.layers.size() > 1, 2)) {
-      R.deleteLayer(active);
-      active = std::min(active, int(R.layers.size()) - 1);
-    }
+    if (iconBtn("##del", "Delete layer (undoable)", R.layers.size() > 1, 2)) deleteLayerBlock(active);
     ImGui::SameLine();
-    if (iconBtn("##up", "Move layer up", active + 1 < int(R.layers.size()), 3)) { R.moveLayer(active, 1); ++active; }
+    if (iconBtn("##up", "Move layer up", active + 1 < int(R.layers.size()), 3)) moveLayerBlock(active, 1);
     ImGui::SameLine();
-    if (iconBtn("##down", "Move layer down", active > 0, 4)) { R.moveLayer(active, -1); --active; }
+    if (iconBtn("##down", "Move layer down", active > 0, 4)) moveLayerBlock(active, -1);
     ImGui::SameLine();
     char cnt[32];
     snprintf(cnt, sizeof cnt, "%d / %d", int(R.layers.size()), R.limit.maxLayers);
@@ -1413,6 +1417,7 @@ void App::drawUI() {
   }
   drawToolOverlay();
   drawSelectionBar();
+  drawBubbleButtons();
   drawAdjustDialog();
   if (growPopup) { ImGui::OpenPopup("Grow / shrink selection"); growPopup = false; }
   if (ImGui::BeginPopupModal("Grow / shrink selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -2158,7 +2163,7 @@ int App::run() {
     pollFlood();
     pollClipboard();
     if (textEdit.active) {
-      if (textEdit.dirty || !(textEdit.shownStyle == textStyle) || textEdit.shownColor[0] != color[0] ||
+      if (textEdit.dirty || !(textEdit.shownStyle == textStyle) || !(textEdit.shownBubble == bubbleStyle) || textEdit.shownColor[0] != color[0] ||
           textEdit.shownColor[1] != color[1] || textEdit.shownColor[2] != color[2])
         updateTextPreview();
       if (!ImGui::GetIO().WantTextInput && !SDL_TextInputActive(window)) SDL_StartTextInput(window);

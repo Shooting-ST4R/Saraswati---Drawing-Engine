@@ -5,6 +5,7 @@
 #include "renderer.h"
 #include "shortcuts.h"
 #include "text.h"
+#include "bubble.h"
 #include <map>
 #include <array>
 #include <cstring>
@@ -364,10 +365,38 @@ class App {
     std::vector<std::pair<std::u32string, int>> history;
     TextStyle shownStyle;
     float shownColor[3] = {-1, -1, -1};
+    bool reedit = false;
+    int editUndos = 0;                // undo steps made when the edit started (Cancel undoes them)
+    TextStyle savedStyle;
+    BubbleStyle savedBubble, shownBubble;
+    // speech bubble
+    uint32_t bubbleLayerId = 0;
+    std::vector<BubbleTail> tails;
+    BubbleTail curTail;
+    bool tailMode = false, tailDrawing = false;
+    int shownX = 0, shownY = 0;
+    uint32_t shownW = 0, shownH = 0;  // bubble area uploaded to the bubble layer
   } textEdit;
+  BubbleStyle bubbleStyle;
+  void renderTextBubble(BubbleImage& img);
+  void clearBubblePreview();
+  bool ensureBubbleLayer();
+  void updateBubblePreview();
+  void drawBubbleSettings();
+  void drawBubbleButtons();
+  // sublayers (e.g. a bubble under its text): always directly below their parent, move with it
+  bool isSublayer(const Layer& l) const { return l.parentId && R.indexOf(l.parentId) >= 0; }
+  uint32_t topLevelId(int index) const;
+  void moveLayerBlock(int index, int dir);    // up (+1) / down (-1) past the neighbouring block
+  void dropLayerBlock(int from, int onto);    // drag and drop in the layer list
+  void deleteLayerBlock(int index);
+  void applyTopOrder(const std::vector<uint32_t>& top);
   struct TextObject {
     TextBox box;
     TextStyle style;
+    BubbleStyle bubble;
+    std::vector<BubbleTail> tails;
+    uint32_t bubbleLayerId = 0;
     float color[3] = {0, 0, 0};
     uint64_t docSerial = 0;
   };

@@ -1341,6 +1341,32 @@ void App::buildToolTest() {
     fprintf(stderr, "texttest: layers %zu, active '%s'\n", R.layers.size(), R.layers[active].name.c_str());
   });
   demo.push_back([] {});
+  // speech bubble with a freehand tail, committed as text layer + bubble sublayer
+  demo.push_back([this] {
+    commitText();
+    textStyle = TextStyle{};
+    textStyle.size = 28;
+    textStyle.align = 1;
+    bubbleStyle = BubbleStyle{};
+    bubbleStyle.enabled = true;
+    color[0] = color[1] = color[2] = 0.05f;
+    setTool(ToolId::Text);
+    textDown(800, 660);
+    textUp(800, 660);
+    textInsert(U"Hello!\nIs this a bubble?");
+  });
+  demo.push_back([] {});
+  demo.push_back([this] {
+    textEdit.tails.push_back({{800, 700}, {760, 760}, {700, 820}, {640, 850}, {600, 870}});
+    textEdit.dirty = true;
+  });
+  demo.push_back([] {});
+  demo.push_back([this] {
+    commitText();
+    const Layer& t = R.layers[size_t(active)];
+    const Layer& b = R.layers[size_t(active - 1)];
+    fprintf(stderr, "bubbletest: '%s' over '%s' (sublayer %s)\n", t.name.c_str(), b.name.c_str(), b.parentId == t.id ? "yes" : "NO");
+  });
   // keyboard: tap switches tools, hold (used on the canvas) returns to the previous tool
   demo.push_back([this] {
     auto key = [&](SDL_Keycode k, bool down, SDL_Keymod mod = 0) {
