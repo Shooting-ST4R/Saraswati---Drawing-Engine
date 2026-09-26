@@ -1,44 +1,61 @@
-# Saraswati — Version 1.0.0 (beta)
+# Saraswati — Version 1.1.0 (beta)
 
 A native painting app (Windows first, Linux second) built around a Vulkan GPU brush engine
 designed for **no perceptible pen lag**, even on 30,000 × 30,000 px canvases with 5,000 px
-brushes. Architecture: [DESIGN.md](DESIGN.md).
+brushes. Architecture: [DESIGN.md](DESIGN.md). What changed in each version:
+`../Version Feature Log.txt`.
 
-## What's in 1.0.0
+## What's in 1.1.0
 
-- **Brushes:** Hard Round, Textured Pen (paper grain fixed to the canvas), Soft Round (airbrush
-  build-up). Size 1–5000 px, opacity, flow, spacing, hardness, texture, pressure → size / opacity,
-  pressure curve, eraser (also the pen's eraser end). No smoothing is added to your strokes.
+- **Brushes:** a library of 22 brushes in groups (pencils, G-Pen, mapping pen, markers, flat /
+  dry brushes, chalk, charcoal, airbrushes, sprays, erasers) in the *Tool Group* panel; size
+  1–5000 px, opacity, flow, spacing, hardness, roundness, angle, paper texture, scatter, jitter,
+  spray particles, pressure → size / opacity with a pressure curve. Save your own brushes.
+  No smoothing is added to your strokes; zoomed-out strokes follow a smooth curve through the
+  pen samples. Keys 1–9 pick brushes.
+- **Brush import:** Photoshop **.abr** and Clip Studio Paint **.sut** brushes, also **.zip**
+  packs (*File › Import brushes*, or drag them onto the window). Tip images, textures, dual tips
+  and dynamics are converted; a report lists anything that is only approximated.
 - **Pen tablets:** pressure through Windows Ink (Wacom / Cintiq / XP-Pen / Huion …) and
-  XInput2 / Wayland on Linux. In the *Wacom Tablet Properties* keep **"Use Windows Ink"** switched
-  on (it is on by default), otherwise Windows only reports a mouse without pressure.
-- **Tools:** brush, eyedropper (also Alt+click), fill (bucket), gradient, line, rectangle,
-  ellipse (outline or filled), rectangle / ellipse / lasso / magic-wand selection, move /
-  transform (scale, rotate, 4-corner distort, flip), hand.
-- **Layers:** thumbnails, new, duplicate, delete, drag-to-reorder, visibility, opacity, rename,
-  lock transparency, and all 28 Clip Studio
-  Paint **blend modes** (Normal … Brightness). All layers live in GPU memory; the maximum layer
-  count is computed from your VRAM and the document size and shown in *New Document* and *Layers*.
-- **Undo / redo** (50 steps, kept in system RAM) for strokes, fills, transforms and layer
-  operations (add, delete, duplicate, reorder, visibility, opacity, blend mode, rename, lock).
-  Selection changes are undoable too; undoing back to the last save clears the `*`.
-- **Safety:** unsaved changes are marked with `*` in the title; quitting, *New* and *Open* ask to
-  save first. Saves are atomic (written to a temporary file, then swapped in).
-- **Files:** open and save **PSD** (and **PSB** for documents over 30,000 px or 4 GB) with layers,
-  names, opacity, visibility and blend modes — the exchange format with Photoshop, Clip Studio
-  Paint, Krita etc. Open / import **PNG, JPEG, GIF (first frame), WebP, SVG, BMP, TGA**; drag files
-  onto the window to import them as layers (Ctrl+drop opens as a new document).
-- **Interface:** dockable panels — drag a panel's tab to an edge to snap it, onto another panel to
-  combine them as tabs, drag the separators to resize; *Window › Reset layout* restores the default.
-  Neutral-grey theme so the UI does not tint your colour perception. Tab hides all panels.
-  The layout, brush settings, colours and last folder are remembered in `User-Data/settings/`.
-- **Colour panel:** HSV wheel, foreground/background swatches (X swaps), hex entry, H/S/V in
-  degrees/percent, recently used colours. Status bar with tool, cursor position, zoom and rotation.
-- **Performance panel** (FPS, GPU time per stage, input → present latency, VRAM, undo RAM,
-  present mode) and a built-in **benchmark**.
+  XInput2 / Wayland on Linux. In the *Wacom Tablet Properties* keep **"Use Windows Ink"** on.
+- **Tools:** brush, eraser, eyedropper, fill, gradient, line, rectangle, ellipse, rectangle /
+  ellipse / lasso / magic-wand selection with a CSP-style selection bar, move / transform, hand,
+  **text**. Holding a tool's key uses it only while held (spring-loaded); Space always pans.
+- **Text:** every installed font; size, leading, kerning, tracking, horizontal / vertical scale,
+  baseline shift, skew, all caps, underline, strike-through, alignment, indents, paragraph
+  spacing. Text stays editable (also after saving and reopening).
+- **Speech bubbles (manga):** switch on *Bubble* in the text tool — a bubble is built around the
+  text live (shape, distance, fill, border colour / width, opacity). The small tail button next to
+  the bubble draws a tail, straight or freehand. The bubble is a sublayer of its text layer.
+- **Layers:** folders with their own blend mode and opacity (or pass-through), clipping
+  ("clip to layer below") for layers and folders, all 28 CSP blend modes, a **Paper** layer (one
+  colour, always at the bottom), lock transparency, thumbnails. *Layer Properties*: the manga
+  **tone** effect (30 dot shapes: round, oval, square, diamond, line, cross, noise …; frequency,
+  angle, density) and the non-destructive **layer colour** effect.
+- **Files:** open / save **PSD** (and **PSB** for huge documents) with layers, folders, clipping,
+  blend modes and Saraswati's own extras (tone, layer colour, editable text and bubbles). Every
+  save is read back and compared before it replaces the old file. Open / import PNG, JPEG, GIF,
+  WebP, SVG, BMP, TGA; drag images onto the canvas or the Layers panel to add them as a layer
+  (also straight from a web browser).
+- **Version Save and Batch Export** (buttons in the top bar):
+  - New pictures are named `2026 09 22 - name - Version 1.psd`. The date is when the picture was
+    started and never changes. **Version Save** (Ctrl+Alt+S) writes `Version 2`, `3` … next to
+    it.
+  - **Batch Export** (Ctrl+Alt+E) writes a list of images next to the .psd in one go, by default
+    `… - S100% Q100.jpg`, `… - S100%.png`, `… - S50% Q95.jpg` and `… - S50%.png`. S is the size,
+    Q the JPEG / WebP quality; the extension is the format.
+  - Right-click the button (or *File › Batch Export settings*) to choose which files are made —
+    JPEG, PNG or WebP (lossy or lossless), any size and quality. The list is remembered.
+- **Automatic backups** every 5 minutes (adjustable) in the background, without any dialog or
+  pause; after a crash the next start offers to restore. *File › Restore from backup* lists all
+  versions.
+- **View:** flip the view horizontally / vertically (only the view — the picture is not changed),
+  rotate, zoom, Navigator panel. FPS limit (120 by default) in *Preferences › Performance*.
+- **Interface:** dockable panels, neutral-grey theme, rebindable shortcuts (*Preferences ›
+  Shortcuts*), preferences for pen buttons, backups, interface size, FPS limit.
 
-Not yet (see `../Possible Feature List.txt`): native `.clip` files, layer folders / masks, text,
-mesh warp / liquify, selection undo, multi-GPU.
+Not yet (see `../Possible Feature List.txt`): native `.clip` files, layer masks, mesh warp /
+liquify, multi-GPU.
 
 ## Build
 
@@ -72,7 +89,7 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 | Action | Keys |
 |---|---|
 | Brush / eraser toggle | B / E (the pen's eraser end erases automatically) |
-| Brush tips | 1 Hard Round · 2 Textured Pen · 3 Soft Round |
+| Brushes | 1–9 pick the first nine brushes of the library |
 | Brush size | [ and ], or Ctrl+Alt+drag on the canvas |
 | Swap colour / background colour | X |
 | Straight line from the last stroke | Shift+click |
@@ -93,7 +110,10 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 | Hide / show all panels | Tab |
 | Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
 | New / open / import / save / save as | Ctrl+N / Ctrl+O / Ctrl+I / Ctrl+S / Ctrl+Shift+S |
-| Export flattened PNG / JPEG | Ctrl+E |
+| Export flattened PNG / JPEG / WebP | Ctrl+E |
+| Version Save / Batch Export | Ctrl+Alt+S / Ctrl+Alt+E |
+| Text tool | T · click to type, drag to make a text frame · Esc finishes |
+| Temporary tool | hold its key (e.g. E), use it, release — back to the previous tool |
 | Layers | drag a row to reorder · double-click to rename · eye icon toggles visibility |
 
 ## Performance test (RTX 3090 PC)
@@ -119,7 +139,8 @@ a 24 GB card holds about 4–5 layers at that size — the app tells you the exa
 
 `--cpu-vulkan`, `--vulkan-driver <dll/so>`, `--gpu <index>`, `--validation`, `--doc WxH`,
 `--brush PX`, `--tip hard|textured|soft`, `--layers N`, `--benchmark`, `--open <file>`,
-`--import <file>` (repeatable), `--save <file.psd>`, `--demo`, `--tooltest`,
+`--import <file>` (repeatable), `--save <file.psd>`, `--demo`, `--tooltest`, `--brushtest`,
+`--brushes <file.abr|.sut|.zip>`, `--drop <file>` (same as dropping it on the canvas), `--batchtest`,
 `--screenshot <file.png>`, `--frames N`, `--window WxH`, `--exit`. `--help` lists them.
 
 ## Notes for the Windows build / test step
@@ -141,7 +162,7 @@ a 24 GB card holds about 4–5 layers at that size — the app tells you the exa
   back only the painted area and flood on a worker thread (the UI stays responsive; the status bar
   shows *Working…*).
 
-## Known issues (to fix before 1.0 final)
+## Known issues
 
 - *Fill / magic wand with "Refer to all visible layers"* on huge documents flattens the whole
   painted area in one GPU submission; on a 30k × 30k document this may briefly hitch the display
