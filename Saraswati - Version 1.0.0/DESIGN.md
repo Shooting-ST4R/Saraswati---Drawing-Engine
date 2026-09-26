@@ -24,8 +24,13 @@ the engine architecture, not feature parity with Clip Studio Paint.
 - Undo / redo for strokes (tile-based, stored in system RAM).
 - View: zoom at cursor, pan, rotate, fit to window, 100 %.
 - Performance panel + benchmark mode (see below).
-- Not in 1.0.0: saving/loading, export, blend modes, selections, eyedropper,
-  mipmaps, tiled/sparse layers, multi-threaded CPU work. (Next versions.)
+- Added during the 1.0.0 build at the user's request (see "Additions" below):
+  28 CSP blend modes, PSD/PSB open + save, image import, docking UI with a
+  neutral-grey theme, and the basic tool set (selections, fill, gradient,
+  line/shapes, eyedropper, transform).
+- Not in 1.0.0: native .clip files, layer folders/masks, text, mesh warp,
+  mipmaps, tiled/sparse layers, multi-GPU. (Next versions; see
+  `Possible Feature List.txt` at the project root.)
 
 ## Stack
 
@@ -45,6 +50,9 @@ Pinned dependency commits (fetched by `App-Data/Source/fetch-deps.sh` / `.ps1`):
 | Vulkan-Headers | KhronosGroup/Vulkan-Headers | 3c65a01745e4a1134d32b9c2c456472212dba16d |
 | volk | zeux/volk | 7f46f79751d7e3b3a6df20e38d3e3986585bcdf4 |
 | glslang | KhronosGroup/glslang | 2ff6f609379ce43c4291c732cf6a19dd2461a680 |
+| stb | nothings/stb | 2c980bb59875b0d32144a71867fbdebb2f77cd20 |
+| nanosvg | memononen/nanosvg | 239e102ec2c691f2902e20ace2ed36ee4a35cfe6 |
+| libwebp | webmproject/libwebp | 4fa21912338357f89e4fd51cf2368325b59e9bd9 (v1.6.0) |
 
 glslang: `ENABLE_OPT=OFF`, tests off. SDL: static only.
 
@@ -192,3 +200,31 @@ whose layer exceeds `maxMemoryAllocationSize`, or with `maxLayers < 1`. Handle
 
 The Windows .exe is built afterwards on the Windows VM (MSVC) and checked on
 SwiftShader; real performance is measured on the RTX 3090 PC.
+
+## Additions made during the 1.0.0 build
+
+- **Blend modes.** `view.glsl: blendLayer()` implements CSP's 28 modes with the
+  W3C compositing formula on premultiplied colour (Glow dodge / Add (Glow) use
+  the premultiplied source so soft edges "glow"). Because non-Normal layers are
+  not associative, the frame composite moved to compute (`frame.comp`) writing a
+  window-size `work` image: `blend(below, active)` then the `above` cache when
+  every visible layer above is Normal, else each above layer is blended per
+  frame (still bounded by screen pixels). `present.frag` draws `work` over the
+  checkerboard.
+- **Selection.** Document-size R8 (or R32F) image in set 0 binding 5, CPU copy
+  is the master. Commit and the live stroke multiply coverage by it; the frame
+  pass draws marching ants. Selection edits are not undoable yet.
+- **Coverage painting.** Fill, filled shapes, gradient, Edit › Fill / Clear
+  write 8-bit coverage (or the gradient shader) into the stroke mask and reuse
+  the normal commit — so they get undo and selection clipping for free.
+- **Transform.** The selection/layer content is read back, lifted (an eraser
+  commit), shown as an ImGui textured quad while editing, then drawn back by
+  `stamp.comp` through the inverse homography of the 4 corners (bilinear).
+  Cancel = undo-and-discard of the lift.
+- **Files.** `fileio.cpp`: PSD/PSB reader/writer (RLE, multi-threaded encode,
+  tight layer bounds, PSB above 30000 px or 4 GB) + stb_image / libwebp /
+  nanosvg import. Saving reads layers back on the main thread and encodes on a
+  worker thread.
+- **UI.** Dear ImGui docking branch (pinned commit changed accordingly), layout
+  in `User-Data/settings/layout.ini`, neutral grey theme (R = G = B), Roboto
+  embedded at build time.

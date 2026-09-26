@@ -6,6 +6,7 @@
 #include <webp/decode.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
