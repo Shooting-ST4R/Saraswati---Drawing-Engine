@@ -3,7 +3,9 @@
 #include "brush.h"
 #include <imgui.h>
 #include "renderer.h"
+#include "shortcuts.h"
 #include <array>
+#include <cstring>
 #include <atomic>
 #include <functional>
 #include <future>
@@ -127,7 +129,37 @@ class App {
   bool penDownEraser = false;
   uint64_t penDownNs = 0;
   float lastX = 0, lastY = 0;
-  bool spaceDown = false, shiftDown = false, ctrlDown = false;
+  bool spaceDown = false, shiftDown = false, ctrlDown = false;  // spaceDown: the pan key is held
+  bool rotateDown = false;                                        // the rotate-view key is held
+  SDL_Keycode panKeyHeld = 0, rotateKeyHeld = 0;
+  // keyboard shortcuts (Preferences > Shortcuts)
+  KeyCombo keys[kActCount][2];
+  void resetShortcuts();
+  int findAction(const KeyCombo& c) const;
+  std::string shortcutLabel(Act a) const;
+  std::string skBuf[kActCount];
+  const char* sk(Act a);  // primary key of an action, for menus (nullptr if none)
+  void runAction(Act a, SDL_Keycode key, bool repeat);
+  void selectToolAct(Act a);
+  bool toolActActive(Act a) const;
+  // spring-loaded tools: hold a tool key to use it, release to go back
+  struct ToolHold {
+    bool active = false, used = false;
+    SDL_Keycode key = 0;
+    ToolId prevTool = ToolId::Brush;
+    bool prevEraser = false;
+    uint64_t downNs = 0;
+  } toolHold;
+  bool restorePending = false;
+  ToolId restoreTool = ToolId::Brush;
+  bool restoreEraser = false;
+  void releaseToolHold(bool forceRestore);
+  void tickToolRestore();
+  void releaseAllKeys();
+  int captureAct = -1, captureSlot = 0;  // Preferences: waiting for a key to bind
+  std::string captureMsg;
+  bool captureKey(const SDL_KeyboardEvent& k);
+  void drawShortcutsPage();
   enum class Drag { None, Pan, Rotate } drag = Drag::None;
   float dragX = 0, dragY = 0;
   double dragStartAngle = 0, dragStartRot = 0;
@@ -240,6 +272,8 @@ class App {
     float wheelZoom = 1.2f;
     int undoSteps = 50;
     float undoGB = 0;              // 0 = automatic (25 % of RAM, max 16 GB)
+    bool springTools = true;       // holding a tool key switches only while held
+    int holdMs = 250;              // held at least this long (or used) = temporary
   } prefs;
   bool showPrefs = false;
   int prefsPage = 0;

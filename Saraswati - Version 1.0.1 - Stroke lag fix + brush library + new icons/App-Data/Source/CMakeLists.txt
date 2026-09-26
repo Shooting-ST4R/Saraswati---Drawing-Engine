@@ -108,6 +108,8 @@ add_executable(Saraswati WIN32
   src/renderer.cpp
   src/renderer_tools.cpp
   src/tools.cpp
+  src/shortcuts.cpp
+  src/app_shortcuts.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp

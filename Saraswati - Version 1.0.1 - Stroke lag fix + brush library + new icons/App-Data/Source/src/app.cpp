@@ -38,6 +38,7 @@ static std::string fmtBytes(double b) {
 }
 
 App::App(SDL_Window* w, Renderer& r, const Options& o) : window(w), R(r), opt(o) {
+  resetShortcuts();
   density = SDL_GetWindowPixelDensity(window);
   if (density <= 0) density = 1;
   userData = findUserData();
@@ -178,15 +179,15 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   lastX = sx;
   lastY = sy;
   if (ImGui::GetIO().WantCaptureMouse) return;
-  if (ctrlDown && altDown && !spaceDown) {  // Ctrl+Alt+drag: brush size
+  if (ctrlDown && altDown && !spaceDown && !rotateDown) {  // Ctrl+Alt+drag: brush size
     sizeDrag = true;
     sizeDragX = sx;
     sizeDragY = sy;
     sizeDragStart = brushes[tipIndex].size;
     return;
   }
-  if (spaceDown) {
-    drag = shiftDown ? Drag::Rotate : Drag::Pan;
+  if (spaceDown || rotateDown) {
+    drag = (rotateDown || shiftDown) ? Drag::Rotate : Drag::Pan;
     dragFromPen = pen;
     dragX = sx;
     dragY = sy;
@@ -196,6 +197,7 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   }
   double dx, dy;
   screenToDoc(sx, sy, dx, dy);
+  if (toolHold.active) toolHold.used = true;  // the held tool was used: going back on release
   if (toolDown(dx, dy, sx, sy)) return;
   strokeFromPen = pen;
   if (shiftDown && haveLastStroke) {
@@ -272,58 +274,27 @@ void App::pointerUp(bool pen) {
 }
 
 void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
-  if (k.key == SDLK_SPACE) spaceDown = down;
   shiftDown = (k.mod & SDL_KMOD_SHIFT) != 0;
   ctrlDown = (k.mod & SDL_KMOD_CTRL) != 0;
   altDown = (k.mod & SDL_KMOD_ALT) != 0;
-  if (!down || ImGui::GetIO().WantTextInput) return;
-  // while a panel widget has the keyboard, only Tab reaches the canvas shortcuts
-  if (ImGui::GetIO().WantCaptureKeyboard && k.key != SDLK_TAB) return;
-  bool ctrl = ctrlDown, shift = shiftDown;
-  switch (k.key) {
-    case SDLK_1: if (ctrl) { view.zoom = 1; break; } [[fallthrough]];
-    case SDLK_2: case SDLK_3: case SDLK_4: case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: case SDLK_9:
-      if (!ctrl) {  // quick-select the first nine brushes of the library
-        int i = int(k.key - SDLK_1);
-        if (i < int(brushes.size())) { tipIndex = i; setTool(ToolId::Brush); }
-      }
-      break;
-    case SDLK_0: if (ctrl) fitView(); break;
-    case SDLK_E: if (!ctrl) eraserToggle = !eraserToggle; else if (!saving && R.hasDocument()) showDialog(DlgExport); break;
-    case SDLK_LEFTBRACKET: brushes[tipIndex].size = std::max(1.0f, brushes[tipIndex].size / 1.15f); break;
-    case SDLK_RIGHTBRACKET: brushes[tipIndex].size = std::min(5000.0f, brushes[tipIndex].size * 1.15f); break;
-    case SDLK_Z:
-      if (ctrl && hoverPreviewOn) cancelPreviews();
-      if (ctrl) {
-        if (xf.active) cancelTransform();  // undo while transforming = cancel the transform
-        else if (shift) R.redo();
-        else R.undo();
-      }
-      break;
-    case SDLK_Y:
-      if (ctrl && hoverPreviewOn) cancelPreviews();
-      if (ctrl && !xf.active) R.redo();
-      break;
-    case SDLK_TAB: hideUI = !hideUI; break;
-    case SDLK_X: if (!ctrl) for (int c = 0; c < 3; ++c) std::swap(color[c], bgColor[c]); break;
-    case SDLK_EQUALS:
-    case SDLK_PLUS:
-    case SDLK_KP_PLUS: zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25); break;
-    case SDLK_MINUS:
-    case SDLK_KP_MINUS: zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8); break;
-    case SDLK_R: if (!ctrl) view.rotation = 0; break;
-    case SDLK_N: if (ctrl) requestAction(PA_New); break;
-    case SDLK_K: if (ctrl) showPrefs = !showPrefs; break;
-    case SDLK_O: if (ctrl && !saving) requestAction(PA_OpenDialog); break;
-    case SDLK_I: if (ctrl && !shift && !saving && R.hasDocument()) showDialog(DlgImport); break;
-    case SDLK_S:
-      if (ctrl && !saving && R.hasDocument()) {
-        if (shift || documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
-      }
-      break;
-    default: break;
+  if (down && captureAct >= 0) { captureKey(k); return; }
+  if (!down) {  // releases always count, even while a panel has the keyboard
+    if (panKeyHeld && k.key == panKeyHeld) { panKeyHeld = 0; spaceDown = false; }
+    if (rotateKeyHeld && k.key == rotateKeyHeld) { rotateKeyHeld = 0; rotateDown = false; }
+    if (toolHold.active && k.key == toolHold.key) releaseToolHold(false);
+    return;
   }
-  if (!R.stroking()) toolKey(k.key, ctrl, shift, altDown);
+  if (ImGui::GetIO().WantTextInput) return;
+  // while a panel widget has the keyboard, only the hide-panels key reaches the canvas shortcuts
+  KeyCombo c{k.key, modsFromSdl(k.mod)};
+  int a = findAction(c);
+  if (ImGui::GetIO().WantCaptureKeyboard && a != int(Act::HidePanels)) return;
+  if (a >= 0) {
+    runAction(Act(a), k.key, k.repeat);
+    return;
+  }
+  // context keys that are not rebindable: Enter / Esc (transform, previews, selection)
+  if (!engine.active() && !toolDrag) toolKey(k.key, ctrlDown, shiftDown, altDown);
 }
 
 void App::handleEvent(const SDL_Event& e) {
@@ -334,6 +305,9 @@ void App::handleEvent(const SDL_Event& e) {
     case SDL_EVENT_QUIT:
       if (opt.exitAfter) running = false;
       else requestAction(PA_Quit);
+      break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+      releaseAllKeys();  // key-ups are not delivered while another window has focus
       break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_RESIZED:
@@ -508,7 +482,7 @@ void App::drawBrushPanel() {
   if (!usesBrush) {
     if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
       sliderF("##op", &brushes[tipIndex].opacity, 0.0f, 1.0f, "Opacity  %.2f");
-      ImGui::Checkbox("Erase instead of paint (E)", &eraserToggle);
+      ImGui::Checkbox("Erase instead of paint", &eraserToggle);
     }
     ImGui::End();
     return;
@@ -531,8 +505,8 @@ void App::drawBrushPanel() {
     else snprintf(label, sizeof label, "      %s", b.name.c_str());
     if (ImGui::Selectable(label, i == tipIndex)) tipIndex = i;
     if (i < 9) {
-      char key[8];
-      snprintf(key, sizeof key, "%d", i + 1);
+      char key[40];
+      snprintf(key, sizeof key, "%s", comboLabel(keys[int(Act::Brush1) + i][0]).c_str());
       ImVec2 ks = ImGui::CalcTextSize(key);
       ImGui::GetWindowDrawList()->AddText(ImVec2(ImGui::GetItemRectMax().x - ks.x - 4, p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), key);
     }
@@ -587,7 +561,7 @@ void App::drawBrushPanel() {
     }
   }
   BrushSettings& cb = brushes[tipIndex];
-  ImGui::Checkbox("Eraser (E)", &eraserToggle);
+  ImGui::Checkbox("Eraser", &eraserToggle);
   if (cb.eraser) { ImGui::SameLine(); ImGui::TextDisabled("(eraser brush)"); }
   sliderF("##size", &cb.size, 1.0f, 5000.0f, "Size  %.1f px", ImGuiSliderFlags_Logarithmic);
   sliderF("##opacity", &cb.opacity, 0.0f, 1.0f, "Opacity  %.2f");
@@ -1161,9 +1135,9 @@ void App::drawPrefs() {
   ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Appearing,
                           ImVec2(0.5f, 0.5f));
   if (!ImGui::Begin("Preferences", &showPrefs, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
-  static const char* pages[] = {"General", "Interface", "Pen & input", "Canvas", "Performance", "About"};
+  static const char* pages[] = {"General", "Interface", "Pen & input", "Canvas", "Performance", "Shortcuts", "About"};
   ImGui::BeginChild("nav", ImVec2(170 * sc, 0), ImGuiChildFlags_Borders);
-  for (int i = 0; i < 6; ++i)
+  for (int i = 0; i < 7; ++i)
     if (ImGui::Selectable(pages[i], prefsPage == i, 0, ImVec2(0, ImGui::GetFrameHeight()))) prefsPage = i;
   ImGui::EndChild();
   ImGui::SameLine();
@@ -1260,6 +1234,15 @@ void App::drawPrefs() {
       row("GPU", R.driverInfo.c_str(), [&] { ImGui::TextWrapped("%s", R.deviceName.c_str()); return false; });
       break;
     }
+    case 5:
+      row("Hold a tool key to use it temporarily",
+          "Tap a tool key to switch tools. Hold it instead, use the tool and let go: you are back on the tool you had "
+          "(e.g. hold E, erase, release E and keep drawing).",
+          toggle(&prefs.springTools));
+      row("Hold time", "A tool key held at least this long - or used on the canvas while held - counts as temporary.",
+          [&] { return ImGui::SliderInt("##hm", &prefs.holdMs, 100, 800, "%d ms"); });
+      drawShortcutsPage();
+      break;
     default:
       ImGui::Text("Saraswati %s", SARASWATI_VERSION);
       ImGui::TextDisabled("A lag-free painting engine (Vulkan, SDL3, Dear ImGui).");
@@ -1317,7 +1300,7 @@ void App::drawUI() {
   updateTitle();
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
-      if (ImGui::MenuItem("New...", "Ctrl+N")) requestAction(PA_New);
+      if (ImGui::MenuItem("New...", sk(Act::New))) requestAction(PA_New);
       drawFileDialogs();
       ImGui::Separator();
       if (ImGui::MenuItem("Quit")) requestAction(PA_Quit);
@@ -1325,28 +1308,28 @@ void App::drawUI() {
     }
     if (ImGui::BeginMenu("Edit")) {
       bool canEdit = !R.stroking() && !xf.active;
-      if (ImGui::MenuItem("Undo", "Ctrl+Z", false, R.canUndo() && canEdit)) R.undo();
-      if (ImGui::MenuItem("Redo", "Ctrl+Y", false, R.canRedo() && canEdit)) R.redo();
+      if (ImGui::MenuItem("Undo", sk(Act::Undo), false, R.canUndo() && canEdit)) R.undo();
+      if (ImGui::MenuItem("Redo", sk(Act::Redo), false, R.canRedo() && canEdit)) R.redo();
       ImGui::Separator();
-      if (ImGui::MenuItem("Fill", "Alt+Backspace", false, !R.busy() && !xf.active)) fillSelection(false);
-      if (ImGui::MenuItem("Clear", "Delete", false, !R.busy() && !xf.active)) fillSelection(true);
-      if (ImGui::MenuItem("Transform", "Ctrl+T", false, !R.busy())) setTool(ToolId::Transform);
+      if (ImGui::MenuItem("Fill", sk(Act::FillSel), false, !R.busy() && !xf.active)) fillSelection(false);
+      if (ImGui::MenuItem("Clear", sk(Act::ClearSel), false, !R.busy() && !xf.active)) fillSelection(true);
+      if (ImGui::MenuItem("Transform", sk(Act::ToolTransform), false, !R.busy())) setTool(ToolId::Transform);
       ImGui::Separator();
-      if (ImGui::MenuItem("Select all", "Ctrl+A")) selectAll();
-      if (ImGui::MenuItem("Deselect", "Ctrl+D", false, selActive)) deselect();
-      if (ImGui::MenuItem("Invert selection", "Ctrl+Shift+I")) invertSelection();
+      if (ImGui::MenuItem("Select all", sk(Act::SelectAll))) selectAll();
+      if (ImGui::MenuItem("Deselect", sk(Act::Deselect), false, selActive)) deselect();
+      if (ImGui::MenuItem("Invert selection", sk(Act::InvertSel))) invertSelection();
       ImGui::Separator();
-      if (ImGui::MenuItem("Preferences...", "Ctrl+K")) showPrefs = true;
+      if (ImGui::MenuItem("Preferences...", sk(Act::Prefs))) showPrefs = true;
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
-      if (ImGui::MenuItem("Fit to window", "Ctrl+0")) fitView();
-      if (ImGui::MenuItem("100 %", "Ctrl+1")) view.zoom = 1;
-      if (ImGui::MenuItem("Zoom in", "+")) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25);
-      if (ImGui::MenuItem("Zoom out", "-")) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8);
-      if (ImGui::MenuItem("Reset rotation", "R")) view.rotation = 0;
+      if (ImGui::MenuItem("Fit to window", sk(Act::ZoomFit))) fitView();
+      if (ImGui::MenuItem("100 %", sk(Act::Zoom100))) view.zoom = 1;
+      if (ImGui::MenuItem("Zoom in", sk(Act::ZoomIn))) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25);
+      if (ImGui::MenuItem("Zoom out", sk(Act::ZoomOut))) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8);
+      if (ImGui::MenuItem("Reset rotation", sk(Act::ResetRotation))) view.rotation = 0;
       ImGui::Separator();
-      ImGui::MenuItem("Hide panels", "Tab", &hideUI);
+      ImGui::MenuItem("Hide panels", sk(Act::HidePanels), &hideUI);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
@@ -1758,6 +1741,21 @@ void App::loadSettings() {
         }
       }
     }
+    else if (k == "hold") {
+      int sp = 1, ms = 250;
+      if (sscanf(v, "%d %d", &sp, &ms) == 2) { prefs.springTools = sp != 0; prefs.holdMs = std::clamp(ms, 100, 800); }
+    }
+    else if (k == "key") {  // key <action id> <key> <mods> <key2> <mods2>
+      char id[64];
+      unsigned k1 = 0, k2 = 0;
+      int m1 = 0, m2 = 0;
+      if (sscanf(v, "%63s %u %d %u %d", id, &k1, &m1, &k2, &m2) == 5)
+        for (int a = 0; a < kActCount; ++a)
+          if (std::strcmp(actionInfo(Act(a)).id, id) == 0) {
+            keys[a][0] = KeyCombo{SDL_Keycode(k1), m1};
+            keys[a][1] = KeyCombo{SDL_Keycode(k2), m2};
+          }
+    }
     else if (k == "brushsel") {
       std::string name = v;
       while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
@@ -1782,6 +1780,11 @@ void App::saveSettings() {
             b.spacing, b.hardness, b.roundness, b.angle, b.followStroke ? 1 : 0, b.texStrength, b.texScale, b.scatter,
             b.sizeJitter, b.flowJitter, b.buildUp ? 1 : 0, b.particles, b.particleSize, b.pressureSize ? 1 : 0, b.minSize,
             b.pressureOpacity ? 1 : 0, b.gamma, b.eraser ? 1 : 0, b.group.c_str(), b.name.c_str());
+  fprintf(f, "hold %d %d\n", prefs.springTools ? 1 : 0, prefs.holdMs);
+  for (int a = 0; a < kActCount; ++a)  // only changed shortcuts are stored, so new defaults reach old settings files
+    if (!(keys[a][0] == actionInfo(Act(a)).def[0] && keys[a][1] == actionInfo(Act(a)).def[1]))
+      fprintf(f, "key %s %u %d %u %d\n", actionInfo(Act(a)).id, unsigned(keys[a][0].key), keys[a][0].mods,
+              unsigned(keys[a][1].key), keys[a][1].mods);
   if (!lastFolder.empty()) fprintf(f, "folder %s\n", lastFolder.c_str());
   fclose(f);
 }
@@ -1863,14 +1866,14 @@ void App::processDialogResults() {
 
 void App::drawFileDialogs() {
   bool busy = R.stroking() || saving;
-  if (ImGui::MenuItem("Open...", "Ctrl+O", false, !busy)) requestAction(PA_OpenDialog);
-  if (ImGui::MenuItem("Import image as layer...", "Ctrl+I", false, !busy && R.hasDocument())) showDialog(DlgImport);
+  if (ImGui::MenuItem("Open...", sk(Act::Open), false, !busy)) requestAction(PA_OpenDialog);
+  if (ImGui::MenuItem("Import image as layer...", sk(Act::Import), false, !busy && R.hasDocument())) showDialog(DlgImport);
   ImGui::Separator();
-  if (ImGui::MenuItem("Save", "Ctrl+S", false, !busy && R.hasDocument())) {
+  if (ImGui::MenuItem("Save", sk(Act::Save), false, !busy && R.hasDocument())) {
     if (documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
   }
-  if (ImGui::MenuItem("Save as PSD...", "Ctrl+Shift+S", false, !busy && R.hasDocument())) showDialog(DlgSave);
-  if (ImGui::MenuItem("Export PNG / JPEG...", "Ctrl+E", false, !busy && R.hasDocument())) showDialog(DlgExport);
+  if (ImGui::MenuItem("Save as PSD...", sk(Act::SaveAs), false, !busy && R.hasDocument())) showDialog(DlgSave);
+  if (ImGui::MenuItem("Export PNG / JPEG...", sk(Act::Export), false, !busy && R.hasDocument())) showDialog(DlgExport);
 }
 
 // Uploads straight-alpha pixels into layer `index` at (x, y).
@@ -2117,6 +2120,7 @@ int App::run() {
       hoverDirty = true;
     }
     tickBenchmark();
+    tickToolRestore();
     tickDemo();
     if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && engine.active() && (!wantShot || screenshotTaken))
       strokeEnd();  // the demo leaves its last stroke open; finish it before saving

@@ -838,32 +838,7 @@ void App::toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt) {
     toolDrag = false;
     return;
   }
-  if (ctrl) {
-    if (key == SDLK_A) selectAll();
-    else if (key == SDLK_D) deselect();
-    else if (key == SDLK_I && shift) invertSelection();
-    else if (key == SDLK_T) setTool(ToolId::Transform);
-    return;
-  }
-  switch (key) {
-    case SDLK_B: setTool(ToolId::Brush); break;
-    case SDLK_I: setTool(ToolId::Eyedropper); break;
-    case SDLK_G: setTool(shift ? ToolId::Gradient : ToolId::Fill); break;
-    case SDLK_U: setTool(tool == ToolId::Line ? ToolId::Rect : tool == ToolId::Rect ? ToolId::Ellipse : ToolId::Line); break;
-    case SDLK_M: setTool(tool == ToolId::SelRect ? ToolId::SelEllipse : ToolId::SelRect); break;
-    case SDLK_L: setTool(ToolId::Lasso); break;
-    case SDLK_W: setTool(ToolId::Wand); break;
-    case SDLK_V: setTool(ToolId::Transform); break;
-    case SDLK_H: setTool(ToolId::Hand); break;
-    case SDLK_DELETE:
-      fillSelection(true);  // clear the selection (or the layer)
-      break;
-    case SDLK_BACKSPACE:
-      if (alt) fillSelection(false);  // Alt+Backspace fills with the colour
-      break;
-    case SDLK_ESCAPE: deselect(); break;
-    default: break;
-  }
+  if (key == SDLK_ESCAPE && !ctrl && !shift && !alt) deselect();
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,22 +981,22 @@ void App::drawToolbar() {
   float bs = std::min(ImGui::GetContentRegionAvail().x, 40.0f * ImGui::GetStyle().FontScaleDpi);
   bs = std::max(bs, 24.0f);
   int perRow = std::max(1, int((ImGui::GetContentRegionAvail().x + 2) / (bs + 2)));
-  struct Entry { ToolId id; const char* icon; const char* name; const char* key; bool eraser; int group; };
+  struct Entry { Act act; const char* icon; const char* extra; int group; };
   static const Entry entries[] = {
-      {ToolId::Brush, "paintbrush", "Brush", "B, 1-9 pick a brush", false, 0},
-      {ToolId::Brush, "eraser", "Eraser", "E", true, 0},
-      {ToolId::Eyedropper, "pipette", "Eyedropper", "I, or Alt+click", false, 0},
-      {ToolId::Fill, "paint-bucket", "Fill", "G", false, 0},
-      {ToolId::Gradient, nullptr, "Gradient", "Shift+G", false, 0},
-      {ToolId::Line, "slash", "Line", "U", false, 1},
-      {ToolId::Rect, "square", "Rectangle", "U", false, 1},
-      {ToolId::Ellipse, "circle", "Ellipse", "U", false, 1},
-      {ToolId::SelRect, "square-dashed", "Rectangle select", "M", false, 2},
-      {ToolId::SelEllipse, "circle-dashed", "Ellipse select", "M", false, 2},
-      {ToolId::Lasso, "lasso", "Lasso select", "L", false, 2},
-      {ToolId::Wand, "wand-sparkles", "Magic wand", "W", false, 2},
-      {ToolId::Transform, "move", "Move / Transform", "V, Ctrl+T", false, 3},
-      {ToolId::Hand, "hand", "Hand (pan)", "H, or hold Space", false, 3}};
+      {Act::ToolBrush, "paintbrush", "1-9 pick a brush", 0},
+      {Act::ToolEraser, "eraser", nullptr, 0},
+      {Act::ToolEyedropper, "pipette", "or Alt+click", 0},
+      {Act::ToolFill, "paint-bucket", nullptr, 0},
+      {Act::ToolGradient, nullptr, nullptr, 0},
+      {Act::ToolLine, "slash", nullptr, 1},
+      {Act::ToolRect, "square", nullptr, 1},
+      {Act::ToolEllipse, "circle", nullptr, 1},
+      {Act::ToolSelRect, "square-dashed", nullptr, 2},
+      {Act::ToolSelEllipse, "circle-dashed", nullptr, 2},
+      {Act::ToolLasso, "lasso", nullptr, 2},
+      {Act::ToolWand, "wand-sparkles", nullptr, 2},
+      {Act::ToolTransform, "move", nullptr, 3},
+      {Act::ToolHand, "hand", nullptr, 3}};
   int i = 0, lastGroup = 0;
   for (const Entry& e : entries) {
     if (e.group != lastGroup) {
@@ -1033,9 +1008,14 @@ void App::drawToolbar() {
     }
     ImGui::PushID(&e);
     if (i % perRow) ImGui::SameLine();
-    bool sel = tool == e.id && (e.id != ToolId::Brush || eraserToggle == e.eraser);
-    char tip[96];
-    snprintf(tip, sizeof tip, "%s  (%s)", e.name, e.key);
+    bool sel = toolActActive(e.act);
+    std::string keysTxt = shortcutLabel(e.act);
+    if (e.act == Act::ToolHand) keysTxt += (keysTxt.empty() ? "" : ", ") + std::string("hold ") + comboLabel(keys[int(Act::PanHold)][0]);
+    if (e.extra) keysTxt += (keysTxt.empty() ? "" : ", ") + std::string(e.extra);
+    char tip[200];
+    if (keysTxt.empty()) snprintf(tip, sizeof tip, "%s", actionInfo(e.act).name);
+    else snprintf(tip, sizeof tip, "%s  (%s)%s", actionInfo(e.act).name, keysTxt.c_str(),
+                  prefs.springTools ? "\nHold the key to use it only while held" : "");
     bool clicked;
     if (e.icon) {
       clicked = iconButton("##t", e.icon, bs, sel, tip);
@@ -1044,14 +1024,11 @@ void App::drawToolbar() {
       clicked = ImGui::Button("##t", ImVec2(bs, bs));
       ImGui::PopStyleColor();
       ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-      drawToolGlyph(ImGui::GetWindowDrawList(), e.id, ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), bs * 0.8f,
+      drawToolGlyph(ImGui::GetWindowDrawList(), ToolId::Gradient, ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), bs * 0.8f,
                ImGui::GetColorU32(ImGuiCol_Text, sel ? 1.0f : 0.72f));
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
     }
-    if (clicked) {
-      setTool(e.id);
-      if (e.id == ToolId::Brush) eraserToggle = e.eraser;
-    }
+    if (clicked) selectToolAct(e.act);
     ImGui::PopID();
     ++i;
   }
@@ -1087,7 +1064,7 @@ void App::drawToolOptions() {
       ImGui::Checkbox("Grow 1 px under line art", &fillGrow);
       ImGui::Checkbox("Refer to all visible layers", &fillSampleAll);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Find the area from the whole picture (e.g. line art on another layer)\nand fill it on the current layer");
-      ImGui::TextDisabled("Fills on the active layer. Alt+Backspace fills the selection.");
+      ImGui::TextDisabled("Fills on the active layer. %s fills the selection.", comboLabel(keys[int(Act::FillSel)][0]).c_str());
       break;
     case ToolId::Wand:
       ImGui::SliderFloat("Tolerance", &wandTol, 0.0f, 1.0f, "%.2f");
@@ -1097,7 +1074,10 @@ void App::drawToolOptions() {
     case ToolId::SelRect:
     case ToolId::SelEllipse:
     case ToolId::Lasso:
-      ImGui::TextDisabled("Shift: add   Alt: subtract   Ctrl+A all\nCtrl+D deselect   Ctrl+Shift+I invert\nDelete clears, Alt+Backspace fills");
+      ImGui::TextDisabled("Shift: add   Alt: subtract   %s all\n%s deselect   %s invert\n%s clears, %s fills",
+                          comboLabel(keys[int(Act::SelectAll)][0]).c_str(), comboLabel(keys[int(Act::Deselect)][0]).c_str(),
+                          comboLabel(keys[int(Act::InvertSel)][0]).c_str(), comboLabel(keys[int(Act::ClearSel)][0]).c_str(),
+                          comboLabel(keys[int(Act::FillSel)][0]).c_str());
       if (ImGui::Button("Select all")) selectAll();
       ImGui::SameLine();
       if (ImGui::Button("Deselect")) deselect();
@@ -1163,7 +1143,7 @@ void App::drawToolOptions() {
       if (ImGui::Button("Cancel (Esc)")) cancelTransform();
       break;
     case ToolId::Hand:
-      ImGui::TextDisabled("Drag to pan. Wheel zooms, Shift+Space+drag rotates.");
+      ImGui::TextDisabled("Drag to pan. Wheel zooms, %s+drag rotates.", comboLabel(keys[int(Act::RotateHold)][0]).c_str());
       break;
     default:
       break;
@@ -1308,6 +1288,32 @@ void App::buildToolTest() {
   // lasso selection left active: marching ants
   demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
   demo.push_back([this] { tool = ToolId::Brush; });
+  // keyboard: tap switches tools, hold (used on the canvas) returns to the previous tool
+  demo.push_back([this] {
+    auto key = [&](SDL_Keycode k, bool down, SDL_Keymod mod = 0) {
+      SDL_KeyboardEvent e{};
+      e.key = k;
+      e.mod = mod;
+      e.down = down;
+      handleKey(e, down);
+    };
+    bool ok = true;
+    auto expect = [&](bool c, const char* what) { if (!c) { ok = false; fprintf(stderr, "keytest FAILED: %s\n", what); } };
+    setTool(ToolId::Brush); eraserToggle = false;
+    key(SDLK_E, true);  expect(tool == ToolId::Brush && eraserToggle, "E selects the eraser");
+    toolHold.used = true;  // (a stroke while E is held)
+    key(SDLK_E, false); expect(tool == ToolId::Brush && !eraserToggle, "releasing a used E returns to the brush");
+    key(SDLK_G, true);  key(SDLK_G, false); expect(tool == ToolId::Fill, "tapping G keeps the fill tool");
+    key(SDLK_G, true, SDL_KMOD_LSHIFT); key(SDLK_G, false, SDL_KMOD_LSHIFT); expect(tool == ToolId::Gradient, "Shift+G = gradient");
+    key(SDLK_SPACE, true); expect(spaceDown, "Space holds pan"); key(SDLK_SPACE, false); expect(!spaceDown, "Space released");
+    int ui = hideUI; key(SDLK_TAB, true); key(SDLK_TAB, false); expect(int(hideUI) != ui, "Tab hides panels"); hideUI = ui;
+    // rebinding: give the eraser F, which frees nothing; then G steals from Fill
+    captureAct = int(Act::ToolEraser); captureSlot = 0; key(SDLK_G, true); key(SDLK_G, false);
+    expect(keys[int(Act::ToolFill)][0].empty() && findAction(KeyCombo{SDLK_G, 0}) == int(Act::ToolEraser), "rebinding moves the key");
+    resetShortcuts(); captureMsg.clear();
+    setTool(ToolId::Brush);
+    fprintf(stderr, "keytest: %s\n", ok ? "ok" : "FAILED");
+  });
   // magic-wand hover preview over the red rectangle (tinted, not yet selected)
   demo.push_back([this] { setTool(ToolId::Wand); wandSampleAll = true; updateHover(230, 300); });
   demo.push_back([] {});
