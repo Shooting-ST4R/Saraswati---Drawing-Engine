@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
     else if (a == "--demo") opt.demo = true;
     else if (a == "--tooltest") opt.toolTest = true;
     else if (a == "--brushtest") opt.brushTest = true;
+    else if (a == "--splinetest") opt.splineTest = true;
     else if (a == "--open") opt.open = next();
     else if (a == "--save") opt.save = next();
     else if (a == "--import") opt.imports.push_back(next());

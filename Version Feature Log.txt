@@ -1,0 +1,53 @@
+Saraswati - Version Feature Log
+===============================
+What each version added or changed. Newest version at the bottom.
+(Kept up to date with every version - see CLAUDE.md, "Version Feature Log Rule".)
+
+
+Version 1.0.0  (first beta)
+---------------------------
+* Vulkan GPU brush engine built for no pen lag on huge canvases (up to 30,000 x 30,000 px,
+  brushes up to 5,000 px); display cost bounded by screen pixels
+* Three brushes: Hard Round, Textured Pen (paper grain), Soft Round
+* Brush settings: size, opacity, flow, spacing, hardness, texture, pressure -> size / opacity,
+  pressure curve, eraser (also the pen's eraser end)
+* Pen tablet pressure through Windows Ink (Wacom / Cintiq) and Linux tablets; barrel buttons
+  pan and pick colour
+* Layers: new, duplicate, delete, reorder (drag), visibility, opacity, rename, lock transparency,
+  thumbnails; layer limit calculated from VRAM
+* All 28 Clip Studio Paint blend modes
+* Undo / redo for strokes, fills, transforms, layer changes and selections
+* Tools: eyedropper, fill bucket (with "refer to all layers"), gradient, line, rectangle, ellipse,
+  rectangle / ellipse / lasso / magic-wand selection, move / transform (scale, rotate, distort,
+  flip), hand
+* Files: open / save PSD (and PSB for huge documents) with layers and blend modes; import PNG,
+  JPEG, GIF, WebP, SVG; export flattened PNG / JPEG; unsaved-changes prompt
+* Interface: dockable panels (snap, resize, combine), neutral grey theme, status bar, Tab hides
+  panels, colour panel with hex / HSV / recent colours, remembered settings
+* Performance panel and built-in benchmark (--benchmark)
+* Windows release folder with a ready-to-run exe
+
+
+Version 1.0.1  (in progress)
+----------------------------
+Fixed:
+* Short lag spike (~0.5 s) after every stroke and every undo: undo data is now copied bit by bit
+  while you draw, into memory that is reserved in advance, and layer thumbnails no longer make
+  the app wait for the GPU
+* Wobbly / faceted lines when drawing zoomed out on big canvases: strokes now follow a smooth
+  curve through the pen samples, and mouse input (whole pixels only) is corrected for its
+  pixel snapping - no stabiliser, no added lag
+
+Added:
+* Brush library with 22 brushes in groups: Pencil, Mechanical pencil, Soft pencil (6B), G-Pen,
+  Mapping pen, Hard round, Textured pen, Calligraphy, Marker, Chisel marker, Highlighter,
+  Flat brush, Dry brush, Chalk, Charcoal, Soft round, Soft airbrush, Hard airbrush, Spray,
+  Coarse spray, Hard eraser, Soft eraser
+* New brush settings: roundness, angle (and angle following the stroke), paper grain on any
+  brush, scatter, size / flow jitter, build-up (airbrush), spray particles
+* Save your own brushes ("New from this"), reset built-in brushes, keys 1-9 pick brushes
+* New icon set (tool bar, layer panel, brush groups) and a separate Eraser tool button
+* Frame-spike log (User-Data/logs/frame-spikes.txt) to diagnose any remaining hitches
+
+Changed:
+* Version folders no longer use commas in their names (they broke the Linux build)

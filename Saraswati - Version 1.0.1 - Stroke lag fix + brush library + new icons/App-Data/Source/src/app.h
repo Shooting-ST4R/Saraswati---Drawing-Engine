@@ -26,6 +26,7 @@ struct Options {
   bool demo = false;
   bool toolTest = false;
   bool brushTest = false;
+  bool splineTest = false;
   std::string open;             // file to open at startup
   std::vector<std::string> imports;  // import as layers at startup (test helper)
   std::string save;             // save as PSD when the demo / startup is done (test helper)
@@ -49,7 +50,7 @@ class App {
   void pointerUp(bool pen);
   void handleKey(const SDL_KeyboardEvent& k, bool down);
   // strokes in document coordinates (used by input, benchmark and demo)
-  void strokeBegin(const PenSample& s, bool eraser);
+  void strokeBegin(const PenSample& s, bool eraser, bool spline = true);
   void strokeAdd(const PenSample& s);
   void strokeEnd();
   void flushDabs(uint64_t inputNs);
@@ -77,6 +78,7 @@ class App {
   void buildDemo();
   void buildToolTest();
   void buildBrushTest();
+  void buildSplineTest();
   bool pendingBrushStroke = false;
   void tickDemo();
   // files

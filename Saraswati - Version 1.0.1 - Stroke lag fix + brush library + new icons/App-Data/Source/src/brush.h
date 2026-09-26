@@ -38,14 +38,30 @@ struct PenSample { double x, y; float pressure; };
 
 class BrushEngine {
  public:
-  void begin(const PenSample& s, const BrushSettings& b, uint32_t seed);
+  // spline = interpolate a centripetal Catmull-Rom curve THROUGH the pen samples (not a
+  // stabiliser: the line still passes exactly through every sample). Removes the faceted /
+  // wobbly look when zoomed out, where each input sample jumps many document pixels. Costs one
+  // sample of delay (~4 ms at 240 Hz). Straight-line tools pass spline = false.
+  void begin(const PenSample& s, const BrushSettings& b, uint32_t seed, bool spline = true);
   void add(const PenSample& s);
+  // Input positions arrive snapped to whole screen pixels; zoomed out, one screen pixel is many
+  // document pixels and the stroke turns into a staircase. q = half a screen pixel in document
+  // units. When q is significant, pixel-crossing midpoints are used as spline points (the pen's
+  // real position at that moment), correcting at most the snapping error itself - no lag or
+  // drift like a stabiliser.
+  void setQuantization(double q) { quant_ = q; }
   bool active() const { return active_; }
-  const PenSample& lastSample() const { return last_; }
-  void end() { active_ = false; }
+  const PenSample& lastSample() const { return pts_.empty() ? last_ : pts_.back(); }
+  void end();
   std::vector<Dab> out;  // dabs produced since last take()
  private:
   void emit(double x, double y, float pressure);
+  void walkTo(const PenSample& s);  // straight segment from last_ to s, emitting spaced dabs
+  void curveSegment(const PenSample& p0, const PenSample& p1, const PenSample& p2, const PenSample& p3);
+  std::vector<PenSample> pts_;      // spline control points not yet fully drawn
+  bool spline_ = true;
+  double quant_ = 0;
+  double fx_ = 0, fy_ = 0;  // last raw (snapped) input position
   float diameterAt(float pressure) const;
   float rnd();  // 0..1
   BrushSettings b_;

@@ -138,8 +138,13 @@ void BrushEngine::emit(double x, double y, float pressure) {
   out.push_back({float(x), float(y), r, a, ca, sa, invRound, 0});
 }
 
-void BrushEngine::begin(const PenSample& s, const BrushSettings& b, uint32_t seed) {
+void BrushEngine::begin(const PenSample& s, const BrushSettings& b, uint32_t seed, bool spline) {
   b_ = b;
+  spline_ = spline;
+  pts_.clear();
+  pts_.push_back(s);
+  fx_ = s.x;
+  fy_ = s.y;
   active_ = true;
   last_ = s;
   rng_ = seed * 2654435761u + 12345u;
@@ -152,6 +157,68 @@ void BrushEngine::begin(const PenSample& s, const BrushSettings& b, uint32_t see
 
 void BrushEngine::add(const PenSample& s) {
   if (!active_) return;
+  if (!spline_) { walkTo(s); return; }
+  PenSample in = s;
+  if (quant_ > 0.25) {
+    // Pixel-snapped input: a change of the snapped value means the pen just crossed the border
+    // between two screen pixels, i.e. it is really at the midpoint. Use those crossing points.
+    if (std::abs(s.x - fx_) < 1e-9 && std::abs(s.y - fy_) < 1e-9) {  // same pixel: pressure only
+      pts_.back().pressure = s.pressure;
+      return;
+    }
+    in.x = std::abs(s.x - fx_) > 1e-9 ? (s.x + fx_) * 0.5 : s.x;
+    in.y = std::abs(s.y - fy_) > 1e-9 ? (s.y + fy_) * 0.5 : s.y;
+    fx_ = s.x;
+    fy_ = s.y;
+  }
+  const PenSample& prev = pts_.back();
+  if (std::hypot(s.x - prev.x, s.y - prev.y) < 0.05) {  // no movement: only the pressure changed
+    pts_.back().pressure = s.pressure;
+    return;
+  }
+  pts_.push_back(in);
+  if (pts_.size() == 3) curveSegment(pts_[0], pts_[0], pts_[1], pts_[2]);
+  else if (pts_.size() == 4) {
+    curveSegment(pts_[0], pts_[1], pts_[2], pts_[3]);
+    pts_.erase(pts_.begin());
+  }
+}
+
+void BrushEngine::end() {
+  if (active_ && spline_) {  // draw the last segment (its "next" point is the end point itself)
+    size_t n = pts_.size();
+    if (n == 2) curveSegment(pts_[0], pts_[0], pts_[1], pts_[1]);
+    else if (n >= 3) curveSegment(pts_[n - 3], pts_[n - 2], pts_[n - 1], pts_[n - 1]);
+  }
+  pts_.clear();
+  active_ = false;
+}
+
+// Centripetal Catmull-Rom segment p1 -> p2 (Barry-Goldman form), walked as short straight pieces.
+void BrushEngine::curveSegment(const PenSample& p0, const PenSample& p1, const PenSample& p2, const PenSample& p3) {
+  auto knot = [](const PenSample& a, const PenSample& b) {
+    return std::max(1e-4, std::sqrt(std::hypot(b.x - a.x, b.y - a.y)));
+  };
+  double t0 = 0, t1 = t0 + knot(p0, p1), t2 = t1 + knot(p1, p2), t3 = t2 + knot(p2, p3);
+  double len = std::hypot(p2.x - p1.x, p2.y - p1.y);
+  int pieces = std::clamp(int(std::ceil(len / 2.0)), 1, 256);
+  for (int i = 1; i <= pieces; ++i) {
+    double t = t1 + (t2 - t1) * i / pieces;
+    auto lerp = [](double a, double b, double ta, double tb, double tt) {
+      return tb - ta < 1e-9 ? b : (a * (tb - tt) + b * (tt - ta)) / (tb - ta);
+    };
+    double a1x = lerp(p0.x, p1.x, t0, t1, t), a1y = lerp(p0.y, p1.y, t0, t1, t);
+    double a2x = lerp(p1.x, p2.x, t1, t2, t), a2y = lerp(p1.y, p2.y, t1, t2, t);
+    double a3x = lerp(p2.x, p3.x, t2, t3, t), a3y = lerp(p2.y, p3.y, t2, t3, t);
+    double b1x = lerp(a1x, a2x, t0, t2, t), b1y = lerp(a1y, a2y, t0, t2, t);
+    double b2x = lerp(a2x, a3x, t1, t3, t), b2y = lerp(a2y, a3y, t1, t3, t);
+    double cx = lerp(b1x, b2x, t1, t2, t), cy = lerp(b1y, b2y, t1, t2, t);
+    float pr = float(p1.pressure + (p2.pressure - p1.pressure) * double(i) / pieces);
+    walkTo({cx, cy, pr});
+  }
+}
+
+void BrushEngine::walkTo(const PenSample& s) {
   double dx = s.x - last_.x, dy = s.y - last_.y;
   double len = std::sqrt(dx * dx + dy * dy);
   if (len <= 0) { last_.pressure = s.pressure; return; }

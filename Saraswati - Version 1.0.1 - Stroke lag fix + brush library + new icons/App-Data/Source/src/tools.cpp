@@ -632,7 +632,7 @@ void App::toolUp(double dx, double dy) {
       break;
     }
     case ToolId::Line:
-      strokeBegin({t0x, t0y, 1.0f}, false);
+      strokeBegin({t0x, t0y, 1.0f}, false, false);
       strokeAdd({t1x, t1y, 1.0f});
       strokeEnd();
       break;
@@ -648,7 +648,7 @@ void App::toolUp(double dx, double dy) {
         if (ow && !R.paintCoverage(active, ox, oy, ow, oh, cov.data(), currentStyle(eraserToggle), err) && !err.empty()) error(err);
       } else {
         size_t n = poly.size() / 2;
-        strokeBegin({poly[0], poly[1], 1.0f}, false);
+        strokeBegin({poly[0], poly[1], 1.0f}, false, false);
         for (size_t i = 1; i <= n; ++i) strokeAdd({poly[2 * (i % n)], poly[2 * (i % n) + 1], 1.0f});
         strokeEnd();
       }

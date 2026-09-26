@@ -104,7 +104,7 @@ void App::fitView() {
 // ---------------------------------------------------------------------------
 // Strokes
 
-void App::strokeBegin(const PenSample& s, bool eraser) {
+void App::strokeBegin(const PenSample& s, bool eraser, bool spline) {
   if (!R.hasDocument() || R.stroking()) return;
   const BrushSettings& b = brushes[tipIndex];
   StrokeStyle st;
@@ -119,7 +119,9 @@ void App::strokeBegin(const PenSample& s, bool eraser) {
   st.eraser = eraser || eraserToggle || b.eraser;
   if (!st.eraser) noteColorUsed();
   R.beginStroke(active, st);
-  engine.begin(s, b, strokeSeed++);
+  engine.begin(s, b, strokeSeed++, spline);
+  // mouse positions are whole screen pixels (pen positions are sub-pixel via Windows Ink HIMETRIC)
+  engine.setQuantization(strokeFromPen ? 0.0 : 0.5 / std::max(1e-6, view.zoom));
 }
 
 void App::strokeAdd(const PenSample& s) {
@@ -173,7 +175,7 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   strokeFromPen = pen;
   if (shiftDown && haveLastStroke) {
     // Shift+click: straight line from the end of the previous stroke
-    strokeBegin({lastEndX, lastEndY, pressure}, eraser);
+    strokeBegin({lastEndX, lastEndY, pressure}, eraser, false);
     strokeAdd({dx, dy, pressure});
     flushDabs(tNs);
     strokeEnd();
@@ -1315,6 +1317,29 @@ void App::buildDemo() {
   });
 }
 
+// --splinetest: an arc sampled like a zoomed-out 30k canvas (every sample snapped to a 20 px grid,
+// i.e. one screen pixel at 5 % zoom), drawn without (left) and with (right) spline interpolation.
+void App::buildSplineTest() {
+  demo.push_back([this] { newDocument(2400, 1600, true); });
+  for (int pass = 0; pass < 2; ++pass)
+    demo.push_back([this, pass] {
+      view.zoom = pass ? 0.05 : 1.0;  // pass 1 behaves like 5 % zoom (half-pixel = 10 doc px)
+      tipIndex = brushIndex("Hard round");
+      brushes[tipIndex].size = 50;
+      color[0] = color[1] = color[2] = 0.15f;
+      double ox = pass ? 1250 : 150;
+      auto snap = [](double v) { return std::round(v / 20.0) * 20.0; };
+      for (int k = 0; k <= 900; ++k) {  // dense like a 240 Hz pen, each sample snapped to the pixel grid
+        double t = k / 900.0, a = 3.3 * t;
+        PenSample p{snap(ox + 500 - 450 * std::cos(a) + 150 * t), snap(250 + 1100 * t + 80 * std::sin(a * 2)), 1.0f};
+        if (k == 0) strokeBegin(p, false, pass == 1);
+        else strokeAdd(p);
+      }
+      strokeEnd();
+      fitView();
+    });
+}
+
 // --brushtest: one stroke with every brush of the library (visual check of the brush engine)
 void App::buildBrushTest() {
   demo.push_back([this] { newDocument(1800, 1300, true); });
@@ -1750,6 +1775,7 @@ int App::run() {
   if (opt.demo) buildDemo();
   else if (opt.toolTest) { opt.demo = true; buildToolTest(); }
   else if (opt.brushTest) { opt.demo = true; buildBrushTest(); }
+  else if (opt.splineTest) { opt.demo = true; buildSplineTest(); }
   else if (opt.benchmark)
     startBenchmark(opt.docW ? opt.docW : 8000, opt.docH ? opt.docH : 8000, opt.brushPx > 0 ? opt.brushPx : 1000.0f,
                    opt.tipSet ? opt.tip : Tip::Hard, std::max(1, opt.layers));

@@ -11,7 +11,8 @@ Reference hardware for performance targets: Ryzen 9 5900X, RTX 3090 (24 GB),
 This project uses manual, folder-based versioning instead of editing files in place. Every version of the project lives in its own numbered folder. The folder with the highest version number is always the current, active version.
 
 Folder name format: **`Saraswati - Version X.Y.Z - Short description`**
-(e.g. `Saraswati - Version 1.0.1 - Fixed soft brush edge`). The very first
+(e.g. `Saraswati - Version 1.0.1 - Fixed soft brush edge`). **No commas** in folder names
+(GCC's `-Wl,` linker options split on commas and the Linux build fails); use `+` or "and". The very first
 folder, `Saraswati - Version 1.0.0`, was named by the user without a
 description; every later folder gets one.
 
@@ -75,6 +76,14 @@ How to build the exe:
   `-DCMAKE_EXE_LINKER_FLAGS=-static`, and `-DSARASWATI_GLSLANG=<host-built glslang>` so the
   shaders compile on the host), then run `Saraswati.exe --tooltest --screenshot … --exit`
   under Wine with `VK_DRIVER_FILES` pointing at lavapipe to verify it.
+
+## Version Feature Log Rule (MANDATORY)
+
+`Version Feature Log.txt` at the project root lists, for every version, what was added,
+changed and fixed, in plain language for the user (newest version at the bottom). **Update it
+with every version** — while the version is being built and again before its release folder is
+made — so the log always matches what the version really contains. Never rewrite the entries of
+past versions except to correct a mistake.
 
 ## Folder Layout (inside every version folder)
 
