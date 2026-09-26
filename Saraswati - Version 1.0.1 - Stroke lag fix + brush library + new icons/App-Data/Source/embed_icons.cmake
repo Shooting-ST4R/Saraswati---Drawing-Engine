@@ -1,0 +1,16 @@
+# cmake -DDIR=<icons dir> -DOUT=<header> -P embed_icons.cmake
+# Embeds every *.svg in DIR as a C string table: { name, svg }.
+file(GLOB svgs "${DIR}/*.svg")
+list(SORT svgs)
+set(body "// generated from ${DIR} (Lucide icons, ISC licence - see LICENSE-lucide.txt)\n#pragma once\nstruct EmbeddedIcon { const char* name; const char* svg; };\nstatic const EmbeddedIcon kLucideIcons[] = {\n")
+foreach(f ${svgs})
+  get_filename_component(n "${f}" NAME_WE)
+  file(READ "${f}" c)
+  string(REPLACE "\\" "\\\\" c "${c}")
+  string(REPLACE "\"" "\\\"" c "${c}")
+  string(REPLACE "\r" "" c "${c}")
+  string(REPLACE "\n" " " c "${c}")
+  string(APPEND body "  {\"${n}\", \"${c}\"},\n")
+endforeach()
+string(APPEND body "};\n")
+file(WRITE "${OUT}" "${body}")

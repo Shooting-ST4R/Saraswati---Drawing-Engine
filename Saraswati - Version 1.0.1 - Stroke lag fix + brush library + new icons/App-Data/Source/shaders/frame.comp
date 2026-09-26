@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define WITH_STROKE
+#include "common.glsl"
+#include "view.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// This frame's picture: blend(below, active layer with live stroke), then the "above"
+// cache on top when every layer above is Normal (else the app dispatches them one by one).
+void main() {
+  ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(workImg);
+  if (px.x >= size.x || px.y >= size.y) return;
+  vec2 s = vec2(px) + 0.5;
+  vec4 c = imageLoad(belowImg, px);
+  if ((pc.flags & FLAG_LAYER) != 0) c = blendLayer(c, sampleLayer(s) * pc.layerOpacity, pc.mode);
+  if ((pc.flags & FLAG_ABOVE_CACHE) != 0) {
+    vec4 a = imageLoad(aboveImg, px);
+    c = a + c * (1.0 - a.a);
+  }
+  if ((pc.flags & FLAG_SEL) != 0) {
+    // marching ants on the selection edge (in screen space, so they stay 1 px wide at any zoom)
+    ivec2 d0 = ivec2(floor(screenToDoc(s)));
+    ivec2 d1 = ivec2(floor(screenToDoc(s + vec2(1.0, 0.0))));
+    ivec2 d2 = ivec2(floor(screenToDoc(s + vec2(0.0, 1.0))));
+    ivec2 dm = ivec2(pc.docSize) - 1;
+    bool in0 = imageLoad(selImg, clamp(d0, ivec2(0), dm)).r >= 0.5 && insideDoc(vec2(d0) + 0.5);
+    bool in1 = imageLoad(selImg, clamp(d1, ivec2(0), dm)).r >= 0.5 && insideDoc(vec2(d1) + 0.5);
+    bool in2 = imageLoad(selImg, clamp(d2, ivec2(0), dm)).r >= 0.5 && insideDoc(vec2(d2) + 0.5);
+    if (in0 != in1 || in0 != in2) {
+      bool dark = (((px.x + px.y + pc.antsPhase) >> 2) & 1) == 1;
+      c = dark ? vec4(0.0, 0.0, 0.0, 1.0) : vec4(1.0);
+    }
+  }
+  imageStore(workImg, px, c);
+}
