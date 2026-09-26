@@ -14,6 +14,7 @@ layout(push_constant) uniform ViewPC {
   vec4 paper;         // premultiplied paper colour
   int mode;           // blend mode of the sampled layer
   int antsPhase;      // marching-ants animation offset
+  float flipX;        // -1 = view mirrored horizontally
 } pc;
 
 const int FLAG_STROKE = 1;   // live stroke in the mask applies to the sampled layer
@@ -30,6 +31,7 @@ const int FLAG_SEL    = 256;  // a selection is active: live stroke clipped to i
 
 vec2 screenToDoc(vec2 s) {
   vec2 v = (s - pc.centre) / pc.zoom;
+  v.x *= pc.flipX;
   return pc.pan + vec2(pc.cosT * v.x + pc.sinT * v.y, -pc.sinT * v.x + pc.cosT * v.y);
 }
 

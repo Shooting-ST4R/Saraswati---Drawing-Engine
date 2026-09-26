@@ -99,6 +99,7 @@ int App::legacyTip(int t) const {
 void App::screenToDoc(double sx, double sy, double& dx, double& dy) const {
   double cx = R.extent.width * 0.5, cy = R.extent.height * 0.5;
   double vx = (sx - cx) / view.zoom, vy = (sy - cy) / view.zoom;
+  if (view.flipX) vx = -vx;
   double c = std::cos(view.rotation), s = std::sin(view.rotation);
   dx = view.panX + c * vx + s * vy;
   dy = view.panY - s * vx + c * vy;
@@ -475,51 +476,12 @@ static const char* groupIcon(const std::string& g) {
   return "feather";
 }
 
-void App::drawBrushPanel() {
-  if (!ImGui::Begin("Tool Settings", &showBrush)) { ImGui::End(); return; }
-  drawToolOptions();
-  bool usesBrush = tool == ToolId::Brush || tool == ToolId::Line || ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
-  if (!usesBrush) {
-    if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
-      sliderF("##op", &brushes[tipIndex].opacity, 0.0f, 1.0f, "Opacity  %.2f");
-      ImGui::Checkbox("Erase instead of paint", &eraserToggle);
-    }
-    ImGui::End();
-    return;
-  }
-  // ---- brush library: grouped list with icons ----
-  float fh = ImGui::GetFrameHeight();
-  float listH = std::clamp(ImGui::GetContentRegionAvail().y * 0.42f, fh * 4, fh * 11);
-  ImGui::BeginChild("brushlist", ImVec2(0, listH), ImGuiChildFlags_Borders);
-  std::string lastGroup;
-  for (int i = 0; i < int(brushes.size()); ++i) {
-    const BrushSettings& b = brushes[i];
-    if (b.group != lastGroup) {
-      lastGroup = b.group;
-      ImGui::TextDisabled("%s", b.group.c_str());
-    }
-    ImGui::PushID(i);
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    char label[96];
-    if (i < 9) snprintf(label, sizeof label, "      %s", b.name.c_str());
-    else snprintf(label, sizeof label, "      %s", b.name.c_str());
-    if (ImGui::Selectable(label, i == tipIndex)) tipIndex = i;
-    if (i < 9) {
-      char key[40];
-      snprintf(key, sizeof key, "%s", comboLabel(keys[int(Act::Brush1) + i][0]).c_str());
-      ImVec2 ks = ImGui::CalcTextSize(key);
-      ImGui::GetWindowDrawList()->AddText(ImVec2(ImGui::GetItemRectMax().x - ks.x - 4, p.y), ImGui::GetColorU32(ImGuiCol_TextDisabled), key);
-    }
-    drawIcon(ImGui::GetWindowDrawList(), groupIcon(b.group), ImVec2(p.x + ImGui::GetTextLineHeight() * 0.6f, p.y + ImGui::GetTextLineHeight() * 0.5f),
-             ImGui::GetTextLineHeight(), ImGui::GetColorU32(i == tipIndex ? ImGuiCol_Text : ImGuiCol_TextDisabled));
-    ImGui::PopID();
-  }
-  ImGui::EndChild();
+void App::drawBrushLibraryButtons() {
   BrushSettings& b = brushes[tipIndex];
   // add / reset / delete
   {
     float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3;
-    if (ImGui::Button("New from this", ImVec2(bw, 0))) {
+    if (ImGui::Button("New", ImVec2(bw, 0))) {
       snprintf(newBrushName, sizeof newBrushName, "%s copy", b.name.c_str());
       ImGui::OpenPopup("New brush");
     }
@@ -538,7 +500,6 @@ void App::drawBrushPanel() {
       brushes.erase(brushes.begin() + tipIndex);
       tipIndex = std::max(0, tipIndex - 1);
       ImGui::EndDisabled();
-      ImGui::End();
       return;
     }
     ImGui::EndDisabled();
@@ -559,6 +520,32 @@ void App::drawBrushPanel() {
       }
       ImGui::EndPopup();
     }
+  }
+}
+
+void App::drawBrushPanel() {
+  if (!ImGui::Begin("Tool Settings", &showBrush)) { ImGui::End(); return; }
+  drawToolOptions();
+  bool usesBrush = tool == ToolId::Brush || tool == ToolId::Line || ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
+  if (!usesBrush) {
+    if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
+      sliderF("##op", &brushes[tipIndex].opacity, 0.0f, 1.0f, "Opacity  %.2f");
+      ImGui::Checkbox("Erase instead of paint", &eraserToggle);
+    }
+    ImGui::End();
+    return;
+  }
+  // current brush (the full library with stroke previews is the Tool Group panel)
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  if (ImGui::BeginCombo("##brushsel", brushes[tipIndex].name.c_str(), ImGuiComboFlags_HeightLarge)) {
+    std::string lastGroup;
+    for (int i = 0; i < int(brushes.size()); ++i) {
+      if (brushes[i].group != lastGroup) { lastGroup = brushes[i].group; ImGui::SeparatorText(lastGroup.c_str()); }
+      ImGui::PushID(i);
+      if (ImGui::Selectable(brushes[i].name.c_str(), i == tipIndex)) tipIndex = i;
+      ImGui::PopID();
+    }
+    ImGui::EndCombo();
   }
   BrushSettings& cb = brushes[tipIndex];
   ImGui::Checkbox("Eraser", &eraserToggle);
@@ -1191,7 +1178,7 @@ void App::drawPrefs() {
             return false;
           });
       row("Reset panel layout", "Put all panels back to the default arrangement.", [&] {
-        if (ImGui::Button("Reset layout", ImVec2(-FLT_MIN, 0))) { resetLayout = true; showBrush = showColor = showLayers = true; }
+        if (ImGui::Button("Reset layout", ImVec2(-FLT_MIN, 0))) { resetLayout = true; showBrush = showColor = showLayers = showNav = showToolGroup = true; }
         return false;
       });
       break;
@@ -1280,7 +1267,7 @@ void App::drawStatusBar() {
       ImGui::Separator();
       ImGui::Text("%.1f %%", view.zoom * 100);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Wheel / + - zoom, Ctrl+0 fit, Ctrl+1 100 %%");
-      ImGui::Text("%.0f deg", std::fmod(view.rotation * 180 / kPi + 36000, 360.0));
+      ImGui::Text("%.0f deg%s", std::fmod(view.rotation * 180 / kPi + 36000, 360.0), view.flipX ? "  flipped" : "");
       ImGui::Separator();
       ImGui::Text("%u x %u", R.docW, R.docH);
       if (selActive) { ImGui::Separator(); ImGui::Text("Selection %d x %d", selX1 - selX0, selY1 - selY0); }
@@ -1327,18 +1314,23 @@ void App::drawUI() {
       if (ImGui::MenuItem("100 %", sk(Act::Zoom100))) view.zoom = 1;
       if (ImGui::MenuItem("Zoom in", sk(Act::ZoomIn))) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25);
       if (ImGui::MenuItem("Zoom out", sk(Act::ZoomOut))) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8);
-      if (ImGui::MenuItem("Reset rotation", sk(Act::ResetRotation))) view.rotation = 0;
+      if (ImGui::MenuItem("Reset rotation", sk(Act::ResetRotation))) rotateView(-view.rotation);
+      if (ImGui::MenuItem("Rotate left 15 deg", sk(Act::RotateLeft))) rotateView(-3.14159265358979323846 / 12);
+      if (ImGui::MenuItem("Rotate right 15 deg", sk(Act::RotateRight))) rotateView(3.14159265358979323846 / 12);
+      if (ImGui::MenuItem("Flip horizontally", sk(Act::FlipView), view.flipX)) flipView();
       ImGui::Separator();
       ImGui::MenuItem("Hide panels", sk(Act::HidePanels), &hideUI);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
+      ImGui::MenuItem("Navigator", nullptr, &showNav);
+      ImGui::MenuItem("Tool Group", nullptr, &showToolGroup);
       ImGui::MenuItem("Colour", nullptr, &showColor);
       ImGui::MenuItem("Tool Settings", nullptr, &showBrush);
       ImGui::MenuItem("Layers", nullptr, &showLayers);
       ImGui::MenuItem("Performance", nullptr, &showPerf);
       ImGui::Separator();
-      if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = true; hideUI = false; }
+      if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = showNav = showToolGroup = true; hideUI = false; }
       ImGui::EndMenu();
     }
     drawWindowButtons();
@@ -1356,11 +1348,14 @@ void App::drawUI() {
   }
   if (!hideUI) {
     drawToolbar();
+    if (showNav) drawNavigator(); else R.navWanted = false;
+    if (showToolGroup) drawToolGroup();
     if (showColor) drawColorPanel();
     if (showBrush) drawBrushPanel();
     if (showLayers) drawLayerPanel();
     if (showPerf) drawPerfPanel();
   } else {
+    R.navWanted = false;
     R.updateThumbnails(1);
   }
   drawNewDocDialog();
@@ -1689,6 +1684,7 @@ App::~App() {
   R.finishAsyncRead(floodCache);
   if (xf.active) R.destroyFloating(xf.fl);
   R.destroyFloating(iconAtlas);
+  R.destroyFloating(previewAtlas);
   saveSettings();
 }
 

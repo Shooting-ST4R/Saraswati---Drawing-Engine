@@ -130,7 +130,7 @@ static bool invert3(const double m[9], double o[9]) {
 void App::docToScreen(double dx, double dy, float& sx, float& sy) const {
   double vx = dx - view.panX, vy = dy - view.panY;
   double c = std::cos(view.rotation), s = std::sin(view.rotation);
-  sx = float(R.extent.width * 0.5 + view.zoom * (c * vx - s * vy));
+  sx = float(R.extent.width * 0.5 + view.zoom * (c * vx - s * vy) * (view.flipX ? -1 : 1));
   sy = float(R.extent.height * 0.5 + view.zoom * (s * vx + c * vy));
 }
 

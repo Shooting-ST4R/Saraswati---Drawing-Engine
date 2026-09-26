@@ -58,6 +58,7 @@ struct View {
   double panX = 0, panY = 0;  // document point at the window centre
   double zoom = 1;            // screen px per document px
   double rotation = 0;        // radians
+  bool flipX = false;         // mirrored horizontally (view only, the picture is unchanged)
   bool operator==(const View&) const = default;
 };
 
@@ -274,6 +275,16 @@ class Renderer {
   void growBounds(Layer& l, int x0, int y0, int x1, int y1);
   bool applyLayerUndo(UndoEntry& e);  // non-tile kinds; swaps the entry with the current state
   bool forceTransparentPaper = false;
+  // merged document thumbnail for the Navigator panel
+  GpuImage navImg;
+  VkDescriptorSet navSet0 = VK_NULL_HANDLE, navTexSet = VK_NULL_HANDLE;
+  uint64_t navKey = 0, lastNavNs = 0;
+ public:
+  bool navWanted = false;  // set by the UI while the Navigator is visible
+  VkDescriptorSet navTexture() const { return navTexSet; }
+  uint32_t navW() const { return navImg.width; }
+  uint32_t navH() const { return navImg.height; }
+ private:
   struct FrameSlot {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -314,6 +325,8 @@ class Renderer {
                     const std::function<void(uint32_t row, uint8_t* dst)>& fillRow, std::string& err);
   void readTimestamps(FrameSlot& s);
   void recordThumbnails(VkCommandBuffer cmd);
+  void recordNavigator(VkCommandBuffer cmd);
+  void destroyNavigator();
   uint64_t lastThumbNs = 0;
   // recycled host buffers for undo tiles (size classes of 4, 16 and 64 tiles)
   static constexpr uint32_t kChunkClasses[3] = {4, 16, 64};

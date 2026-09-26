@@ -52,7 +52,8 @@ struct ViewPC {
   float paper[4];
   int32_t mode;
   int32_t antsPhase;
-  int32_t pad[2];
+  float flipX;  // -1 = view mirrored horizontally
+  int32_t pad;
 };
 static_assert(sizeof(ViewPC) == 96);
 struct DabPC {
@@ -835,6 +836,7 @@ void Renderer::destroyDocument() {
   runDeferred(true);
   for (auto& l : layers) destroyLayer(l);
   layers.clear();
+  destroyNavigator();
   destroyImage(device, mask);
   destroyImage(device, sel);
   selectionActive = false;
@@ -1346,6 +1348,7 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   pc.paper[0] = pc.paper[1] = pc.paper[2] = pc.paper[3] = p;
   pc.mode = int(mode);
   pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
+  pc.flipX = v.flipX ? -1.0f : 1.0f;
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
 }
@@ -1750,6 +1753,7 @@ bool Renderer::renderFrame(const FrameParams& p) {
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 3);
     recordFrameComposite(cmd, q);
     recordThumbnails(cmd);
+    recordNavigator(cmd);
     if (pickPending && pickX >= 0 && pickY >= 0 && uint32_t(pickX) < extent.width && uint32_t(pickY) < extent.height) {
       memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
       VkBufferImageCopy c{};

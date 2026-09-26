@@ -176,6 +176,22 @@ class App {
   ToolId tool = ToolId::Brush;
   void setTool(ToolId t);
   void drawToolbar();
+  // Navigator / Tool Group panels (panels.cpp)
+  bool showNav = true, showToolGroup = true;
+  void drawNavigator();
+  void drawToolGroup();
+  void drawBrushLibraryButtons();
+  void keepCanvasCentre(const std::function<void()>& change);
+  void rotateView(double radians);
+  void flipView();
+  void updateBrushPreviews();
+  Floating previewAtlas;
+  std::string previewKey, toolGroupShown;
+  uint64_t previewBuiltNs = 0;
+  int previewW = 0, previewH = 0, lastTipForGroup = -1;
+  // the eraser tool keeps its own brush (e.g. Hard eraser), the brush tool its own
+  int paintTip = -1, eraseTip = -1;
+  void switchToolState(ToolId t, bool eraser);
   void drawToolOptions();
   void drawToolOverlay();
   bool toolDown(double dx, double dy, float sx, float sy);

@@ -286,6 +286,94 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
   }
 }
 
+void Renderer::destroyNavigator() {
+  GpuImage img = navImg;
+  VkDescriptorSet set = navSet0, tex = navTexSet;
+  VkDevice dev = device;
+  VkDescriptorPool pool = descPool;
+  if (!img.image && !set && !tex) return;
+  defer([dev, img, set, tex, pool]() mutable {
+    if (tex) ImGui_ImplVulkan_RemoveTexture(tex);
+    destroyImage(dev, img);
+    if (set) vkFreeDescriptorSets(dev, pool, 1, &set);
+  });
+  navImg = {};
+  navSet0 = navTexSet = VK_NULL_HANDLE;
+  navKey = 0;
+}
+
+// The whole picture, merged, at <= 512 px: blend every visible layer into one small image.
+void Renderer::recordNavigator(VkCommandBuffer cmd) {
+  if (!navWanted || !docW || strokeActive) return;
+  uint64_t now = SDL_GetTicksNS();
+  uint64_t key = revision * 1000003ull + docSerial * 7919ull + (whitePaper ? 1 : 2);
+  for (auto& l : layers)
+    key = key * 1099511628211ull ^ (uint64_t(l.id) << 20 ^ uint64_t(l.visible) << 1 ^ uint64_t(l.opacity * 1000) << 8 ^
+                                     uint64_t(l.mode) << 40 ^ uint64_t(l.thumbDirty));
+  if (key == navKey && navImg.image) return;
+  if (now - lastNavNs < 100000000ull && navImg.image) return;  // at most 10 per second
+  const uint32_t T = 512;
+  uint32_t tw = docW >= docH ? T : std::max(1u, uint32_t(uint64_t(T) * docW / docH));
+  uint32_t th = docW >= docH ? std::max(1u, uint32_t(uint64_t(T) * docH / docW)) : T;
+  if (navImg.image && (navImg.width != tw || navImg.height != th)) destroyNavigator();
+  bool fresh = false;
+  if (!navImg.image) {
+    if (createImage(device, memProps, tw, th, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    navImg) != VK_SUCCESS)
+      return;
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = descPool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &set0Layout;
+    if (vkAllocateDescriptorSets(device, &dai, &navSet0) != VK_SUCCESS) { destroyImage(device, navImg); navImg = {}; return; }
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, navImg.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[3] = {};
+    for (int k = 0; k < 3; ++k) {
+      w[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      w[k].dstSet = navSet0;
+      w[k].dstBinding = uint32_t(2 + k);
+      w[k].descriptorCount = 1;
+      w[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      w[k].pImageInfo = &ii;
+    }
+    vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
+    navTexSet = ImGui_ImplVulkan_AddTexture(navImg.view, VK_IMAGE_LAYOUT_GENERAL);
+    fresh = true;
+  }
+  uint64_t t0 = now;
+  navKey = key;
+  lastNavNs = now;
+  if (fresh)
+    imageBarrier(cmd, navImg.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, kCS,
+                 kRW);
+  else
+    memoryBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, kCS, kRW);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &navSet0, 0, nullptr);
+  View v;
+  v.panX = docW * 0.5;
+  v.panY = docH * 0.5;
+  v.zoom = double(tw) / docW;
+  VkExtent2D ext{tw, th};
+  uint32_t gx = (tw + 15) / 16, gy = (th + 15) / 16;
+  bool first = true;
+  for (auto& l : layers) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
+    if (first) {  // paper (white or transparent)
+      pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
+      vkCmdDispatch(cmd, gx, gy, 1);
+      memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+      first = false;
+    }
+    if (!l.visible) continue;
+    pushView(cmd, v, ext, 0, l.opacity, l.mode);
+    vkCmdDispatch(cmd, gx, gy, 1);
+    memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+  }
+  memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+  lastCpu.thumbMs += (SDL_GetTicksNS() - t0) * 1e-6;
+}
+
 std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int x, int y, uint32_t w, uint32_t h, std::string& err) {
   auto r = std::make_shared<AsyncRead>();
   r->device = device;

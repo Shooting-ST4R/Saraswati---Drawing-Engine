@@ -34,14 +34,28 @@ const char* App::sk(Act a) {
 
 bool App::toolActActive(Act a) const {
   ToolId t = kToolOfAct[int(a)];
-  return tool == t && (t != ToolId::Brush || eraserToggle == (a == Act::ToolEraser));
+  return tool == t && (t != ToolId::Brush || (eraserToggle || brushes[tipIndex].eraser) == (a == Act::ToolEraser));
+}
+
+void App::switchToolState(ToolId t, bool eraser) {
+  auto valid = [&](int i) { return i >= 0 && i < int(brushes.size()); };
+  if (tool == ToolId::Brush) (eraserToggle ? eraseTip : paintTip) = tipIndex;  // remember the brush of each mode
+  if (t == ToolId::Brush) {
+    if (eraser && !valid(eraseTip))
+      for (int i = 0; i < int(brushes.size()); ++i)
+        if (brushes[i].eraser) { eraseTip = i; break; }
+    int want = eraser ? eraseTip : paintTip;
+    if (valid(want)) tipIndex = want;
+    eraserToggle = eraser;
+  } else if (t != tool) {
+    eraserToggle = eraser;  // another tool starts in paint mode (its settings can still erase)
+  }
+  setTool(t);
 }
 
 void App::selectToolAct(Act a) {
   ToolId t = kToolOfAct[int(a)];
-  if (t == ToolId::Brush) eraserToggle = a == Act::ToolEraser;
-  else if (t != tool) eraserToggle = false;  // another tool starts in paint mode (its settings can still erase)
-  setTool(t);
+  switchToolState(t, a == Act::ToolEraser);
 }
 
 void App::releaseToolHold(bool forceRestore) {
@@ -61,8 +75,7 @@ void App::releaseToolHold(bool forceRestore) {
 void App::tickToolRestore() {
   if (!restorePending || engine.active() || toolDrag) return;
   restorePending = false;
-  setTool(restoreTool);
-  eraserToggle = restoreEraser;
+  switchToolState(restoreTool, restoreEraser);
 }
 
 void App::releaseAllKeys() {
@@ -145,8 +158,11 @@ void App::runAction(Act a, SDL_Keycode key, bool repeat) {
     case Act::ZoomOut: center(0.8); break;
     case Act::ZoomFit: fitView(); break;
     case Act::Zoom100: view.zoom = 1; break;
-    case Act::ResetRotation: view.rotation = 0; break;
+    case Act::ResetRotation: rotateView(-view.rotation); break;
     case Act::HidePanels: if (!repeat) hideUI = !hideUI; break;
+    case Act::FlipView: if (!repeat) flipView(); break;
+    case Act::RotateLeft: rotateView(-3.14159265358979323846 / 12); break;
+    case Act::RotateRight: rotateView(3.14159265358979323846 / 12); break;
     default: break;
   }
 }
