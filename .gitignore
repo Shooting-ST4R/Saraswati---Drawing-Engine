@@ -1,0 +1,16 @@
+# downloaded libraries and build output (recreated by fetch-deps / build)
+**/App-Data/Source/third_party/
+**/App-Data/Source/build*/
+**/App-Data/App/*
+!**/App-Data/App/.gitkeep
+# the user's own drawings and app logs never go into git
+**/User-Data/documents/*
+!**/User-Data/documents/.gitkeep
+**/User-Data/logs/*
+!**/User-Data/logs/.gitkeep
+# editor / OS clutter
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
