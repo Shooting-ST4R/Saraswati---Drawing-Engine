@@ -28,12 +28,27 @@ void App::rotateView(double radians) {
   });
 }
 
+// Flipping only changes how the picture is shown (like a mirror); the layers are never touched.
 void App::flipView() { keepCanvasCentre([&] { view.flipX = !view.flipX; }); }
+void App::flipViewV() {
+  keepCanvasCentre([&] {
+    view.flipX = !view.flipX;
+    double r = std::remainder(view.rotation + kPiP, 2 * kPiP);
+    view.rotation = std::abs(r) < 1e-9 ? 0 : r;
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Navigator
 
-static void drawFlipGlyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+static void drawFlipGlyph(ImDrawList* dl, ImVec2 c, float s, ImU32 col, bool vertical = false) {
+  if (vertical) {
+    float h = s * 0.36f, w = s * 0.3f, g = s * 0.07f;
+    for (float x = -h; x < h; x += s * 0.14f) dl->AddLine(ImVec2(c.x + x, c.y), ImVec2(c.x + std::min(h, x + s * 0.07f), c.y), col, 1.0f);
+    dl->AddTriangleFilled(ImVec2(c.x - h * 0.7f, c.y - g), ImVec2(c.x + h * 0.7f, c.y - g), ImVec2(c.x + h * 0.7f, c.y - g - w), col);
+    dl->AddTriangle(ImVec2(c.x - h * 0.7f, c.y + g), ImVec2(c.x + h * 0.7f, c.y + g), ImVec2(c.x + h * 0.7f, c.y + g + w), col, 1.2f);
+    return;
+  }
   float h = s * 0.36f, w = s * 0.3f, g = s * 0.07f;
   for (float y = -h; y < h; y += s * 0.14f) dl->AddLine(ImVec2(c.x, c.y + y), ImVec2(c.x, c.y + std::min(h, y + s * 0.07f)), col, 1.0f);
   dl->AddTriangleFilled(ImVec2(c.x - g, c.y - h * 0.7f), ImVec2(c.x - g, c.y + h * 0.7f), ImVec2(c.x - g - w, c.y + h * 0.7f), col);
@@ -141,6 +156,13 @@ void App::drawNavigator() {
     drawFlipGlyph(ImGui::GetWindowDrawList(), ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), bs,
                   ImGui::GetColorU32(ImGuiCol_Text, view.flipX ? 1.0f : 0.72f));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Flip the view horizontally (to check proportions; the picture is not changed)");
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    if (ImGui::Button("##flipv", ImVec2(bs, bs))) flipViewV();
+    ImGui::PopStyleColor();
+    mn = ImGui::GetItemRectMin(); mx = ImGui::GetItemRectMax();
+    drawFlipGlyph(ImGui::GetWindowDrawList(), ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), bs, ImGui::GetColorU32(ImGuiCol_Text, 0.72f), true);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Flip the view vertically (view only - the picture is not changed; text shows mirrored)");
   }
   ImGui::End();
 }

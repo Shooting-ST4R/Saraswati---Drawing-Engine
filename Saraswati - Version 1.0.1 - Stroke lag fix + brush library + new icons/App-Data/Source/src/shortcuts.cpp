@@ -48,6 +48,7 @@ const ActionInfo kActions[kActCount] = {
     {"view.resetrot", "Reset rotation", "View", {{SDLK_R, 0}, {}}},
     {"view.hideui", "Hide panels", "View", {{SDLK_TAB, 0}, {}}},
     {"view.flip", "Flip view horizontally", "View", {{}, {}}},
+    {"view.flipv", "Flip view vertically", "View", {{}, {}}},
     {"view.rotleft", "Rotate view left 15 deg", "View", {{}, {}}},
     {"view.rotright", "Rotate view right 15 deg", "View", {{}, {}}},
     {"brush.slot1", "Brush slot 1", "Brush & colour", {{SDLK_1, 0}, {}}},

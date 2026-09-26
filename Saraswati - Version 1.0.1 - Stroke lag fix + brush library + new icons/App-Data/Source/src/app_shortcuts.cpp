@@ -165,6 +165,7 @@ void App::runAction(Act a, SDL_Keycode key, bool repeat) {
     case Act::ResetRotation: rotateView(-view.rotation); break;
     case Act::HidePanels: if (!repeat) hideUI = !hideUI; break;
     case Act::FlipView: if (!repeat) flipView(); break;
+    case Act::FlipViewV: if (!repeat) flipViewV(); break;
     case Act::RotateLeft: rotateView(-3.14159265358979323846 / 12); break;
     case Act::RotateRight: rotateView(3.14159265358979323846 / 12); break;
     default: break;

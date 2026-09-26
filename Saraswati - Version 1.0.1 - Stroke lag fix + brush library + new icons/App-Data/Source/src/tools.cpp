@@ -1367,6 +1367,20 @@ void App::buildToolTest() {
     const Layer& b = R.layers[size_t(active - 1)];
     fprintf(stderr, "bubbletest: '%s' over '%s' (sublayer %s)\n", t.name.c_str(), b.name.c_str(), b.parentId == t.id ? "yes" : "NO");
   });
+  // automatic backup: written in the background, then restored and compared
+  demo.push_back([this] {
+    if (userData.empty()) { fprintf(stderr, "backuptest: skipped (no User-Data)\n"); return; }
+    backupTestLayers = R.layers.size();
+    startBackup();
+  });
+  demo.push_back([] {});
+  demo.push_back([this] {
+    if (userData.empty()) return;
+    listBackups();
+    bool ok = !backups.empty() && restoreBackup(backups.front().path);
+    fprintf(stderr, "backuptest: %s (%zu layers restored of %zu, %s)\n", ok && R.layers.size() == backupTestLayers ? "ok" : "FAILED",
+            R.layers.size(), backupTestLayers, backups.empty() ? "no file" : fmtBytes(double(backups.front().bytes)).c_str());
+  });
   // keyboard: tap switches tools, hold (used on the canvas) returns to the previous tool
   demo.push_back([this] {
     auto key = [&](SDL_Keycode k, bool down, SDL_Keymod mod = 0) {

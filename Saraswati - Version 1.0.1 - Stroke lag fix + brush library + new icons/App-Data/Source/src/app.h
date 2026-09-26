@@ -7,6 +7,8 @@
 #include "text.h"
 #include "bubble.h"
 #include <map>
+#include <fstream>
+#include <filesystem>
 #include <array>
 #include <cstring>
 #include <atomic>
@@ -44,6 +46,7 @@ enum class ToolId : int {
 };
 
 void applyUiScale(float scale);  // main.cpp
+std::string fmtBytes(double b);  // app.cpp
 
 class App {
  public:
@@ -187,6 +190,7 @@ class App {
   void keepCanvasCentre(const std::function<void()>& change);
   void rotateView(double radians);
   void flipView();
+  void flipViewV();  // = mirrored + turned 180 deg (view only)
   void updateBrushPreviews();
   Floating previewAtlas;
   std::string previewKey, toolGroupShown;
@@ -293,6 +297,9 @@ class App {
     float undoGB = 0;              // 0 = automatic (25 % of RAM, max 16 GB)
     bool springTools = true;       // holding a tool key switches only while held
     int holdMs = 250;              // held at least this long (or used) = temporary
+    int fpsLimit = 120;            // 0 = unlimited
+    bool backupOn = true;          // automatic backups
+    int backupMinutes = 5, backupKeep = 20;
   } prefs;
   bool showPrefs = false;
   int prefsPage = 0;
@@ -384,6 +391,40 @@ class App {
   void updateBubblePreview();
   void drawBubbleSettings();
   void drawBubbleButtons();
+  // automatic backups (backup.cpp)
+  struct BackupInfo { std::string path, document, when; uint64_t bytes = 0; };
+  struct BackupLayer {
+    uint32_t id, parentId;
+    std::string name;
+    bool visible;
+    float opacity;
+    int mode;
+    bool lockAlpha;
+    int x0, y0, x1, y1;
+  };
+  std::vector<BackupInfo> backups;
+  std::vector<BackupLayer> backupLayers;
+  size_t backupNext = 0;
+  int backupStage = 0, restorePick = 0;
+  uint64_t lastBackupNs = 0, backupRevision = ~0ull, backupStartRevision = 0, backupDoc = 0;
+  std::shared_ptr<AsyncRead> backupRead;
+  std::future<bool> backupJob;
+  std::ofstream backupFile;
+  std::string backupTmp, lastBackupText;
+  bool crashedLastTime = false, showRestore = false;
+  std::string backupRoot() const;
+  void backupStartup();
+  void backupShutdown();
+  void listBackups();
+  void tickBackup();
+  void startBackup();
+  void abortBackup(const std::string& why);
+  bool restoreBackup(const std::string& path);
+  void drawRestoreDialog();
+  std::string pendingSavePath, pathBeforeSave;
+  uint64_t lastPresentNs = 0;
+  size_t backupTestLayers = 0;
+  std::atomic<bool> saveVerifying{false};
   // sublayers (e.g. a bubble under its text): always directly below their parent, move with it
   bool isSublayer(const Layer& l) const { return l.parentId && R.indexOf(l.parentId) >= 0; }
   uint32_t topLevelId(int index) const;
@@ -458,7 +499,7 @@ class App {
   std::atomic<float> saveProgress{0};
   std::mutex saveMutex;
   std::string saveMessage;
-  bool saveDone = false;
+  std::atomic<bool> saveDone{false};  // set by the save thread; wakes the main loop
   bool savedForTest = false;
 public:
   ~App();

@@ -39,6 +39,13 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
 // Flattened PNG (with alpha) or JPEG (over white), chosen by the file extension.
 bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err);
 
+// Safe saving: write to a temporary file (flushed to disk), read it back and compare, then replace.
+struct PsdCheck { int32_t x = 0, y = 0; uint32_t w = 0, h = 0; uint64_t hash = 0; bool visible = true; uint8_t opacity = 255; BlendMode mode = BlendMode::Normal; };
+bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& merged, std::string& err, float* progress = nullptr);
+std::vector<PsdCheck> psdChecks(const DocFile& doc);
+bool verifyPsd(const std::string& file, uint32_t w, uint32_t h, const std::vector<PsdCheck>& expect, std::string& err);
+bool commitFileReplace(const std::string& tmp, const std::string& path, std::string& err);
+
 // In-memory PNG (system clipboard): encode straight RGBA, decode any stb-supported image.
 bool encodePngMemory(const ImageRGBA& img, std::vector<uint8_t>& out);
 bool decodeImageMemory(const void* data, size_t size, ImageRGBA& out, std::string& err);

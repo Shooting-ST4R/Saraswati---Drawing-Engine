@@ -15,6 +15,13 @@
 #include <cstring>
 #include <filesystem>
 #include <thread>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -28,6 +35,34 @@ static FILE* openUtf8(const std::string& path, const char* mode) {
   return _wfopen(p.c_str(), wmode.c_str());
 #else
   return fopen(path.c_str(), mode);
+#endif
+}
+
+// Everything written is on the disk before the file is renamed into place (power loss / crash
+// can never leave a half-written file under the real name).
+static bool syncAndClose(FILE* f) {
+  bool ok = fflush(f) == 0;
+#ifdef _WIN32
+  ok = ok && _commit(_fileno(f)) == 0;
+#else
+  ok = ok && fsync(fileno(f)) == 0;
+#endif
+  return (fclose(f) == 0) && ok;
+}
+
+// Atomically replaces `path` with `tmp` (the old file stays intact if anything fails).
+bool commitFileReplace(const std::string& tmp, const std::string& path, std::string& err) {
+  fs::path from(reinterpret_cast<const char8_t*>(tmp.c_str())), to(reinterpret_cast<const char8_t*>(path.c_str()));
+#ifdef _WIN32
+  if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+  err = "Could not replace " + path + " (error " + std::to_string(GetLastError()) + "). The new file was kept as " + tmp;
+  return false;
+#else
+  std::error_code ec;
+  fs::rename(from, to, ec);  // POSIX rename replaces atomically
+  if (!ec) return true;
+  err = "Could not replace " + path + ": " + ec.message() + ". The new file was kept as " + tmp;
+  return false;
 #endif
 }
 
@@ -147,12 +182,17 @@ bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err
       unsigned a = img.rgba[i * 4 + 3];
       for (int k = 0; k < 3; ++k) rgb[i * 3 + k] = uint8_t((img.rgba[i * 4 + k] * a + 255 * (255 - a) + 127) / 255);
     }
-    ok = stbi_write_jpg(path.c_str(), int(img.w), int(img.h), 3, rgb.data(), 92);
+    ok = stbi_write_jpg((path + ".saving").c_str(), int(img.w), int(img.h), 3, rgb.data(), 92);
   } else {
-    ok = stbi_write_png(path.c_str(), int(img.w), int(img.h), 4, img.rgba.data(), int(img.w) * 4);
+    ok = stbi_write_png((path + ".saving").c_str(), int(img.w), int(img.h), 4, img.rgba.data(), int(img.w) * 4);
   }
-  if (!ok) err = "Could not write " + path;
-  return ok != 0;
+  if (!ok) {
+    err = "Could not write " + path + " (disk full or no permission?)";
+    std::error_code ec;
+    fs::remove(fs::path(reinterpret_cast<const char8_t*>((path + ".saving").c_str())), ec);
+    return false;
+  }
+  return commitFileReplace(path + ".saving", path, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +593,8 @@ static void encodeChannelRle(const uint8_t* rgba, uint32_t stride, uint32_t x0, 
   for (auto& p : parts) out.insert(out.end(), p.begin(), p.end());
 }
 
-bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merged, std::string& err, float* progress) {
+bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& merged, std::string& err, float* progress) {
+  const std::string& path = tmp;
   // Tight bounds of each layer (skip fully transparent borders).
   struct Box { uint32_t x0, y0, x1, y1; };
   std::vector<Box> boxes;
@@ -573,9 +614,9 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
     rawBytes += double(b.x1 - b.x0) * (b.y1 - b.y0) * 4.1;
   }
   bool psb = doc.w > 30000 || doc.h > 30000 || rawBytes > 3.9e9;
-  std::string tmp = path + ".saving";
   FILE* f = openUtf8(tmp, "wb");
-  if (!f) { err = "Cannot write " + path; return false; }
+  std::string shown = tmp.size() > 7 && tmp.compare(tmp.size() - 7, 7, ".saving") == 0 ? tmp.substr(0, tmp.size() - 7) : tmp;
+  if (!f) { err = "Cannot write " + shown + " (folder missing, no permission, or disk full)"; return false; }
   Writer w(f);
   w.bytes("8BPS", 4);
   w.u16(psb ? 2 : 1);
@@ -602,7 +643,12 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
   for (size_t li = 0; li < doc.layers.size(); ++li) {
     const DocLayer& L = doc.layers[li];
     const Box& b = boxes[li];
-    w.u32(b.y0); w.u32(b.x0); w.u32(b.y1); w.u32(b.x1);
+    if (b.x1 > b.x0) {  // layer pixels may start anywhere in the document (L.x, L.y)
+      w.u32(uint32_t(L.y + int32_t(b.y0))); w.u32(uint32_t(L.x + int32_t(b.x0)));
+      w.u32(uint32_t(L.y + int32_t(b.y1))); w.u32(uint32_t(L.x + int32_t(b.x1)));
+    } else {
+      w.u32(0); w.u32(0); w.u32(0); w.u32(0);
+    }
     w.u16(4);
     const int16_t ids[4] = {-1, 0, 1, 2};
     for (int c = 0; c < 4; ++c) {
@@ -682,23 +728,93 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
   for (auto& p : planes) w.bytes(p.data(), size_t(merged.h) * cw);
   for (auto& p : planes) w.bytes(p.data() + size_t(merged.h) * cw, p.size() - size_t(merged.h) * cw);
   bool ok = w.ok();
-  if (fclose(f) != 0) ok = false;
+  if (!syncAndClose(f)) ok = false;
   if (!ok) {
     std::error_code ec;
     fs::remove(fs::path(reinterpret_cast<const char8_t*>(tmp.c_str())), ec);
-    err = "Write error while saving " + path + " (disk full?)";
+    err = "Write error while saving " + shown + " (disk full?)";
     return false;
-  }
-  std::error_code ec;
-  fs::path to(reinterpret_cast<const char8_t*>(path.c_str()));
-  fs::rename(fs::path(reinterpret_cast<const char8_t*>(tmp.c_str())), to, ec);
-  if (ec) {
-    fs::remove(to, ec);
-    fs::rename(fs::path(reinterpret_cast<const char8_t*>(tmp.c_str())), to, ec);
-    if (ec) { err = "Could not replace " + path + ": " + ec.message(); return false; }
   }
   if (progress) *progress = 1.0f;
   return true;
+}
+
+static uint64_t fnv(uint64_t h, const uint8_t* p, size_t n) {
+  for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+  return h;
+}
+
+// What the file must contain: per layer the written rectangle, its pixels' hash and the properties.
+std::vector<PsdCheck> psdChecks(const DocFile& doc) {
+  std::vector<PsdCheck> out;
+  for (const DocLayer& L : doc.layers) {
+    PsdCheck c;
+    uint32_t x0 = L.w, y0 = L.h, x1 = 0, y1 = 0;
+    for (uint32_t y = 0; y < L.h; ++y)
+      for (uint32_t x = 0; x < L.w; ++x)
+        if (L.rgba[(size_t(y) * L.w + x) * 4 + 3]) { x0 = std::min(x0, x); x1 = std::max(x1, x + 1); y0 = std::min(y0, y); y1 = std::max(y1, y + 1); }
+    if (x0 < x1) {
+      c.x = L.x + int32_t(x0); c.y = L.y + int32_t(y0); c.w = x1 - x0; c.h = y1 - y0;
+      uint64_t h = 1469598103934665603ull;
+      for (uint32_t y = y0; y < y1; ++y) h = fnv(h, &L.rgba[(size_t(y) * L.w + x0) * 4], size_t(c.w) * 4);
+      c.hash = h;
+    }
+    c.visible = L.visible;
+    c.opacity = uint8_t(std::lround(std::clamp(L.opacity, 0.0f, 1.0f) * 255));
+    c.mode = L.mode;
+    out.push_back(c);
+  }
+  return out;
+}
+
+// Reads the written file back with the normal loader and compares everything that was saved.
+bool verifyPsd(const std::string& file, uint32_t w, uint32_t h, const std::vector<PsdCheck>& expect, std::string& err) {
+  DocFile d;
+  std::string e;
+  if (!loadPsd(file, d, e)) { err = "the written file could not be read back: " + e; return false; }
+  if (d.w != w || d.h != h) { err = "the written file has the wrong size"; return false; }
+  if (d.layers.size() != expect.size()) {
+    err = "the written file has " + std::to_string(d.layers.size()) + " layers instead of " + std::to_string(expect.size());
+    return false;
+  }
+  for (size_t i = 0; i < expect.size(); ++i) {
+    const PsdCheck& c = expect[i];
+    const DocLayer& L = d.layers[i];
+    std::string which = "layer " + std::to_string(i + 1);
+    if (L.visible != c.visible || uint8_t(std::lround(L.opacity * 255)) != c.opacity || L.mode != c.mode) {
+      err = which + ": properties differ after saving";
+      return false;
+    }
+    if (c.w == 0) {
+      bool any = false;
+      for (size_t k = 3; k < L.rgba.size(); k += 4) any |= L.rgba[k] != 0;
+      if (any) { err = which + ": should be empty"; return false; }
+      continue;
+    }
+    // the loader may return a larger rect; compare exactly the expected one
+    if (L.x > c.x || L.y > c.y || L.x + int64_t(L.w) < c.x + int64_t(c.w) || L.y + int64_t(L.h) < c.y + int64_t(c.h)) {
+      err = which + ": pixels are missing after saving";
+      return false;
+    }
+    uint64_t hsh = 1469598103934665603ull;
+    for (uint32_t y = 0; y < c.h; ++y)
+      hsh = fnv(hsh, &L.rgba[(size_t(c.y - L.y + int32_t(y)) * L.w + size_t(c.x - L.x)) * 4], size_t(c.w) * 4);
+    if (hsh != c.hash) { err = which + ": pixels differ after saving"; return false; }
+  }
+  return true;
+}
+
+bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merged, std::string& err, float* progress) {
+  std::string tmp = path + ".saving";
+  if (!writePsdFile(tmp, doc, merged, err, progress)) return false;
+  std::string verr;
+  if (!verifyPsd(tmp, doc.w, doc.h, psdChecks(doc), verr)) {
+    std::error_code ec;
+    fs::remove(fs::path(reinterpret_cast<const char8_t*>(tmp.c_str())), ec);
+    err = "Saving was stopped - " + verr + ". The previous file was not touched.";
+    return false;
+  }
+  return commitFileReplace(tmp, path, err);
 }
 
 bool encodePngMemory(const ImageRGBA& img, std::vector<uint8_t>& out) {

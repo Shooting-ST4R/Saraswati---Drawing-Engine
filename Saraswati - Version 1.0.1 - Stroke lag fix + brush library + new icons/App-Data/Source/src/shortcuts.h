@@ -14,7 +14,7 @@ enum class Act : int {
   Undo, Redo, New, Open, Save, SaveAs, Import, Export, Prefs,
   SelectAll, Deselect, InvertSel, ClearSel, FillSel, Cut, Copy, Paste, ClearOutside,
   SwapColors, BrushSmaller, BrushBigger,
-  ZoomIn, ZoomOut, ZoomFit, Zoom100, ResetRotation, HidePanels, FlipView, RotateLeft, RotateRight,
+  ZoomIn, ZoomOut, ZoomFit, Zoom100, ResetRotation, HidePanels, FlipView, FlipViewV, RotateLeft, RotateRight,
   Brush1, Brush2, Brush3, Brush4, Brush5, Brush6, Brush7, Brush8, Brush9,
   Count
 };

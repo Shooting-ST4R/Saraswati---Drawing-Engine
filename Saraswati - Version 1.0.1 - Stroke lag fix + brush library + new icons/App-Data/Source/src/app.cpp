@@ -30,7 +30,7 @@ static std::string findUserData() {
   return p.string();
 }
 
-static std::string fmtBytes(double b) {
+std::string fmtBytes(double b) {
   char buf[64];
   if (b >= 1024.0 * 1024 * 1024) snprintf(buf, sizeof buf, "%.2f GB", b / (1024.0 * 1024 * 1024));
   else snprintf(buf, sizeof buf, "%.1f MB", b / (1024.0 * 1024));
@@ -1177,6 +1177,13 @@ void App::drawPrefs() {
           toggle(&prefs.perfAtStart));
       row("Ask before discarding changes", "When quitting, creating or opening a document with unsaved changes.",
           toggle(&prefs.confirmUnsaved));
+      row("Automatic backups", "Saves a copy of the picture in the background (no dialogs, no waiting) whenever it changed. "
+                               "After a crash, the next start offers to restore it. File > Restore from backup lists all versions.",
+          toggle(&prefs.backupOn));
+      row("Backup every", "Minutes between automatic backups.",
+          [&] { return ImGui::SliderInt("##bm", &prefs.backupMinutes, 1, 60, "%d min"); });
+      row("Backup versions kept", "Older backups of the same picture are deleted.",
+          [&] { return ImGui::SliderInt("##bk", &prefs.backupKeep, 1, 200, "%d"); });
       break;
     case 1: {
       row("Interface size", "Automatic follows the Windows display scaling of the monitor the window is on (e.g. 150 % on a "
@@ -1223,6 +1230,16 @@ void App::drawPrefs() {
       break;
     }
     case 4: {
+      row("Frame rate limit", "Maximum frames per second drawn on screen. Pen input is still read at full speed; a limit "
+                              "saves GPU power and heat. Pick your monitor's refresh rate or higher.",
+          [&] {
+            const int vals[] = {30, 60, 90, 120, 144, 165, 240, 360, 0};
+            const char* items[] = {"30 fps", "60 fps", "90 fps", "120 fps", "144 fps", "165 fps", "240 fps", "360 fps", "Unlimited"};
+            int cur = 3;
+            for (int i = 0; i < 9; ++i) if (vals[i] == prefs.fpsLimit) cur = i;
+            if (ImGui::Combo("##fps", &cur, items, 9)) { prefs.fpsLimit = vals[cur]; return true; }
+            return false;
+          });
       row("Undo steps", "How many steps back you can go. More steps use more system memory.",
           [&] { return ImGui::SliderInt("##us", &prefs.undoSteps, 5, 500); });
       char auto_[64];
@@ -1285,10 +1302,12 @@ void App::drawStatusBar() {
       if (selActive) { ImGui::Separator(); ImGui::Text("Selection %d x %d", selX1 - selX0, selY1 - selY0); }
       if (xf.active) { ImGui::Separator(); ImGui::TextUnformatted("Transforming - Enter applies, Esc cancels"); }
       ImGui::Separator();
-      if (saving) ImGui::TextUnformatted("Saving...");
+      if (saving) ImGui::TextUnformatted(saveVerifying ? "Checking the saved file..." : "Saving...");
       else if (flooding) ImGui::TextUnformatted("Working...");
       else if (SDL_GetTicksNS() < toastUntil) ImGui::TextUnformatted(toast.c_str());
       else if (R.cpuEmulation) ImGui::TextDisabled("CPU emulation");
+      if (backupStage) { ImGui::Separator(); ImGui::TextDisabled("Backing up..."); }
+      else if (!lastBackupText.empty()) { ImGui::Separator(); ImGui::TextDisabled("%s", lastBackupText.c_str()); }
       ImGui::EndMenuBar();
     }
   }
@@ -1352,7 +1371,8 @@ void App::drawUI() {
       if (ImGui::MenuItem("Reset rotation", sk(Act::ResetRotation))) rotateView(-view.rotation);
       if (ImGui::MenuItem("Rotate left 15 deg", sk(Act::RotateLeft))) rotateView(-3.14159265358979323846 / 12);
       if (ImGui::MenuItem("Rotate right 15 deg", sk(Act::RotateRight))) rotateView(3.14159265358979323846 / 12);
-      if (ImGui::MenuItem("Flip horizontally", sk(Act::FlipView), view.flipX)) flipView();
+      if (ImGui::MenuItem("Flip view horizontally", sk(Act::FlipView), view.flipX)) flipView();
+      if (ImGui::MenuItem("Flip view vertically", sk(Act::FlipViewV))) flipViewV();
       ImGui::Separator();
       ImGui::MenuItem("Hide panels", sk(Act::HidePanels), &hideUI);
       ImGui::EndMenu();
@@ -1418,6 +1438,7 @@ void App::drawUI() {
   drawToolOverlay();
   drawSelectionBar();
   drawBubbleButtons();
+  drawRestoreDialog();
   drawAdjustDialog();
   if (growPopup) { ImGui::OpenPopup("Grow / shrink selection"); growPopup = false; }
   if (ImGui::BeginPopupModal("Grow / shrink selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1713,7 +1734,7 @@ void App::buildBrushTest() {
 void App::tickDemo() {
   if (demoDone || demo.empty()) return;
   // wait for the GPU to finish the previous step (the last step leaves a stroke open on purpose)
-  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn && !textPreviewOn) || flooding || clipping || hoverDirty || !fonts.ready() || textEdit.dirty) && !(demoStep == demo.size())) return;
+  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn && !textPreviewOn) || flooding || clipping || hoverDirty || !fonts.ready() || textEdit.dirty || backupStage != 0) && !(demoStep == demo.size())) return;
   if (demoStep < demo.size()) {
     demo[demoStep++]();
     framesToRender = std::max(framesToRender, 3);
@@ -1736,6 +1757,7 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
   if (flooding) floodJob.wait();
+  backupShutdown();
   if (clipping) clipJob.wait();
   R.finishAsyncRead(clipRead);
   if (floodRead == floodCache) floodRead.reset();  // same read-back: release it once
@@ -1796,6 +1818,13 @@ void App::loadSettings() {
         }
       }
     }
+    else if (k == "fps") prefs.fpsLimit = std::clamp(atoi(v), 0, 1000);
+    else if (k == "backup") {
+      int on = 1, mins = 5, keep = 20;
+      if (sscanf(v, "%d %d %d", &on, &mins, &keep) == 3) {
+        prefs.backupOn = on != 0; prefs.backupMinutes = std::clamp(mins, 1, 60); prefs.backupKeep = std::clamp(keep, 1, 200);
+      }
+    }
     else if (k == "hold") {
       int sp = 1, ms = 250;
       if (sscanf(v, "%d %d", &sp, &ms) == 2) { prefs.springTools = sp != 0; prefs.holdMs = std::clamp(ms, 100, 800); }
@@ -1836,6 +1865,8 @@ void App::saveSettings() {
             b.sizeJitter, b.flowJitter, b.buildUp ? 1 : 0, b.particles, b.particleSize, b.pressureSize ? 1 : 0, b.minSize,
             b.pressureOpacity ? 1 : 0, b.gamma, b.eraser ? 1 : 0, b.group.c_str(), b.name.c_str());
   fprintf(f, "hold %d %d\n", prefs.springTools ? 1 : 0, prefs.holdMs);
+  fprintf(f, "backup %d %d %d\n", prefs.backupOn ? 1 : 0, prefs.backupMinutes, prefs.backupKeep);
+  fprintf(f, "fps %d\n", prefs.fpsLimit);
   for (int a = 0; a < kActCount; ++a)  // only changed shortcuts are stored, so new defaults reach old settings files
     if (!(keys[a][0] == actionInfo(Act(a)).def[0] && keys[a][1] == actionInfo(Act(a)).def[1]))
       fprintf(f, "key %s %u %d %u %d\n", actionInfo(Act(a)).id, unsigned(keys[a][0].key), keys[a][0].mods,
@@ -1907,6 +1938,7 @@ void App::processDialogResults() {
     saveDone = false;
     if (saveThread.joinable()) saveThread.join();
     if (!saveMessage.empty()) {
+      documentPath = pathBeforeSave;  // the document is still where it was
       error(saveMessage);
       continueAfterSave = false;
       pendingAction = PA_None;
@@ -1922,6 +1954,7 @@ void App::processDialogResults() {
 void App::drawFileDialogs() {
   bool busy = R.stroking() || saving;
   if (ImGui::MenuItem("Open...", sk(Act::Open), false, !busy)) requestAction(PA_OpenDialog);
+  if (ImGui::MenuItem("Restore from backup...", nullptr, false, !busy && !userData.empty())) showRestore = true;
   if (ImGui::MenuItem("Import image as layer...", sk(Act::Import), false, !busy && R.hasDocument())) showDialog(DlgImport);
   ImGui::Separator();
   if (ImGui::MenuItem("Save", sk(Act::Save), false, !busy && R.hasDocument())) {
@@ -2024,45 +2057,95 @@ void App::importAsLayer(const std::string& path) {
 }
 
 void App::saveFile(const std::string& path) {
-  if (!R.hasDocument() || R.stroking() || saving) return;
-  // GPU readback happens here (fast on a real GPU); encoding and disk I/O run on a worker thread.
-  R.waitIdle();
+  if (!R.hasDocument()) return;
+  if (saving) { pendingSavePath = path; return; }  // saved again as soon as the running save is done
+  // everything that is not in the layers yet goes in first (nothing is silently left out)
+  if (textEdit.active) commitText();
+  if (xf.active) applyTransform();
+  if (hoverPreviewOn || previewing) cancelPreviews();
+  if (engine.active()) strokeEnd();
+  if (R.stroking()) { pendingSavePath = path; return; }  // the stroke lands in the layer next frame: save then
   auto doc = std::make_shared<DocFile>();
   auto merged = std::make_shared<ImageRGBA>();
   doc->w = R.docW;
   doc->h = R.docH;
   std::string err;
-  for (size_t i = 0; i < R.layers.size(); ++i) {
-    DocLayer L;
-    const Layer& src = R.layers[i];
-    L.name = src.name;
-    L.visible = src.visible;
-    L.opacity = src.opacity;
-    L.mode = src.mode;
-    L.w = R.docW;
-    L.h = R.docH;
-    if (!R.readLayerPixels(int(i), L.rgba, err)) { error("Save failed: " + err); return; }
-    doc->layers.push_back(std::move(L));
+  try {
+    // GPU readback of only the painted area of each layer; encoding, checking and disk I/O run on a worker thread
+    R.waitIdle();
+    for (size_t i = 0; i < R.layers.size(); ++i) {
+      DocLayer L;
+      const Layer& src = R.layers[i];
+      L.name = src.name;
+      L.visible = src.visible;
+      L.opacity = src.opacity;
+      L.mode = src.mode;
+      int x0 = std::max(src.bx0, 0), y0 = std::max(src.by0, 0);
+      int x1 = std::min(src.bx1, int(R.docW)), y1 = std::min(src.by1, int(R.docH));
+      if (x0 < x1 && y0 < y1) {
+        L.x = x0; L.y = y0;
+        L.w = uint32_t(x1 - x0); L.h = uint32_t(y1 - y0);
+        if (!R.readLayerRegion(int(i), x0, y0, L.w, L.h, L.rgba, err)) { error("Save failed: " + err); return; }
+      }
+      doc->layers.push_back(std::move(L));
+    }
+    merged->w = R.docW;
+    merged->h = R.docH;
+    if (!R.readMergedPixels(merged->rgba, err)) { error("Save failed: " + err); return; }
+  } catch (const std::bad_alloc&) {
+    error("Not enough memory to save this document right now.\nClose other programs and try again - nothing was written.");
+    return;
   }
-  merged->w = R.docW;
-  merged->h = R.docH;
-  if (!R.readMergedPixels(merged->rgba, err)) { error("Save failed: " + err); return; }
   if (saveThread.joinable()) saveThread.join();
   saving = true;
+  saveVerifying = false;
   saveProgress = 0;
+  pathBeforeSave = documentPath;
   documentPath = path;
   revisionAtSave = R.revision;
   lastFolder = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).parent_path().string();
   saveThread = std::thread([this, doc, merged, path] {
-    for (auto& L : doc->layers) unpremultiply(L.rgba);
-    unpremultiply(merged->rgba);
     std::string e;
-    float prog = 0;
-    bool ok = savePsd(path, *doc, *merged, e, &prog);
+    bool ok = false;
+    std::string tmp = path + ".saving";
+    try {
+      for (auto& L : doc->layers) unpremultiply(L.rgba);
+      unpremultiply(merged->rgba);
+      float prog = 0;
+      ok = writePsdFile(tmp, *doc, *merged, e, &prog);
+      if (ok) {
+        // read the file back and compare every layer before it replaces the old one
+        std::vector<PsdCheck> checks = psdChecks(*doc);
+        uint32_t w = doc->w, h = doc->h;
+        doc->layers.clear();
+        doc->layers.shrink_to_fit();
+        merged->rgba.clear();
+        merged->rgba.shrink_to_fit();
+        saveVerifying = true;
+        std::string verr;
+        if (!verifyPsd(tmp, w, h, checks, verr)) {
+          ok = false;
+          e = "Saving was stopped - " + verr + ".\nThe previous file was not touched.";
+        } else {
+          ok = commitFileReplace(tmp, path, e);
+        }
+      }
+    } catch (const std::bad_alloc&) {
+      ok = false;
+      e = "Not enough memory to finish saving. The previous file was not touched.";
+    } catch (const std::exception& ex) {
+      ok = false;
+      e = std::string("Unexpected error while saving: ") + ex.what() + ". The previous file was not touched.";
+    }
+    if (!ok) {
+      std::error_code ec;
+      if (e.find("was kept as") == std::string::npos) fs::remove(fs::path(reinterpret_cast<const char8_t*>(tmp.c_str())), ec);
+    }
     std::lock_guard<std::mutex> lock(saveMutex);
     saveMessage = ok ? std::string() : "Save failed: " + e;
     saveOk = ok;
-    if (ok) SDL_Log("saved %s", path.c_str());
+    if (ok) SDL_Log("saved %s (verified)", path.c_str());
+    else SDL_Log("save failed: %s", e.c_str());
     saveDone = true;
     saving = false;
   });
@@ -2110,6 +2193,7 @@ int App::run() {
     io.IniFilename = iniPath.c_str();
     settingsPath = (fs::path(userData) / "settings" / "settings.txt").string();
     fonts.startScan((fs::path(userData) / "settings" / "fontcache.txt").string());
+    backupStartup();
     loadSettings();
     applyPrefs();
     if (prefs.perfAtStart) showPerf = true;
@@ -2145,7 +2229,8 @@ int App::run() {
 
   bool wantShot = !opt.screenshot.empty();
   while (running) {
-    bool animating = bench.running || saving || flooding || hoverDirty || textEdit.active || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
+    bool animating = bench.running || saving || saveDone || !pendingSavePath.empty() || clipping || backupStage != 0 ||
+                     flooding || hoverDirty || textEdit.active || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
                      (wantShot && !screenshotTaken);
     SDL_Event e;
     if (!animating) {
@@ -2185,10 +2270,16 @@ int App::run() {
     }
     tickBenchmark();
     tickToolRestore();
+    tickBackup();
+    if (!pendingSavePath.empty() && !saving && !R.stroking() && !engine.active()) {
+      std::string p = std::move(pendingSavePath);
+      pendingSavePath.clear();
+      saveFile(p);
+    }
     tickDemo();
     if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && engine.active() && (!wantShot || screenshotTaken))
       strokeEnd();  // the demo leaves its last stroke open; finish it before saving
-    if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && !R.busy() && !bench.running &&
+    if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && (!R.busy() || hoverPreviewOn || textPreviewOn) && !bench.running &&
         (!wantShot || screenshotTaken)) {
       savedForTest = true;
       saveFile(opt.save);
@@ -2208,6 +2299,18 @@ int App::run() {
     p.view = view;
     p.activeLayer = active;
     p.imgui = ImGui::GetDrawData();
+    // frame-rate limit: keep taking input while waiting for the next frame slot (never delays input,
+    // only the redraw; benchmark and test runs are not limited)
+    if (prefs.fpsLimit > 0 && !bench.running && !opt.demo && lastPresentNs) {
+      uint64_t minNs = 1000000000ull / uint64_t(prefs.fpsLimit);
+      while (SDL_GetTicksNS() - lastPresentNs < minNs) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) handleEvent(ev);
+        uint64_t left = minNs - std::min(minNs, SDL_GetTicksNS() - lastPresentNs);
+        if (left) SDL_DelayPrecise(std::min<uint64_t>(left, 1000000ull));
+      }
+    }
+    lastPresentNs = SDL_GetTicksNS();
     bool shotNow = false;
     if (wantShot && !screenshotTaken) {
       bool ready = opt.demo ? (demoDone && framesRendered > 2)
@@ -2262,7 +2365,8 @@ int App::run() {
       }
     }
     if (framesToRender > 0) --framesToRender;
-    if (opt.exitAfter && (!wantShot || screenshotTaken) && !saving && (opt.save.empty() || savedForTest)) {
+    if (opt.exitAfter && (!wantShot || screenshotTaken) && !saving && !saveDone && pendingSavePath.empty() &&
+        (opt.save.empty() || savedForTest)) {
       if ((opt.benchmark && !bench.running && !bench.report.empty()) || (opt.demo && demoDone) || !opt.save.empty())
         running = false;
     }
