@@ -17,6 +17,7 @@ layout(push_constant) uniform ViewPC {
   float flipX;        // -1 = view mirrored horizontally
   int adjType;        // live colour-adjustment preview on the active layer (FLAG_ADJ)
   vec4 adjP;
+  int fx;             // this layer's record in the effect buffer, -1 = none
 } pc;
 
 const int FLAG_STROKE = 1;   // live stroke in the mask applies to the sampled layer
@@ -43,6 +44,99 @@ bool insideDoc(vec2 d) {
 }
 
 #include "adjust.glsl"
+#include "tone_shapes.glsl"
+
+// Per-layer effects (Layer Properties), one record per layer index. Non-destructive: applied to
+// the layer colour while compositing, so the layer's pixels never change.
+struct LayerFx {
+  int flags;        // 1 tone, 2 layer colour, 4 tone reflects layer opacity, 8 tone in black
+  int shape;
+  int density;      // 0 from the brightness of the image, 1 from its opacity
+  int levels;       // posterization levels, 0 = off
+  float cell;       // dot period in document px
+  float cosA, sinA;
+  float offX, offY;
+  float noiseSize, noiseFactor;
+  float area;       // area of the unit dot shape
+  float opacity;    // layer opacity (reflected in the dot size)
+  float pad0, pad1, pad2;
+  vec4 mainColor;
+  vec4 subColor;    // a = 0: light parts become transparent
+};
+layout(std430, set = 0, binding = 6) readonly buffer FxBuf { LayerFx fx[]; };
+
+float toneHash(vec2 g) { return fract(sin(dot(g, vec2(12.9898, 78.233))) * 43758.5453); }
+
+// coverage of the tone dots at cell position q for density d (0..1), anti-aliased over one pixel
+float toneDots(int shape, vec2 q, float d, float A, float cell) {
+  if (d <= 0.0) return 0.0;
+  if (d >= 1.0) return 1.0;
+  if (shape == 3) {  // lines: thickness = density
+    float y = abs(fract(q.y) - 0.5);
+    return clamp((d * 0.5 - y) * cell + 0.5, 0.0, 1.0);
+  }
+  if (shape == 27) {  // wave lines
+    float y = abs(fract(q.y + 0.22 * sin(q.x * 3.14159265)) - 0.5);
+    return clamp((d * 0.5 - y) * cell + 0.5, 0.0, 1.0);
+  }
+  if (shape == 29) {  // random dots: each dot moved inside its cell
+    vec2 id = floor(q);
+    vec2 j = vec2(toneHash(id), toneHash(id + 17.3)) - 0.5;
+    float s = sqrt(min(d, 0.5) / A);
+    vec2 u = fract(q) - 0.5 - j * max(0.0, 1.0 - 2.0 * s) * 0.9;
+    float c = clamp(0.5 - (length(u) - s) * cell, 0.0, 1.0);
+    return d <= 0.5 ? c : mix(c, 1.0, (d - 0.5) * 2.0);
+  }
+  if (shape == 4) {  // cross: arm width r with 4r - 4r^2 = d
+    vec2 u = abs(fract(q) - 0.5);
+    float r = (1.0 - sqrt(max(0.0, 1.0 - d))) * 0.5;
+    return clamp((r - min(u.x, u.y)) * cell + 0.5, 0.0, 1.0);
+  }
+  if (d <= 0.5) {  // growing dots
+    vec2 u = fract(q) - 0.5;
+    float s = sqrt(d / A);
+    return clamp(0.5 - toneShapeDistance(shape, u / s) * s * cell, 0.0, 1.0);
+  }
+  // dark tones: shrinking holes of the same shape between the dots
+  vec2 u = fract(q + 0.5) - 0.5;
+  float s = sqrt((1.0 - d) / A);
+  return 1.0 - clamp(0.5 - toneShapeDistance(shape, u / s) * s * cell, 0.0, 1.0);
+}
+
+vec4 applyLayerFx(vec4 c, ivec2 p, LayerFx f) {
+  if ((f.flags & 2) != 0 && c.a > 0.0) {  // layer colour: dark -> main colour, light -> sub colour
+    vec3 rgb = c.rgb / c.a;
+    float l = clamp(dot(rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
+    vec3 col = mix(f.mainColor.rgb, f.subColor.rgb, l);
+    float a = c.a * mix(1.0, f.subColor.a, l);
+    c = vec4(col * a, a);
+  }
+  if ((f.flags & 1) != 0) {  // manga tone
+    if (c.a <= 0.0) return vec4(0.0);
+    vec3 rgb = c.rgb / c.a;
+    float d = f.density == 0 ? 1.0 - clamp(dot(rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0) : c.a;
+    if ((f.flags & 4) != 0) d *= f.opacity;
+    if (f.levels > 1) d = floor(d * float(f.levels - 1) + 0.5) / float(f.levels - 1);
+    d = clamp(d, 0.0, 1.0);
+    float cov;
+    if (f.shape == 6) {  // noise
+      float h = toneHash(floor((vec2(p) + 0.5) / max(f.noiseSize, 1.0)));
+      cov = mix(0.5, h, f.noiseFactor) < d ? 1.0 : 0.0;
+    } else if (f.shape == 28) {  // concentric circles around the dot position (X / Y)
+      float r = length(vec2(p) + 0.5 - vec2(f.offX, f.offY)) / f.cell;
+      float y = abs(fract(r) - 0.5);
+      cov = clamp((d * 0.5 - y) * f.cell + 0.5, 0.0, 1.0);
+    } else {
+      vec2 q0 = vec2(p) + 0.5 - vec2(f.offX, f.offY);
+      vec2 q = vec2(f.cosA * q0.x + f.sinA * q0.y, -f.sinA * q0.x + f.cosA * q0.y) / f.cell;
+      cov = toneDots(f.shape, q, d, f.area, f.cell);
+    }
+    float a = cov * (f.density == 0 ? c.a : 1.0);
+    vec3 col = (f.flags & 8) != 0 ? vec3(0.0) : rgb;
+    c = vec4(col * a, a);
+  }
+  return c;
+}
 
 vec4 layerTexel(ivec2 p) {
   if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(pc.docSize)))) return vec4(0.0);
@@ -61,6 +155,7 @@ vec4 layerTexel(ivec2 p) {
     else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
   }
 #endif
+  if (pc.fx >= 0 && fx[pc.fx].flags != 0) c = applyLayerFx(c, p, fx[pc.fx]);
   return c;
 }
 

@@ -450,3 +450,128 @@ void App::deleteLayerBlock(int index) {
   R.deleteLayer(R.indexOf(id));
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
 }
+
+// ---------------------------------------------------------------------------
+// Layer Properties: non-destructive effects of the active layer (like Clip Studio Paint)
+
+void App::drawLayerProperties() {
+  if (!ImGui::Begin("Layer Properties", &showLayerProps)) { ImGui::End(); return; }
+  if (!R.hasDocument()) { ImGui::TextDisabled("No document"); ImGui::End(); return; }
+  active = std::clamp(active, 0, int(R.layers.size()) - 1);
+  Layer& L = R.layers[size_t(active)];
+  ImGui::TextDisabled("%s", L.name.c_str());
+  bool changed = false;
+  // one undo step per edit: record the old values when a control is grabbed
+  auto track = [&](bool edited) {
+    if (ImGui::IsItemActivated()) { propsBefore = {L.tone, L.lcolor}; propsEditing = true; }
+    if (edited) changed = true;
+    if (ImGui::IsItemDeactivatedAfterEdit() && propsEditing) {
+      ToneFx nt = L.tone;
+      LayerColorFx nc = L.lcolor;
+      L.tone = propsBefore.first;
+      L.lcolor = propsBefore.second;
+      R.recordLayerProps(active);
+      L.tone = nt;
+      L.lcolor = nc;
+      propsEditing = false;
+    }
+  };
+  auto instant = [&](bool edited, const std::function<void()>& apply) {  // checkboxes / combos: one undo step each
+    if (!edited) return;
+    ToneFx nt = L.tone;
+    LayerColorFx nc = L.lcolor;
+    apply();
+    std::swap(nt, L.tone);
+    std::swap(nc, L.lcolor);
+    R.recordLayerProps(active);
+    L.tone = nt;
+    L.lcolor = nc;
+    changed = true;
+  };
+  ImGui::SeparatorText("Effect");
+  float fh = ImGui::GetFrameHeight();
+  {
+    bool lc = L.lcolor.on, tn = L.tone.on;
+    if (iconButton("##fxlc", "palette", fh * 1.3f, lc, "Layer colour: show the layer in one colour (non-destructive)"))
+      instant(true, [&] { L.lcolor.on = !lc; });
+    ImGui::SameLine();
+    if (iconButton("##fxtone", "grip", fh * 1.3f, tn, "Tone: show the layer as manga screentone dots (non-destructive)"))
+      instant(true, [&] { L.tone.on = !tn; });
+  }
+  if (L.lcolor.on) {
+    ImGui::SeparatorText("Layer colour");
+    float m[3] = {L.lcolor.main[0], L.lcolor.main[1], L.lcolor.main[2]};
+    bool e = ImGui::ColorEdit3("Colour", m, ImGuiColorEditFlags_NoInputs);
+    if (e) for (int k = 0; k < 3; ++k) L.lcolor.main[k] = m[k];
+    track(e);
+    ImGui::SameLine();
+    float s[3] = {L.lcolor.sub[0], L.lcolor.sub[1], L.lcolor.sub[2]};
+    ImGui::BeginDisabled(!L.lcolor.useSub);
+    e = ImGui::ColorEdit3("Sub colour", s, ImGuiColorEditFlags_NoInputs);
+    if (e) for (int k = 0; k < 3; ++k) L.lcolor.sub[k] = s[k];
+    track(e);
+    ImGui::EndDisabled();
+    bool us = L.lcolor.useSub;
+    if (ImGui::Checkbox("Light parts in the sub colour", &us)) instant(true, [&] { L.lcolor.useSub = us; });
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: light / white parts become transparent");
+  }
+  if (L.tone.on) {
+    ToneFx& t = L.tone;
+    float w = ImGui::GetContentRegionAvail().x;
+    ImGui::SeparatorText("Tone");
+    ImGui::SetNextItemWidth(w);
+    char ff[64];
+    snprintf(ff, sizeof ff, "Frequency %%.1f lpi (%.0f dpi)", R.docDpi);
+    track(ImGui::SliderFloat("##freq", &t.frequency, 5.0f, 200.0f, ff, ImGuiSliderFlags_Logarithmic));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lines per inch: higher = smaller, finer dots.\nThe document resolution is set below.");
+    const char* dens[] = {"Density: use colour of image", "Density: use opacity of image"};
+    int dm = t.density;
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::Combo("##dens", &dm, dens, 2)) instant(true, [&] { t.density = dm; });
+    bool ro = t.reflectOpacity;
+    if (ImGui::Checkbox("Reflect layer opacity", &ro)) instant(true, [&] { t.reflectOpacity = ro; });
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The layer opacity makes the dots smaller instead of fading them");
+    bool po = t.posterize;
+    if (ImGui::Checkbox("Posterization", &po)) instant(true, [&] { t.posterize = po; });
+    if (t.posterize) {
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+      track(ImGui::SliderInt("##lv", &t.levels, 2, 16, "%d levels"));
+    }
+    ImGui::SeparatorText("Dot settings");
+    int sh = t.shape;
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::BeginCombo("##shape", toneShapeNames()[std::clamp(sh, 0, kToneShapes - 1)], ImGuiComboFlags_HeightLargest)) {
+      for (int i = 0; i < kToneShapes; ++i)
+        if (ImGui::Selectable(toneShapeNames()[i], i == sh)) instant(true, [&] { t.shape = i; });
+      ImGui::EndCombo();
+    }
+    ImGui::SetNextItemWidth(w);
+    track(ImGui::SliderFloat("##ang", &t.angle, -90.0f, 90.0f, "Angle %.0f deg"));
+    ImGui::BeginDisabled(t.shape != 6);
+    float half = (w - ImGui::GetStyle().ItemSpacing.x) / 2;
+    ImGui::SetNextItemWidth(half);
+    track(ImGui::SliderFloat("##ns", &t.noiseSize, 1.0f, 20.0f, "Noise size %.1f"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(half);
+    track(ImGui::SliderFloat("##nf", &t.noiseFactor, 0.0f, 1.0f, "Noise factor %.2f"));
+    ImGui::EndDisabled();
+    ImGui::SetNextItemWidth(half);
+    track(ImGui::DragFloat("##ox", &t.offX, 0.25f, -10000, 10000, "Dot position X %.1f"));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(half);
+    track(ImGui::DragFloat("##oy", &t.offY, 0.25f, -10000, 10000, "Dot position Y %.1f"));
+    ImGui::SeparatorText("Expression colour");
+    const char* ex[] = {"Colour of the image", "Monochrome (black)"};
+    int em = t.express;
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::Combo("##expr", &em, ex, 2)) instant(true, [&] { t.express = em; });
+    ImGui::SeparatorText("Document");
+    ImGui::SetNextItemWidth(w);
+    if (ImGui::DragFloat("##dpi", &R.docDpi, 1.0f, 72.0f, 1200.0f, "Resolution %.0f dpi", ImGuiSliderFlags_AlwaysClamp)) changed = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Print resolution of the page (manga pages: usually 600 dpi for line art\nand tones). Used for the tone frequency.");
+  }
+  if (!L.tone.on && !L.lcolor.on) ImGui::TextDisabled("Pick an effect above. Effects change only how the\nlayer looks - its pixels stay as they are.");
+  if (changed) R.markCachesDirty();
+  ImGui::End();
+}

@@ -1367,6 +1367,18 @@ void App::buildToolTest() {
     const Layer& b = R.layers[size_t(active - 1)];
     fprintf(stderr, "bubbletest: '%s' over '%s' (sublayer %s)\n", t.name.c_str(), b.name.c_str(), b.parentId == t.id ? "yes" : "NO");
   });
+  // layer effects: tone on the bottom layer, layer colour on a text layer (non-destructive)
+  demo.push_back([this] {
+    commitText();
+    Layer& b = R.layers[0];
+    b.tone.on = true;
+    b.tone.frequency = 30;
+    b.tone.express = 1;
+    for (Layer& l : R.layers)
+      if (l.name.rfind("Text: A", 0) == 0) { l.lcolor.on = true; }
+    R.markCachesDirty();
+  });
+  demo.push_back([] {});
   // automatic backup: written in the background, then restored and compared
   demo.push_back([this] {
     if (userData.empty()) { fprintf(stderr, "backuptest: skipped (no User-Data)\n"); return; }

@@ -56,7 +56,7 @@ endif()
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT})
-file(GLOB SHADER_INCLUDES ${SHADER_DIR}/*.glsl)
+file(GLOB SHADER_INCLUDES CONFIGURE_DEPENDS ${SHADER_DIR}/*.glsl)
 set(SHADER_HEADERS "")
 # compile_shader(<source file> <variable name> [defines...])
 function(compile_shader src name)
@@ -118,6 +118,7 @@ add_executable(Saraswati WIN32
   src/text_tool.cpp
   src/bubble.cpp
   src/backup.cpp
+  src/tone.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp
@@ -134,7 +135,7 @@ add_executable(Saraswati WIN32
 add_dependencies(Saraswati saraswati_shaders)
 set_target_properties(Saraswati PROPERTIES OUTPUT_NAME $<IF:$<PLATFORM_ID:Windows>,Saraswati,saraswati>)
 target_include_directories(Saraswati PRIVATE
-  src ${SHADER_OUT} ${IMGUI} ${IMGUI}/backends ${TP}/volk ${TP}/Vulkan-Headers/include
+  src shaders ${SHADER_OUT} ${IMGUI} ${IMGUI}/backends ${TP}/volk ${TP}/Vulkan-Headers/include
   ${TP}/stb ${TP}/nanosvg/src ${TP}/libwebp/src)
 target_compile_definitions(Saraswati PRIVATE
   VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_VOLK IMGUI_DISABLE_OBSOLETE_FUNCTIONS

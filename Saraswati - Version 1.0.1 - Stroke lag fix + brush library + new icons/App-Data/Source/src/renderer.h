@@ -27,6 +27,32 @@ const char* blendModeName(BlendMode m);
 // One brush footprint: elliptical (cosA/sinA = tip angle, invRound = 1 / roundness).
 struct Dab { float x, y, radius, alpha, cosA, sinA, invRound, pad; };
 
+// Layer Properties effects - non-destructive, applied while compositing (the pixels never change).
+struct ToneFx {  // manga screentone
+  bool on = false;
+  int shape = 0;           // 0 circle .. 29 random dots (see toneShapeNames)
+  int density = 0;         // 0 use the colour (brightness) of the image, 1 use its opacity
+  bool reflectOpacity = true;  // layer opacity thins the dots instead of fading them
+  bool posterize = false;
+  int levels = 4;
+  float frequency = 60;    // lines per inch (at the document resolution)
+  float angle = 45;        // degrees
+  float noiseSize = 2, noiseFactor = 1;
+  float offX = 0, offY = 0;
+  int express = 0;         // 0 colour of the image, 1 monochrome (black dots)
+  bool operator==(const ToneFx&) const = default;
+};
+struct LayerColorFx {  // "Change layer colour": dark -> main colour, light -> sub colour
+  bool on = false;
+  float main[3] = {0.20f, 0.45f, 1.0f};
+  float sub[3] = {1, 1, 1};
+  bool useSub = true;      // off: light parts become transparent
+  bool operator==(const LayerColorFx&) const = default;
+};
+const char* const* toneShapeNames();  // kToneShapes names
+constexpr int kToneShapes = 30;
+float toneShapeArea(int shape);       // area of the unit dot (tone.cpp)
+
 struct Layer {
   uint32_t id = 0;
   std::string name;
@@ -36,6 +62,8 @@ struct Layer {
   float opacity = 1.0f;
   BlendMode mode = BlendMode::Normal;
   bool lockAlpha = false;  // paint only where the layer already has pixels
+  ToneFx tone;
+  LayerColorFx lcolor;
   uint32_t parentId = 0;   // sublayer of this layer (e.g. a speech bubble under its text); moves with it
   // conservative bounds of painted pixels (empty when x0 >= x1)
   int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
@@ -53,6 +81,8 @@ struct LayerProps {
   float opacity = 1.0f;
   BlendMode mode = BlendMode::Normal;
   bool lockAlpha = false;
+  ToneFx tone;
+  LayerColorFx lcolor;
 };
 
 struct View {
@@ -228,6 +258,7 @@ class Renderer {
   std::vector<Layer> layers;
   uint32_t docW = 0, docH = 0;
   bool whitePaper = true;
+  float docDpi = 350;  // document resolution (tone frequency is in lines per inch)
   LayerLimit limit;
   std::string deviceName, driverInfo;
   bool cpuEmulation = false;
@@ -353,7 +384,13 @@ class Renderer {
   int gradR[4] = {};
   void releaseStrokeUndo();
   int findLayer(uint32_t id) const;
-  void pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode);
+  void pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode, int fx = -1);
+  // per-layer effects (Layer Properties): one GPU record per layer index, written every frame
+  GpuBuffer fxBuf;
+  uint32_t fxCapacity = 0;
+  void writeFxBinding(VkDescriptorSet set);
+  void updateFx();
+  float compositeOpacity(const Layer& l) const;  // tone "reflect layer opacity" uses the opacity for the dots instead
 
   SDL_Window* window = nullptr;
   VkSurfaceKHR surface = VK_NULL_HANDLE;

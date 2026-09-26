@@ -57,8 +57,10 @@ struct ViewPC {
   float flipX;  // -1 = view mirrored horizontally
   int32_t adjType;
   float adjP[4];
+  int32_t fx;  // index into the per-layer effect buffer, -1 = none
+  int32_t pad[3];
 };
-static_assert(sizeof(ViewPC) == 112);
+static_assert(sizeof(ViewPC) == 128);
 struct DabPC {
   int32_t origin[2], size[2];
   int32_t first, count, flags;  // flags: 1 = build-up
@@ -195,11 +197,18 @@ void Renderer::init(SDL_Window* win, const RendererOptions& opt) {
     VK_CHECK(vkCreateSemaphore(device, &sci, nullptr, &s.imageAvailable));
     VK_CHECK(createBuffer(device, memProps, sizeof(Dab) * kMaxDabsPerFrame, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s.dabBuf, true));
+    if (!fxBuf.buffer) {
+      fxCapacity = 2048;
+      VK_CHECK(createBuffer(device, memProps, VkDeviceSize(fxCapacity) * 96, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, fxBuf, true));
+      memset(fxBuf.mapped, 0, size_t(fxCapacity) * 96);
+    }
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = descPool;
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &set0Layout;
     VK_CHECK(vkAllocateDescriptorSets(device, &dai, &s.set0));
+    writeFxBinding(s.set0);
   }
   VK_CHECK(createBuffer(device, memProps, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, pickBuf, true));
@@ -367,15 +376,15 @@ void Renderer::createDevice(const RendererOptions& opt) {
 
 void Renderer::createPipelines() {
   // set 0: mask, dab buffer, below, above, work.  set 1: layer.
-  VkDescriptorSetLayoutBinding b0[6] = {};
-  for (uint32_t i = 0; i < 6; ++i) {
+  VkDescriptorSetLayoutBinding b0[7] = {};
+  for (uint32_t i = 0; i < 7; ++i) {  // 6: per-layer effects (tone, layer colour)
     b0[i].binding = i;
-    b0[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b0[i].descriptorType = i == 1 || i == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b0[i].descriptorCount = 1;
     b0[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   }
   VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  lci.bindingCount = 6;
+  lci.bindingCount = 7;
   lci.pBindings = b0;
   VK_CHECK(vkCreateDescriptorSetLayout(device, &lci, nullptr, &set0Layout));
   VkDescriptorSetLayoutBinding b1{};
@@ -398,7 +407,7 @@ void Renderer::createPipelines() {
 
   // per layer: its own set + a thumbnail set 0; plus frame slots, flatten and floating sets
   VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1110 + 6 * 1010 + 6 * (kFrames + 2)},
-                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1010 + kFrames + 2}};
+                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1010 + kFrames + 8)}};
   VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   dpci.maxSets = 2120 + kFrames + 2;
@@ -676,6 +685,7 @@ void Renderer::shutdown() {
   runDeferred(true);
   destroyDocument();
   runDeferred(true);
+  destroyBuffer(device, fxBuf);
   for (auto& pool : chunkPool) {
     for (auto& b : pool) destroyBuffer(device, b);
     pool.clear();
@@ -925,7 +935,7 @@ void Renderer::recordLayerProps(int index) {
   UndoEntry e;
   e.kind = UndoKind::Props;
   e.layerId = l.id;
-  e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha};
+  e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor};
   pushUndo(std::move(e));
 }
 
@@ -936,9 +946,11 @@ bool Renderer::applyLayerUndo(UndoEntry& e) {
       int i = findLayer(e.layerId);
       if (i < 0) return false;
       Layer& l = layers[i];
-      LayerProps cur{l.name, l.visible, l.opacity, l.mode, l.lockAlpha};
+      LayerProps cur{l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor};
       l.name = e.props.name; l.visible = e.props.visible; l.opacity = e.props.opacity;
       l.mode = e.props.mode; l.lockAlpha = e.props.lockAlpha;
+      l.tone = e.props.tone; l.lcolor = e.props.lcolor;
+      cachesDirty = true;
       e.props = cur;
       return true;
     }
@@ -1217,6 +1229,8 @@ bool Renderer::readMergedRegion(int rx, int ry, uint32_t rw, uint32_t rh, std::v
   dai.descriptorSetCount = 1;
   dai.pSetLayouts = &set0Layout;
   if (vkAllocateDescriptorSets(device, &dai, &set) != VK_SUCCESS) { destroyImage(device, tile); err = "descriptor"; return false; }
+  writeFxBinding(set);
+  updateFx();
   {
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, tile.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[3] = {};
@@ -1253,7 +1267,7 @@ bool Renderer::readMergedRegion(int rx, int ry, uint32_t rw, uint32_t rh, std::v
       for (auto& l : layers) {
         if (!l.visible || l.opacity <= 0) continue;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-        pushView(cmd, v, ext, 0, l.opacity, l.mode);
+        pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
         vkCmdDispatch(cmd, T / 16, T / 16, 1);
         memoryBarrier(cmd, kCS, kRW, kCS, kRW);
       }
@@ -1350,7 +1364,7 @@ void Renderer::copyPendingUndo(VkCommandBuffer cmd, Layer& layer) {
   lastCpu.undoMs += (SDL_GetTicksNS() - t0) * 1e-6;
 }
 
-void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode) {
+void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode, int fx) {
   ViewPC pc{};
   pc.pan[0] = float(v.panX);
   pc.pan[1] = float(v.panY);
@@ -1376,6 +1390,7 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
   pc.flipX = v.flipX ? -1.0f : 1.0f;
   pc.adjType = adjType;
+  pc.fx = fx;
   for (int k = 0; k < 4; ++k) pc.adjP[k] = adjP[k];
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
@@ -1675,7 +1690,7 @@ void Renderer::recordCaches(VkCommandBuffer cmd, const FrameParams& p) {
     if (i == p.activeLayer || !l.visible || l.opacity <= 0) continue;
     if (i > p.activeLayer && !aboveSimple) continue;  // blended per frame instead
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-    pushView(cmd, p.view, extent, i > p.activeLayer ? FLAG_ABOVE : 0, l.opacity, l.mode);
+    pushView(cmd, p.view, extent, i > p.activeLayer ? FLAG_ABOVE : 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
     vkCmdDispatch(cmd, gx, gy, 1);
     memoryBarrier(cmd, kCS, kRW, kCS, kRW);
   }
@@ -1696,7 +1711,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
     if (adjType && act->visible) flags |= FLAG_ADJ;
   }
   if (selectionActive) flags |= FLAG_SEL;
-  pushView(cmd, p.view, extent, flags, act ? act->opacity : 1.0f, act ? act->mode : BlendMode::Normal);
+  pushView(cmd, p.view, extent, flags, act ? compositeOpacity(*act) : 1.0f, act ? act->mode : BlendMode::Normal, act ? p.activeLayer : -1);
   vkCmdDispatch(cmd, gx, gy, 1);
   memoryBarrier(cmd, kCS, kRW, kCS, kRW);
   if (!aboveSimple) {
@@ -1705,7 +1720,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
       const Layer& l = layers[i];
       if (!l.visible || l.opacity <= 0) continue;
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-      pushView(cmd, p.view, extent, FLAG_WORK, l.opacity, l.mode);
+      pushView(cmd, p.view, extent, FLAG_WORK, compositeOpacity(l), l.mode, int(&l - layers.data()));
       vkCmdDispatch(cmd, gx, gy, 1);
       memoryBarrier(cmd, kCS, kRW, kCS, kRW);
     }
@@ -1771,6 +1786,7 @@ bool Renderer::renderFrame(const FrameParams& p) {
   }
   FrameParams q = p;
   if (hasDocument()) {
+    updateFx();
     recordUndoOps(cmd);
     recordPreviewOps(cmd);
     q.activeLayer = std::clamp(p.activeLayer, 0, int(layers.size()) - 1);

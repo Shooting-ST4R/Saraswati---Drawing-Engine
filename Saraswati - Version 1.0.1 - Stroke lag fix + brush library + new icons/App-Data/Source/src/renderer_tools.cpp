@@ -246,6 +246,7 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
       dai.descriptorSetCount = 1;
       dai.pSetLayouts = &set0Layout;
       if (vkAllocateDescriptorSets(device, &dai, &l.thumbSet0) != VK_SUCCESS) { destroyImage(device, l.thumb); return; }
+      writeFxBinding(l.thumbSet0);
       VkDescriptorImageInfo ii{VK_NULL_HANDLE, l.thumb.view, VK_IMAGE_LAYOUT_GENERAL};
       VkWriteDescriptorSet w[3] = {};
       for (int k = 0; k < 3; ++k) {
@@ -277,7 +278,7 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
     pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
     vkCmdDispatch(cmd, (ext.width + 15) / 16, (ext.height + 15) / 16, 1);
     memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-    pushView(cmd, v, ext, 0, 1, BlendMode::Normal);
+    pushView(cmd, v, ext, 0, 1, BlendMode::Normal, int(&l - layers.data()));
     vkCmdDispatch(cmd, (ext.width + 15) / 16, (ext.height + 15) / 16, 1);
     forceTransparentPaper = false;
     memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -357,6 +358,7 @@ void Renderer::recordNavigator(VkCommandBuffer cmd) {
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &set0Layout;
     if (vkAllocateDescriptorSets(device, &dai, &navSet0) != VK_SUCCESS) { destroyImage(device, navImg); navImg = {}; return; }
+    writeFxBinding(navSet0);
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, navImg.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[3] = {};
     for (int k = 0; k < 3; ++k) {
@@ -397,7 +399,7 @@ void Renderer::recordNavigator(VkCommandBuffer cmd) {
       first = false;
     }
     if (!l.visible) continue;
-    pushView(cmd, v, ext, 0, l.opacity, l.mode);
+    pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
     vkCmdDispatch(cmd, gx, gy, 1);
     memoryBarrier(cmd, kCS, kRW, kCS, kRW);
   }
@@ -459,6 +461,8 @@ std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &set0Layout;
     VK_CHECK(vkAllocateDescriptorSets(device, &dai, &r->tileSet));
+    writeFxBinding(r->tileSet);
+    updateFx();
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, r->tile.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr[3] = {};
     for (int k = 0; k < 3; ++k) {
@@ -488,7 +492,7 @@ std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int
         for (auto& l : layers) {
           if (!l.visible || l.opacity <= 0) continue;
           vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-          pushView(cmd, v, ext, 0, l.opacity, l.mode);
+          pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
           vkCmdDispatch(cmd, T / 16, T / 16, 1);
           memoryBarrier(cmd, kCS, kRW, kCS, kRW);
         }
@@ -614,4 +618,62 @@ void Renderer::abortStroke() {
   releaseStrokeUndo();
   strokeActive = strokeEnding = false;
   maskClearPending = gradPending = false;
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer effects
+
+void Renderer::writeFxBinding(VkDescriptorSet set) {
+  if (!fxBuf.buffer || !set) return;
+  VkDescriptorBufferInfo bi{fxBuf.buffer, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set;
+  w.dstBinding = 6;
+  w.descriptorCount = 1;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  w.pBufferInfo = &bi;
+  vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+}
+
+float Renderer::compositeOpacity(const Layer& l) const {
+  return l.tone.on && l.tone.reflectOpacity ? 1.0f : l.opacity;
+}
+
+void Renderer::updateFx() {
+  if (!fxBuf.mapped) return;
+  struct FxGpu {
+    int32_t flags, shape, density, levels;
+    float cell, cosA, sinA, offX, offY, noiseSize, noiseFactor, area, opacity, pad[3];
+    float main[4], sub[4];
+  };
+  static_assert(sizeof(FxGpu) == 96);
+  auto* out = static_cast<FxGpu*>(fxBuf.mapped);
+  for (size_t i = 0; i < layers.size() && i < fxCapacity; ++i) {
+    const Layer& l = layers[i];
+    FxGpu g{};
+    if (l.lcolor.on) {
+      g.flags |= 2;
+      for (int k = 0; k < 3; ++k) { g.main[k] = l.lcolor.main[k]; g.sub[k] = l.lcolor.sub[k]; }
+      g.main[3] = 1;
+      g.sub[3] = l.lcolor.useSub ? 1.0f : 0.0f;
+    }
+    if (l.tone.on) {
+      const ToneFx& t = l.tone;
+      g.flags |= 1 | (t.reflectOpacity ? 4 : 0) | (t.express == 1 ? 8 : 0);
+      g.shape = std::clamp(t.shape, 0, kToneShapes - 1);
+      g.density = t.density;
+      g.levels = t.posterize ? std::max(2, t.levels) : 0;
+      g.cell = std::max(1.0f, docDpi / std::max(1.0f, t.frequency));
+      double a = t.angle * 3.14159265358979323846 / 180.0;
+      g.cosA = float(std::cos(a));
+      g.sinA = float(std::sin(a));
+      g.offX = t.offX;
+      g.offY = t.offY;
+      g.noiseSize = std::max(1.0f, t.noiseSize);
+      g.noiseFactor = std::clamp(t.noiseFactor, 0.0f, 1.0f);
+      g.area = toneShapeArea(g.shape);
+      g.opacity = l.opacity;
+    }
+    out[i] = g;
+  }
 }

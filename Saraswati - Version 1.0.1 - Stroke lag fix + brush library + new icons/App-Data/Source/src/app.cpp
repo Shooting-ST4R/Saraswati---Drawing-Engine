@@ -711,6 +711,7 @@ void App::buildDefaultLayout(unsigned int dockId) {
   ImGui::DockBuilderDockWindow("Tool Group", leftBottom);
   ImGui::DockBuilderDockWindow("Colour", rightTop);
   ImGui::DockBuilderDockWindow("Tool Settings", rightRest);
+  ImGui::DockBuilderDockWindow("Layer Properties", rightRest);
   ImGui::DockBuilderDockWindow("Layers", rightLayers);
   ImGui::DockBuilderDockWindow("Performance", rightPerf);
   ImGui::DockBuilderFinish(dockId);
@@ -826,7 +827,8 @@ void App::drawLayerPanel() {
     float tx = p.x + 38 + ind + thumb;
     dl->AddText(ImVec2(tx, p.y + rowH / 2 - ImGui::GetTextLineHeight() - 1), ImGui::GetColorU32(ImGuiCol_Text), l.name.c_str());
     char info[96];
-    snprintf(info, sizeof info, "%s  %.0f%%%s", blendModeName(l.mode), l.opacity * 100, l.lockAlpha ? "  locked" : "");
+    snprintf(info, sizeof info, "%s  %.0f%%%s%s%s", blendModeName(l.mode), l.opacity * 100, l.lockAlpha ? "  locked" : "",
+             l.tone.on ? "  tone" : "", l.lcolor.on ? "  colour" : "");
     dl->AddText(ImVec2(tx, p.y + rowH / 2 + 1), ImGui::GetColorU32(ImGuiCol_TextDisabled), info);
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 2));
     ImGui::Dummy(ImVec2(0, 0));
@@ -1393,6 +1395,7 @@ void App::drawUI() {
       ImGui::MenuItem("Colour", nullptr, &showColor);
       ImGui::MenuItem("Tool Settings", nullptr, &showBrush);
       ImGui::MenuItem("Layers", nullptr, &showLayers);
+      ImGui::MenuItem("Layer Properties", nullptr, &showLayerProps);
       ImGui::MenuItem("Performance", nullptr, &showPerf);
       ImGui::Separator();
       if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = showNav = showToolGroup = true; hideUI = false; }
@@ -1417,6 +1420,7 @@ void App::drawUI() {
     if (showToolGroup) drawToolGroup();
     if (showColor) drawColorPanel();
     if (showBrush) drawBrushPanel();
+    if (showLayerProps) drawLayerProperties();
     if (showLayers) drawLayerPanel();
     if (showPerf) drawPerfPanel();
   } else {

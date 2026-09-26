@@ -185,6 +185,9 @@ class App {
   // Navigator / Tool Group panels (panels.cpp)
   bool showNav = true, showToolGroup = true;
   void drawNavigator();
+  void drawLayerProperties();
+  bool showLayerProps = true, propsEditing = false;
+  std::pair<ToneFx, LayerColorFx> propsBefore;
   void drawToolGroup();
   void drawBrushLibraryButtons();
   void keepCanvasCentre(const std::function<void()>& change);
