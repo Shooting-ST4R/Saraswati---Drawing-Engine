@@ -117,6 +117,9 @@ void App::strokeAdd(const PenSample& s) {
 
 void App::strokeEnd() {
   if (!engine.active()) return;
+  lastEndX = engine.lastSample().x;
+  lastEndY = engine.lastSample().y;
+  haveLastStroke = true;
   engine.end();
   flushDabs(0);
   R.endStroke();
@@ -147,7 +150,16 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   }
   double dx, dy;
   screenToDoc(sx, sy, dx, dy);
+  if (toolDown(dx, dy, sx, sy)) return;
   strokeFromPen = pen;
+  if (shiftDown && haveLastStroke) {
+    // Shift+click: straight line from the end of the previous stroke
+    strokeBegin({lastEndX, lastEndY, pressure}, eraser);
+    strokeAdd({dx, dy, pressure});
+    flushDabs(tNs);
+    strokeEnd();
+    return;
+  }
   strokeBegin({dx, dy, pressure}, eraser);
   flushDabs(tNs);
 }
@@ -170,6 +182,12 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
     view.rotation = dragStartRot + (a - dragStartAngle);
     return;
   }
+  if (toolDrag) {
+    double dx, dy;
+    screenToDoc(sx, sy, dx, dy);
+    toolMove(dx, dy, sx, sy);
+    return;
+  }
   if (engine.active() && strokeFromPen == pen) {
     double dx, dy;
     screenToDoc(sx, sy, dx, dy);
@@ -180,6 +198,12 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
 
 void App::pointerUp(bool pen) {
   if (drag != Drag::None) { drag = Drag::None; return; }
+  if (toolDrag) {
+    double dx, dy;
+    screenToDoc(lastX, lastY, dx, dy);
+    toolUp(dx, dy);
+    return;
+  }
   if (engine.active() && strokeFromPen == pen) strokeEnd();
 }
 
@@ -187,6 +211,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
   if (k.key == SDLK_SPACE) spaceDown = down;
   shiftDown = (k.mod & SDL_KMOD_SHIFT) != 0;
   ctrlDown = (k.mod & SDL_KMOD_CTRL) != 0;
+  altDown = (k.mod & SDL_KMOD_ALT) != 0;
   if (!down || ImGui::GetIO().WantTextInput) return;
   bool ctrl = ctrlDown, shift = shiftDown;
   switch (k.key) {
@@ -202,7 +227,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
     case SDLK_R: if (!ctrl) view.rotation = 0; break;
     case SDLK_N: if (ctrl) showNewDoc = true; break;
     case SDLK_O: if (ctrl && !saving) showDialog(DlgOpen); break;
-    case SDLK_I: if (ctrl && !saving && R.hasDocument()) showDialog(DlgImport); break;
+    case SDLK_I: if (ctrl && !shift && !saving && R.hasDocument()) showDialog(DlgImport); break;
     case SDLK_S:
       if (ctrl && !saving && R.hasDocument()) {
         if (shift || documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
@@ -210,6 +235,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
       break;
     default: break;
   }
+  if (!R.stroking()) toolKey(k.key, ctrl, shift, altDown);
 }
 
 void App::handleEvent(const SDL_Event& e) {
@@ -316,6 +342,7 @@ void App::error(const std::string& msg) {
 }
 
 bool App::newDocument(uint32_t w, uint32_t h, bool white) {
+  if (xf.active) cancelTransform();
   std::string err;
   if (!R.newDocument(w, h, white, err)) {
     error("Could not create a " + std::to_string(w) + " x " + std::to_string(h) + " document: " + err);
@@ -323,6 +350,8 @@ bool App::newDocument(uint32_t w, uint32_t h, bool white) {
   }
   active = 0;
   documentPath.clear();
+  resetSelection();
+  haveLastStroke = false;
   fitView();
   return true;
 }
@@ -338,7 +367,18 @@ void App::addLayer() {
 // UI
 
 void App::drawBrushPanel() {
-  if (!ImGui::Begin("Brush", &showBrush)) { ImGui::End(); return; }
+  if (!ImGui::Begin("Tool Settings", &showBrush)) { ImGui::End(); return; }
+  drawToolOptions();
+  bool usesBrush = tool == ToolId::Brush || tool == ToolId::Line || ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
+  if (!usesBrush) {
+    if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
+      ImGui::SliderFloat("Opacity", &brushes[tipIndex].opacity, 0.0f, 1.0f, "%.2f");
+      ImGui::Checkbox("Erase instead of paint (E)", &eraserToggle);
+    }
+    ImGui::End();
+    return;
+  }
+  ImGui::SeparatorText("Brush tip");
   for (int i = 0; i < 3; ++i) {
     if (i) ImGui::SameLine();
     if (ImGui::RadioButton(kTipNames[i], tipIndex == i)) tipIndex = i;
@@ -379,13 +419,15 @@ void App::buildDefaultLayout(unsigned int dockId) {
   ImGui::DockBuilderRemoveNode(dockId);
   ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
   ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->WorkSize);
-  ImGuiID centre = dockId, left, right;
+  ImGuiID centre = dockId, left, right, tools;
+  tools = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.035f, nullptr, &centre);
   left = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.19f, nullptr, &centre);
   right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.23f, nullptr, &centre);
   ImGuiID leftBottom, rightBottom;
   leftBottom = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.45f, nullptr, &left);
   rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
-  ImGui::DockBuilderDockWindow("Brush", left);
+  ImGui::DockBuilderDockWindow("Tools", tools);
+  ImGui::DockBuilderDockWindow("Tool Settings", left);
   ImGui::DockBuilderDockWindow("Colour", leftBottom);
   ImGui::DockBuilderDockWindow("Layers", right);
   ImGui::DockBuilderDockWindow("Performance", rightBottom);
@@ -535,6 +577,14 @@ void App::drawUI() {
     if (ImGui::BeginMenu("Edit")) {
       if (ImGui::MenuItem("Undo", "Ctrl+Z", false, R.canUndo() && !R.stroking())) R.undo();
       if (ImGui::MenuItem("Redo", "Ctrl+Y", false, R.canRedo() && !R.stroking())) R.redo();
+      ImGui::Separator();
+      if (ImGui::MenuItem("Fill", "Alt+Backspace", false, !R.busy())) fillSelection(false);
+      if (ImGui::MenuItem("Clear", "Delete", false, !R.busy())) fillSelection(true);
+      if (ImGui::MenuItem("Transform", "Ctrl+T", false, !R.busy())) setTool(ToolId::Transform);
+      ImGui::Separator();
+      if (ImGui::MenuItem("Select all", "Ctrl+A")) selectAll();
+      if (ImGui::MenuItem("Deselect", "Ctrl+D", false, selActive)) deselect();
+      if (ImGui::MenuItem("Invert selection", "Ctrl+Shift+I")) invertSelection();
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -544,7 +594,7 @@ void App::drawUI() {
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
-      ImGui::MenuItem("Brush", nullptr, &showBrush);
+      ImGui::MenuItem("Tool Settings", nullptr, &showBrush);
       ImGui::MenuItem("Colour", nullptr, &showColor);
       ImGui::MenuItem("Layers", nullptr, &showLayers);
       ImGui::MenuItem("Performance", nullptr, &showPerf);
@@ -567,6 +617,7 @@ void App::drawUI() {
     float s = ImGui::GetIO().DisplayFramebufferScale.x;
     canvasX = c->Pos.x * s; canvasY = c->Pos.y * s; canvasW = c->Size.x * s; canvasH = c->Size.y * s;
   }
+  drawToolbar();
   if (showBrush) drawBrushPanel();
   if (showColor) drawColorPanel();
   if (showLayers) drawLayerPanel();
@@ -581,8 +632,16 @@ void App::drawUI() {
     if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
   }
+  drawToolOverlay();
+  {
+    float rgba[4];
+    if (R.takePick(rgba) && rgba[3] > 0.01f)
+      for (int k = 0; k < 3; ++k) color[k] = std::clamp(rgba[k] / rgba[3], 0.0f, 1.0f);
+  }
   // brush outline at the cursor
-  if (!ImGui::GetIO().WantCaptureMouse && R.hasDocument() && drag == Drag::None) {
+  bool brushCursor = (tool == ToolId::Brush && !altDown) || tool == ToolId::Line ||
+                     ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
+  if (brushCursor && !ImGui::GetIO().WantCaptureMouse && R.hasDocument() && drag == Drag::None) {
     float s = ImGui::GetIO().DisplayFramebufferScale.x;
     float r = float(brushes[tipIndex].size * 0.5 * view.zoom) / s;
     ImVec2 c(lastX / s, lastY / s);
@@ -1020,6 +1079,7 @@ int App::run() {
   }
   uint32_t w = opt.docW ? opt.docW : 3000, h = opt.docH ? opt.docH : 2000;
   if (opt.demo) buildDemo();
+  else if (opt.toolTest) { opt.demo = true; buildToolTest(); }
   else if (opt.benchmark)
     startBenchmark(opt.docW ? opt.docW : 8000, opt.docH ? opt.docH : 8000, opt.brushPx > 0 ? opt.brushPx : 1000.0f,
                    opt.tipSet ? opt.tip : Tip::Hard, std::max(1, opt.layers));

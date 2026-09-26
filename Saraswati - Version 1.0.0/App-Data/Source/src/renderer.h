@@ -59,6 +59,14 @@ struct RendererOptions {
   bool validation = false;
 };
 
+// Transform tool: a floating copy of pixels (straight alpha) + its descriptor sets.
+struct Floating {
+  GpuImage image;
+  VkDescriptorSet set = VK_NULL_HANDLE;       // set 2 for the stamp shader
+  VkDescriptorSet imguiTex = VK_NULL_HANDLE;  // ImGui texture for the live preview
+  uint32_t w = 0, h = 0;
+};
+
 struct LayerLimit {
   bool ok = false;
   std::string reason;
@@ -101,9 +109,29 @@ class Renderer {
   bool stroking() const { return strokeActive; }
   bool busy() const { return strokeActive || !pendingDabs.empty() || !undoOps.empty(); }
 
+  // ---- tools (renderer_tools.cpp) ----
+  // Paints `cov` (8-bit coverage, w x h at x, y) into the layer with the style's colour /
+  // eraser, through the normal commit (undo + selection clipping). Applied next frame.
+  bool paintCoverage(int layer, int x, int y, uint32_t w, uint32_t h, const uint8_t* cov, const StrokeStyle& st, std::string& err);
+  // Linear gradient (colour at p0 -> transparent at p1) over the given rect, next frame.
+  bool paintGradient(int layer, float x0, float y0, float x1, float y1, int rx0, int ry0, int rx1, int ry1, const StrokeStyle& st);
+  bool uploadSelection(const uint8_t* docSizeSel, int x, int y, uint32_t w, uint32_t h, std::string& err);
+  void setSelectionActive(bool on) { if (selectionActive != on) { selectionActive = on; } }
+  bool selectionActive = false;
+  bool readLayerRegion(int index, int x, int y, uint32_t w, uint32_t h, std::vector<uint8_t>& premulRgba, std::string& err);
+  bool createFloating(uint32_t w, uint32_t h, const uint8_t* straightRgba, Floating& f, std::string& err);
+  void destroyFloating(Floating& f);
+  // Draws the floating image into the layer through `inv` (document px -> floating px, row-major
+  // 3x3 homography) over the rect; one undo step.
+  bool stamp(int layer, const Floating& f, const double inv[9], int rx0, int ry0, int rx1, int ry1, std::string& err);
+  // Eyedropper: reads the composited colour at a window pixel during the next frame.
+  void requestPick(int x, int y) { pickX = x; pickY = y; pickPending = true; }
+  bool takePick(float rgba[4]) { if (!pickReady) return false; for (int i = 0; i < 4; ++i) rgba[i] = pickValue[i]; pickReady = false; return true; }
+
   // ---- undo ----
-  void undo() { if (!strokeActive) undoOps.push_back(true); }
-  void redo() { if (!strokeActive) undoOps.push_back(false); }
+  void undo() { if (!strokeActive) undoOps.push_back(1); }
+  void redo() { if (!strokeActive) undoOps.push_back(0); }
+  void undoDiscard() { undoOps.push_back(2); }  // undo the last step without keeping it for redo
   bool canUndo() const { return !undoStack.empty(); }
   bool canRedo() const { return !redoStack.empty(); }
   size_t undoBytes() const;
@@ -195,6 +223,11 @@ class Renderer {
   bool copyTiles(VkCommandBuffer cmd, Layer& layer, const std::vector<VkRect2D>& tiles,
                  std::vector<Chunk>& chunks, size_t& bytes, bool toBuffer);
   void dropUndo(UndoEntry& e);
+  void pushUndo(UndoEntry&& e);
+  std::vector<VkRect2D> tilesForRect(int x0, int y0, int x1, int y1) const;
+  void markDirtyRect(int x0, int y0, int x1, int y1);
+  bool uploadRegion(VkImage img, int x, int y, uint32_t w, uint32_t h, uint32_t bpp,
+                    const std::function<void(uint32_t row, uint8_t* dst)>& fillRow, std::string& err);
   void readTimestamps(FrameSlot& s);
   int findLayer(uint32_t id) const;
   void pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode);
@@ -218,7 +251,8 @@ class Renderer {
   VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
   VkDescriptorPool descPool = VK_NULL_HANDLE;
   VkPipeline dabPipe = VK_NULL_HANDLE, commitPipe = VK_NULL_HANDLE, cachePipe = VK_NULL_HANDLE,
-             framePipe = VK_NULL_HANDLE, presentPipe = VK_NULL_HANDLE;
+             framePipe = VK_NULL_HANDLE, presentPipe = VK_NULL_HANDLE, gradPipe = VK_NULL_HANDLE,
+             stampPipe = VK_NULL_HANDLE;
   VkQueryPool queryPool = VK_NULL_HANDLE;
   VkCommandPool oneShotPool = VK_NULL_HANDLE;
 
@@ -228,6 +262,11 @@ class Renderer {
 
   // document GPU state
   GpuImage mask;
+  GpuImage sel;  // selection coverage, same format family as the mask (R8 or R32F)
+  GpuBuffer pickBuf;
+  bool pickPending = false, pickReady = false;
+  int pickX = 0, pickY = 0;
+  float pickValue[4] = {};
   GpuImage below, above, work;  // window-size screen caches + frame result
   bool cachesDirty = true;
   View cacheView{};
@@ -248,5 +287,5 @@ class Renderer {
   std::vector<uint32_t> dirtyTiles;
 
   std::deque<UndoEntry> undoStack, redoStack;
-  std::vector<bool> undoOps;  // true = undo, false = redo
+  std::vector<int> undoOps;  // 1 = undo, 0 = redo, 2 = undo and discard
 };

@@ -30,6 +30,7 @@ static const char* kUsage =
     "  --layers <N>              benchmark: number of layers\n"
     "  --benchmark               play a synthetic 4 s zig-zag stroke and write a report to User-Data/logs\n"
     "  --demo                    scripted visual test (tips, layers, blend modes, undo/redo, view)\n"
+    "  --tooltest                scripted visual test of the tools (selections, fill, gradient, shapes, transform)\n"
     "  --open <file>             open a document or image at startup\n"
     "  --import <file>           import an image/PSD as a new layer at startup (repeatable)\n"
     "  --save <file.psd>         save as PSD after the demo / startup (test helper)\n"
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
     else if (a == "--layers") opt.layers = atoi(next());
     else if (a == "--benchmark") opt.benchmark = true;
     else if (a == "--demo") opt.demo = true;
+    else if (a == "--tooltest") opt.toolTest = true;
     else if (a == "--open") opt.open = next();
     else if (a == "--save") opt.save = next();
     else if (a == "--import") opt.imports.push_back(next());

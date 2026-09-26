@@ -1,0 +1,925 @@
+// Non-brush tools: selections, fill, gradient, line/shapes, eyedropper, transform, hand;
+// plus the tool bar and per-tool settings.
+#include "app.h"
+#include "fileio.h"
+
+#include <imgui.h>
+#include <imgui_internal.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+static constexpr double kPi = 3.14159265358979323846;
+
+struct ToolInfo { ToolId id; const char* name; const char* key; };
+static const ToolInfo kTools[] = {
+    {ToolId::Brush, "Brush", "B"},          {ToolId::Eyedropper, "Eyedropper", "I  (Alt+click)"},
+    {ToolId::Fill, "Fill", "G"},            {ToolId::Gradient, "Gradient", "Shift+G"},
+    {ToolId::Line, "Line", "U"},            {ToolId::Rect, "Rectangle", "U"},
+    {ToolId::Ellipse, "Ellipse", "U"},      {ToolId::SelRect, "Rectangle select", "M"},
+    {ToolId::SelEllipse, "Ellipse select", "M"}, {ToolId::Lasso, "Lasso select", "L"},
+    {ToolId::Wand, "Magic wand", "W"},      {ToolId::Transform, "Move / Transform", "V, Ctrl+T"},
+    {ToolId::Hand, "Hand (pan)", "H, Space"}};
+
+// ---------------------------------------------------------------------------
+// Rasterisation (CPU): polygon coverage with 4 sub-scanlines and fractional span ends.
+
+static void rasterPolygon(const std::vector<double>& pts, int docW, int docH, int& ox, int& oy, uint32_t& ow, uint32_t& oh,
+                          std::vector<uint8_t>& cov) {
+  size_t n = pts.size() / 2;
+  ow = oh = 0;
+  if (n < 3) return;
+  double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;
+  for (size_t i = 0; i < n; ++i) {
+    minx = std::min(minx, pts[2 * i]); maxx = std::max(maxx, pts[2 * i]);
+    miny = std::min(miny, pts[2 * i + 1]); maxy = std::max(maxy, pts[2 * i + 1]);
+  }
+  int x0 = std::max(0, int(std::floor(minx))), y0 = std::max(0, int(std::floor(miny)));
+  int x1 = std::min(docW, int(std::ceil(maxx)) + 1), y1 = std::min(docH, int(std::ceil(maxy)) + 1);
+  if (x0 >= x1 || y0 >= y1) return;
+  ox = x0; oy = y0; ow = uint32_t(x1 - x0); oh = uint32_t(y1 - y0);
+  cov.assign(size_t(ow) * oh, 0);
+  std::vector<float> acc(ow + 2);
+  std::vector<double> xs;
+  const int S = 4;
+  for (int y = y0; y < y1; ++y) {
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (int sub = 0; sub < S; ++sub) {
+      double sy = y + (sub + 0.5) / S;
+      xs.clear();
+      for (size_t i = 0; i < n; ++i) {
+        double ax = pts[2 * i], ay = pts[2 * i + 1];
+        double bx = pts[2 * ((i + 1) % n)], by = pts[2 * ((i + 1) % n) + 1];
+        if ((ay <= sy) != (by <= sy)) xs.push_back(ax + (sy - ay) / (by - ay) * (bx - ax));
+      }
+      std::sort(xs.begin(), xs.end());
+      for (size_t k = 0; k + 1 < xs.size(); k += 2) {  // even-odd
+        double a = std::clamp(xs[k] - x0, 0.0, double(ow)), b = std::clamp(xs[k + 1] - x0, 0.0, double(ow));
+        if (b <= a) continue;
+        int ia = int(a), ib = int(b);
+        if (ia == ib) { acc[ia] += float(b - a) / S; continue; }
+        acc[ia] += float(ia + 1 - a) / S;
+        for (int i = ia + 1; i < ib; ++i) acc[i] += 1.0f / S;
+        if (ib < int(ow)) acc[ib] += float(b - ib) / S;
+      }
+    }
+    uint8_t* row = cov.data() + size_t(y - y0) * ow;
+    for (uint32_t i = 0; i < ow; ++i) row[i] = uint8_t(std::lround(std::clamp(acc[i], 0.0f, 1.0f) * 255));
+  }
+}
+
+static std::vector<double> ellipsePoly(double x0, double y0, double x1, double y1) {
+  double cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, rx = std::abs(x1 - x0) / 2, ry = std::abs(y1 - y0) / 2;
+  int n = std::clamp(int((rx + ry) * 0.8), 32, 2048);
+  std::vector<double> p;
+  for (int i = 0; i < n; ++i) {
+    double a = 2 * kPi * i / n;
+    p.push_back(cx + rx * std::cos(a));
+    p.push_back(cy + ry * std::sin(a));
+  }
+  return p;
+}
+
+static std::vector<double> rectPoly(double x0, double y0, double x1, double y1) {
+  return {std::min(x0, x1), std::min(y0, y1), std::max(x0, x1), std::min(y0, y1),
+          std::max(x0, x1), std::max(y0, y1), std::min(x0, x1), std::max(y0, y1)};
+}
+
+// 4-point homography: maps src[i] -> dst[i] (row-major 3x3, h[8] = 1).
+static bool homography(const double src[4][2], const double dst[4][2], double h[9]) {
+  double A[8][9] = {};
+  for (int i = 0; i < 4; ++i) {
+    double x = src[i][0], y = src[i][1], u = dst[i][0], v = dst[i][1];
+    double r0[9] = {x, y, 1, 0, 0, 0, -u * x, -u * y, u};
+    double r1[9] = {0, 0, 0, x, y, 1, -v * x, -v * y, v};
+    memcpy(A[2 * i], r0, sizeof r0);
+    memcpy(A[2 * i + 1], r1, sizeof r1);
+  }
+  for (int c = 0; c < 8; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < 8; ++r) if (std::abs(A[r][c]) > std::abs(A[piv][c])) piv = r;
+    if (std::abs(A[piv][c]) < 1e-12) return false;
+    for (int k = 0; k < 9; ++k) std::swap(A[c][k], A[piv][k]);
+    for (int r = 0; r < 8; ++r) {
+      if (r == c) continue;
+      double f = A[r][c] / A[c][c];
+      for (int k = c; k < 9; ++k) A[r][k] -= f * A[c][k];
+    }
+  }
+  for (int i = 0; i < 8; ++i) h[i] = A[i][8] / A[i][i];
+  h[8] = 1;
+  return true;
+}
+
+static bool invert3(const double m[9], double o[9]) {
+  double d = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  if (std::abs(d) < 1e-15) return false;
+  o[0] = (m[4] * m[8] - m[5] * m[7]) / d; o[1] = (m[2] * m[7] - m[1] * m[8]) / d; o[2] = (m[1] * m[5] - m[2] * m[4]) / d;
+  o[3] = (m[5] * m[6] - m[3] * m[8]) / d; o[4] = (m[0] * m[8] - m[2] * m[6]) / d; o[5] = (m[2] * m[3] - m[0] * m[5]) / d;
+  o[6] = (m[3] * m[7] - m[4] * m[6]) / d; o[7] = (m[1] * m[6] - m[0] * m[7]) / d; o[8] = (m[0] * m[4] - m[1] * m[3]) / d;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+
+void App::docToScreen(double dx, double dy, float& sx, float& sy) const {
+  double vx = dx - view.panX, vy = dy - view.panY;
+  double c = std::cos(view.rotation), s = std::sin(view.rotation);
+  sx = float(R.extent.width * 0.5 + view.zoom * (c * vx - s * vy));
+  sy = float(R.extent.height * 0.5 + view.zoom * (s * vx + c * vy));
+}
+
+StrokeStyle App::currentStyle(bool eraser) const {
+  const BrushSettings& b = brushes[tipIndex];
+  StrokeStyle st;
+  st.tip = b.tip;
+  st.hardness = b.hardness;
+  st.texStrength = b.texStrength;
+  st.texScale = b.texScale;
+  st.color[0] = color[0]; st.color[1] = color[1]; st.color[2] = color[2];
+  st.opacity = b.opacity;
+  st.eraser = eraser;
+  return st;
+}
+
+void App::setTool(ToolId t) {
+  if (xf.active && t != ToolId::Transform) applyTransform();
+  tool = t;
+  if (t == ToolId::Transform && !xf.active) startTransform();
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+
+void App::resetSelection() {
+  selCpu.clear();
+  selActive = false;
+  selX0 = selY0 = selX1 = selY1 = 0;
+  R.setSelectionActive(false);
+}
+
+void App::combineSelection(int x, int y, uint32_t w, uint32_t h, const std::vector<uint8_t>& cov, int op) {
+  if (!R.hasDocument()) return;
+  int W = int(R.docW), H = int(R.docH);
+  if (selCpu.size() != size_t(W) * H) selCpu.assign(size_t(W) * H, 0);
+  int ux0 = x, uy0 = y, ux1 = x + int(w), uy1 = y + int(h);
+  if (op == 0 && selActive) {  // replace: clear the old area
+    for (int yy = selY0; yy < selY1; ++yy) memset(selCpu.data() + size_t(yy) * W + selX0, 0, size_t(selX1 - selX0));
+  }
+  if (selActive) { ux0 = std::min(ux0, selX0); uy0 = std::min(uy0, selY0); ux1 = std::max(ux1, selX1); uy1 = std::max(uy1, selY1); }
+  for (uint32_t r = 0; r < h; ++r) {
+    int yy = y + int(r);
+    if (yy < 0 || yy >= H) continue;
+    for (uint32_t c = 0; c < w; ++c) {
+      int xx = x + int(c);
+      if (xx < 0 || xx >= W) continue;
+      uint8_t v = cov[size_t(r) * w + c];
+      uint8_t& d = selCpu[size_t(yy) * W + xx];
+      if (op == 2) d = uint8_t(std::min<int>(d, 255 - v));
+      else d = std::max(d, v);
+    }
+  }
+  ux0 = std::max(ux0, 0); uy0 = std::max(uy0, 0); ux1 = std::min(ux1, W); uy1 = std::min(uy1, H);
+  // new bounding box
+  int bx0 = W, by0 = H, bx1 = 0, by1 = 0;
+  for (int yy = uy0; yy < uy1; ++yy) {
+    const uint8_t* row = selCpu.data() + size_t(yy) * W;
+    for (int xx = ux0; xx < ux1; ++xx)
+      if (row[xx]) { bx0 = std::min(bx0, xx); bx1 = std::max(bx1, xx + 1); by0 = std::min(by0, yy); by1 = std::max(by1, yy + 1); }
+  }
+  std::string err;
+  if (ux0 < ux1 && uy0 < uy1) R.uploadSelection(selCpu.data(), ux0, uy0, uint32_t(ux1 - ux0), uint32_t(uy1 - uy0), err);
+  selActive = bx0 < bx1;
+  if (selActive) { selX0 = bx0; selY0 = by0; selX1 = bx1; selY1 = by1; }
+  R.setSelectionActive(selActive);
+}
+
+void App::selectAll() {
+  if (!R.hasDocument()) return;
+  std::vector<uint8_t> all(size_t(R.docW) * R.docH, 255);
+  combineSelection(0, 0, R.docW, R.docH, all, 0);
+}
+
+void App::deselect() {
+  if (!selActive) return;
+  std::vector<uint8_t> none;
+  int W = int(R.docW);
+  for (int yy = selY0; yy < selY1; ++yy) memset(selCpu.data() + size_t(yy) * W + selX0, 0, size_t(selX1 - selX0));
+  std::string err;
+  R.uploadSelection(selCpu.data(), selX0, selY0, uint32_t(selX1 - selX0), uint32_t(selY1 - selY0), err);
+  selActive = false;
+  R.setSelectionActive(false);
+}
+
+void App::invertSelection() {
+  if (!R.hasDocument()) return;
+  size_t n = size_t(R.docW) * R.docH;
+  if (selCpu.size() != n) selCpu.assign(n, 0);
+  std::vector<uint8_t> inv(n);
+  for (size_t i = 0; i < n; ++i) inv[i] = uint8_t(255 - selCpu[i]);
+  selActive = false;
+  combineSelection(0, 0, R.docW, R.docH, inv, 0);
+}
+
+// Edit > Fill (colour) or Delete (erase) inside the selection, or the whole layer without one.
+void App::fillSelection(bool erase) {
+  if (!R.hasDocument() || R.busy()) return;
+  int x0 = 0, y0 = 0, x1 = int(R.docW), y1 = int(R.docH);
+  if (selActive) { x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1; }
+  std::vector<uint8_t> cov(size_t(x1 - x0) * (y1 - y0), 255);  // the commit clips to the selection
+  StrokeStyle st = currentStyle(erase);
+  st.opacity = 1;
+  std::string err;
+  if (!R.paintCoverage(active, x0, y0, uint32_t(x1 - x0), uint32_t(y1 - y0), cov.data(), st, err) && !err.empty()) error(err);
+}
+
+// Flood fill on the active layer (premultiplied RGBA compared per channel).
+bool App::floodMask(double dx, double dy, float tol, bool contiguous, std::vector<uint8_t>& mask, int& bx0, int& by0,
+                    int& bx1, int& by1) {
+  int W = int(R.docW), H = int(R.docH);
+  int sx = int(std::floor(dx)), sy = int(std::floor(dy));
+  if (sx < 0 || sy < 0 || sx >= W || sy >= H) return false;
+  std::vector<uint8_t> px;
+  std::string err;
+  R.waitIdle();
+  if (!R.readLayerRegion(active, 0, 0, uint32_t(W), uint32_t(H), px, err)) { error(err); return false; }
+  const uint8_t* seed = &px[(size_t(sy) * W + sx) * 4];
+  int t = int(tol * 255 + 0.5f);
+  auto match = [&](size_t i) {
+    const uint8_t* p = &px[i * 4];
+    for (int k = 0; k < 4; ++k) if (std::abs(int(p[k]) - int(seed[k])) > t) return false;
+    return true;
+  };
+  mask.assign(size_t(W) * H, 0);
+  bx0 = W; by0 = H; bx1 = 0; by1 = 0;
+  auto grow = [&](int x, int y) { bx0 = std::min(bx0, x); bx1 = std::max(bx1, x + 1); by0 = std::min(by0, y); by1 = std::max(by1, y + 1); };
+  if (!contiguous) {
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        if (match(size_t(y) * W + x)) { mask[size_t(y) * W + x] = 255; grow(x, y); }
+  } else {
+    std::vector<std::pair<int, int>> stack{{sx, sy}};
+    while (!stack.empty()) {
+      auto [x, y] = stack.back();
+      stack.pop_back();
+      size_t row = size_t(y) * W;
+      if (mask[row + x] || !match(row + x)) continue;
+      int l = x, r = x;
+      while (l > 0 && !mask[row + l - 1] && match(row + l - 1)) --l;
+      while (r + 1 < W && !mask[row + r + 1] && match(row + r + 1)) ++r;
+      memset(&mask[row + l], 255, size_t(r - l + 1));
+      grow(l, y);
+      grow(r, y);
+      for (int ny : {y - 1, y + 1}) {
+        if (ny < 0 || ny >= H) continue;
+        size_t nrow = size_t(ny) * W;
+        bool prev = false;
+        for (int i = l; i <= r; ++i) {
+          bool ok = !mask[nrow + i] && match(nrow + i);
+          if (ok && !prev) stack.push_back({i, ny});
+          prev = ok;
+        }
+      }
+    }
+  }
+  return bx0 < bx1;
+}
+
+// ---------------------------------------------------------------------------
+// Transform
+
+void App::startTransform() {
+  if (xf.active || !R.hasDocument() || R.busy()) return;
+  int W = int(R.docW), H = int(R.docH);
+  std::string err;
+  int x0, y0, x1, y1;
+  std::vector<uint8_t> px;
+  R.waitIdle();
+  if (selActive) {
+    x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1;
+    if (!R.readLayerRegion(active, x0, y0, uint32_t(x1 - x0), uint32_t(y1 - y0), px, err)) { error(err); return; }
+  } else {
+    // whole layer: find the painted bounds
+    if (!R.readLayerRegion(active, 0, 0, uint32_t(W), uint32_t(H), px, err)) { error(err); return; }
+    x0 = W; y0 = H; x1 = 0; y1 = 0;
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        if (px[(size_t(y) * W + x) * 4 + 3]) { x0 = std::min(x0, x); x1 = std::max(x1, x + 1); y0 = std::min(y0, y); y1 = std::max(y1, y + 1); }
+    if (x0 >= x1) { error("The layer is empty - nothing to transform."); tool = ToolId::Brush; return; }
+    std::vector<uint8_t> crop(size_t(x1 - x0) * (y1 - y0) * 4);
+    for (int y = y0; y < y1; ++y)
+      memcpy(&crop[size_t(y - y0) * (x1 - x0) * 4], &px[(size_t(y) * W + x0) * 4], size_t(x1 - x0) * 4);
+    px.swap(crop);
+  }
+  uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
+  std::vector<uint8_t> cov(size_t(w) * h, 255);
+  if (selActive)
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        uint8_t s = selCpu[size_t(y0 + int(y)) * W + x0 + int(x)];
+        cov[size_t(y) * w + x] = s;
+        uint8_t* p = &px[(size_t(y) * w + x) * 4];
+        for (int k = 0; k < 4; ++k) p[k] = uint8_t((p[k] * s + 127) / 255);
+      }
+  unpremultiply(px);
+  if (!R.createFloating(w, h, px.data(), xf.fl, err)) { error(err); return; }
+  // lift the pixels off the layer (one undo step; Cancel undoes it without leaving a redo)
+  StrokeStyle st = currentStyle(true);
+  st.opacity = 1;
+  if (!R.paintCoverage(active, x0, y0, w, h, cov.data(), st, err)) { R.destroyFloating(xf.fl); error(err); return; }
+  xf.active = true;
+  xf.srcX = x0;
+  xf.srcY = y0;
+  double q[4][2] = {{double(x0), double(y0)}, {double(x1), double(y0)}, {double(x1), double(y1)}, {double(x0), double(y1)}};
+  memcpy(xf.q, q, sizeof q);
+  xf.drag = 0;
+  deselect();
+  tool = ToolId::Transform;
+}
+
+void App::applyTransform() {
+  if (!xf.active) return;
+  while (R.busy()) {  // the lift must be committed first
+    Renderer::FrameParams p;
+    p.view = view;
+    p.activeLayer = active;
+    R.renderFrame(p);
+  }
+  double src[4][2] = {{0, 0}, {double(xf.fl.w), 0}, {double(xf.fl.w), double(xf.fl.h)}, {0, double(xf.fl.h)}};
+  double hm[9], inv[9];
+  std::string err;
+  if (homography(src, xf.q, hm) && invert3(hm, inv)) {
+    double mnx = 1e300, mny = 1e300, mxx = -1e300, mxy = -1e300;
+    for (auto& c : xf.q) { mnx = std::min(mnx, c[0]); mxx = std::max(mxx, c[0]); mny = std::min(mny, c[1]); mxy = std::max(mxy, c[1]); }
+    R.stamp(active, xf.fl, inv, int(std::floor(mnx)) - 1, int(std::floor(mny)) - 1, int(std::ceil(mxx)) + 1,
+            int(std::ceil(mxy)) + 1, err);
+    if (!err.empty()) error(err);
+  } else {
+    error("The transform is degenerate (corners overlap); cancelled.");
+    R.undoDiscard();
+  }
+  R.destroyFloating(xf.fl);
+  xf.active = false;
+  tool = ToolId::Brush;
+}
+
+void App::cancelTransform() {
+  if (!xf.active) return;
+  while (R.busy()) {
+    Renderer::FrameParams p;
+    p.view = view;
+    p.activeLayer = active;
+    R.renderFrame(p);
+  }
+  R.undoDiscard();  // put the lifted pixels back
+  R.destroyFloating(xf.fl);
+  xf.active = false;
+  tool = ToolId::Brush;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer handling (document coordinates + framebuffer-pixel screen position)
+
+bool App::toolDown(double dx, double dy, float sx, float sy) {
+  if (tool == ToolId::Brush && !altDown) return false;
+  selOp = shiftDown ? 1 : altDown ? 2 : 0;
+  t0x = t1x = dx;
+  t0y = t1y = dy;
+  toolDrag = true;
+  switch (tool) {
+    case ToolId::Brush:  // Alt+click
+    case ToolId::Eyedropper:
+      picking = true;
+      R.requestPick(int(sx), int(sy));
+      return true;
+    case ToolId::Hand:
+      drag = Drag::Pan;
+      dragX = sx;
+      dragY = sy;
+      toolDrag = false;
+      return true;
+    case ToolId::Fill: {
+      toolDrag = false;
+      std::vector<uint8_t> m;
+      int x0, y0, x1, y1;
+      if (!floodMask(dx, dy, fillTol, fillContiguous, m, x0, y0, x1, y1)) return true;
+      int W = int(R.docW), H = int(R.docH);
+      if (fillGrow) {  // grow 1 px under anti-aliased line art so no halo is left
+        x0 = std::max(0, x0 - 1); y0 = std::max(0, y0 - 1); x1 = std::min(W, x1 + 1); y1 = std::min(H, y1 + 1);
+      }
+      uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
+      std::vector<uint8_t> cov(size_t(w) * h);
+      for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) {
+          uint8_t v = m[size_t(y) * W + x];
+          if (!v && fillGrow)
+            for (int oy = -1; oy <= 1 && !v; ++oy)
+              for (int ox = -1; ox <= 1 && !v; ++ox) {
+                int xx = x + ox, yy = y + oy;
+                if (xx >= 0 && yy >= 0 && xx < W && yy < H && m[size_t(yy) * W + xx]) v = 255;
+              }
+          cov[size_t(y - y0) * w + (x - x0)] = v;
+        }
+      StrokeStyle st = currentStyle(false);
+      std::string err;
+      if (!R.paintCoverage(active, x0, y0, w, h, cov.data(), st, err) && !err.empty()) error(err);
+      return true;
+    }
+    case ToolId::Wand: {
+      toolDrag = false;
+      std::vector<uint8_t> m;
+      int x0, y0, x1, y1;
+      if (!floodMask(dx, dy, wandTol, wandContiguous, m, x0, y0, x1, y1)) return true;
+      int W = int(R.docW);
+      uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
+      std::vector<uint8_t> cov(size_t(w) * h);
+      for (uint32_t y = 0; y < h; ++y) memcpy(&cov[size_t(y) * w], &m[size_t(y0 + int(y)) * W + x0], w);
+      combineSelection(x0, y0, w, h, cov, selOp);
+      return true;
+    }
+    case ToolId::Lasso:
+      lasso = {dx, dy};
+      return true;
+    case ToolId::Transform: {
+      if (!xf.active) { startTransform(); toolDrag = false; return true; }
+      // corners (screen distance), inside = move, outside = rotate
+      float best = 1e9f;
+      int bi = -1;
+      for (int i = 0; i < 4; ++i) {
+        float cx, cy;
+        docToScreen(xf.q[i][0], xf.q[i][1], cx, cy);
+        float d = std::hypot(cx - sx, cy - sy);
+        if (d < best) { best = d; bi = i; }
+      }
+      memcpy(xf.start, xf.q, sizeof xf.q);
+      xf.gx = dx;
+      xf.gy = dy;
+      if (best < 12 * density) {
+        xf.corner = bi;
+        xf.drag = ctrlDown ? 3 : 2;
+      } else {
+        std::vector<double> poly;
+        for (auto& c : xf.q) { poly.push_back(c[0]); poly.push_back(c[1]); }
+        bool inside = false;
+        for (size_t i = 0, j = 3; i < 4; j = i++) {
+          if ((poly[2 * i + 1] > dy) != (poly[2 * j + 1] > dy) &&
+              dx < (poly[2 * j] - poly[2 * i]) * (dy - poly[2 * i + 1]) / (poly[2 * j + 1] - poly[2 * i + 1]) + poly[2 * i])
+            inside = !inside;
+        }
+        xf.drag = inside ? 1 : 4;
+        double cx = 0, cy = 0;
+        for (auto& c : xf.q) { cx += c[0] / 4; cy += c[1] / 4; }
+        xf.a0 = std::atan2(dy - cy, dx - cx);
+      }
+      return true;
+    }
+    default:
+      return true;  // drag tools: gradient, line, shapes, rect/ellipse select
+  }
+}
+
+void App::toolMove(double dx, double dy, float sx, float sy) {
+  if (!toolDrag) return;
+  t1x = dx;
+  t1y = dy;
+  if (shiftDown && (tool == ToolId::Rect || tool == ToolId::Ellipse || tool == ToolId::SelRect || tool == ToolId::SelEllipse) &&
+      selOp == 0) {
+    double s = std::max(std::abs(t1x - t0x), std::abs(t1y - t0y));  // square / circle
+    t1x = t0x + (t1x >= t0x ? s : -s);
+    t1y = t0y + (t1y >= t0y ? s : -s);
+  }
+  if (tool == ToolId::Lasso) {
+    size_t n = lasso.size();
+    if (std::hypot(dx - lasso[n - 2], dy - lasso[n - 1]) * view.zoom >= 2.0) { lasso.push_back(dx); lasso.push_back(dy); }
+  }
+  if (tool == ToolId::Eyedropper || (tool == ToolId::Brush && picking)) R.requestPick(int(sx), int(sy));
+  if (tool == ToolId::Transform && xf.active && xf.drag) {
+    double mx = dx - xf.gx, my = dy - xf.gy;
+    if (xf.drag == 1) {
+      for (int i = 0; i < 4; ++i) { xf.q[i][0] = xf.start[i][0] + mx; xf.q[i][1] = xf.start[i][1] + my; }
+    } else if (xf.drag == 3) {
+      xf.q[xf.corner][0] = xf.start[xf.corner][0] + mx;
+      xf.q[xf.corner][1] = xf.start[xf.corner][1] + my;
+    } else if (xf.drag == 2) {
+      // scale in the quad's own axes with the opposite corner fixed
+      int o = (xf.corner + 2) % 4;
+      double ox = xf.start[o][0], oy = xf.start[o][1];
+      double ux = xf.start[1][0] - xf.start[0][0], uy = xf.start[1][1] - xf.start[0][1];
+      double vx = xf.start[3][0] - xf.start[0][0], vy = xf.start[3][1] - xf.start[0][1];
+      double det = ux * vy - uy * vx;
+      if (std::abs(det) < 1e-9) return;
+      auto decomp = [&](double px, double py, double& a, double& b) {
+        a = (px * vy - py * vx) / det;
+        b = (ux * py - uy * px) / det;
+      };
+      double a0, b0, a1, b1;
+      decomp(xf.start[xf.corner][0] - ox, xf.start[xf.corner][1] - oy, a0, b0);
+      decomp(dx - ox, dy - oy, a1, b1);
+      double su = std::abs(a0) > 1e-9 ? a1 / a0 : 1, sv = std::abs(b0) > 1e-9 ? b1 / b0 : 1;
+      if (shiftDown) { double m = (std::abs(su) + std::abs(sv)) / 2; su = su < 0 ? -m : m; sv = sv < 0 ? -m : m; }
+      for (int i = 0; i < 4; ++i) {
+        double a, b;
+        decomp(xf.start[i][0] - ox, xf.start[i][1] - oy, a, b);
+        a *= su;
+        b *= sv;
+        xf.q[i][0] = ox + a * ux + b * vx;
+        xf.q[i][1] = oy + a * uy + b * vy;
+      }
+    } else if (xf.drag == 4) {
+      double cx = 0, cy = 0;
+      for (auto& c : xf.start) { cx += c[0] / 4; cy += c[1] / 4; }
+      double ang = std::atan2(dy - cy, dx - cx) - xf.a0;
+      if (shiftDown) ang = std::round(ang / (kPi / 12)) * (kPi / 12);  // 15 degree steps
+      double c = std::cos(ang), s = std::sin(ang);
+      for (int i = 0; i < 4; ++i) {
+        double px = xf.start[i][0] - cx, py = xf.start[i][1] - cy;
+        xf.q[i][0] = cx + c * px - s * py;
+        xf.q[i][1] = cy + s * px + c * py;
+      }
+    }
+  }
+}
+
+void App::toolUp(double dx, double dy) {
+  if (!toolDrag) return;
+  toolDrag = false;
+  picking = false;
+  std::string err;
+  int W = int(R.docW), H = int(R.docH);
+  switch (tool) {
+    case ToolId::Gradient: {
+      if (std::hypot(t1x - t0x, t1y - t0y) < 1) break;
+      int x0 = 0, y0 = 0, x1 = W, y1 = H;
+      if (selActive) { x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1; }
+      R.paintGradient(active, float(t0x), float(t0y), float(t1x), float(t1y), x0, y0, x1, y1, currentStyle(eraserToggle));
+      break;
+    }
+    case ToolId::Line:
+      strokeBegin({t0x, t0y, 1.0f}, false);
+      strokeAdd({t1x, t1y, 1.0f});
+      strokeEnd();
+      break;
+    case ToolId::Rect:
+    case ToolId::Ellipse: {
+      if (std::abs(t1x - t0x) < 1 || std::abs(t1y - t0y) < 1) break;
+      std::vector<double> poly = tool == ToolId::Rect ? rectPoly(t0x, t0y, t1x, t1y) : ellipsePoly(t0x, t0y, t1x, t1y);
+      if (shapeFilled) {
+        int ox, oy;
+        uint32_t ow, oh;
+        std::vector<uint8_t> cov;
+        rasterPolygon(poly, W, H, ox, oy, ow, oh, cov);
+        if (ow && !R.paintCoverage(active, ox, oy, ow, oh, cov.data(), currentStyle(eraserToggle), err) && !err.empty()) error(err);
+      } else {
+        size_t n = poly.size() / 2;
+        strokeBegin({poly[0], poly[1], 1.0f}, false);
+        for (size_t i = 1; i <= n; ++i) strokeAdd({poly[2 * (i % n)], poly[2 * (i % n) + 1], 1.0f});
+        strokeEnd();
+      }
+      break;
+    }
+    case ToolId::SelRect:
+    case ToolId::SelEllipse:
+    case ToolId::Lasso: {
+      std::vector<double> poly;
+      if (tool == ToolId::Lasso) poly = lasso;
+      else if (std::abs(t1x - t0x) >= 1 && std::abs(t1y - t0y) >= 1) {
+        if (tool == ToolId::SelRect) {
+          // rectangles snap to whole pixels (crisp edges)
+          poly = rectPoly(std::round(t0x), std::round(t0y), std::round(t1x), std::round(t1y));
+        } else {
+          poly = ellipsePoly(t0x, t0y, t1x, t1y);
+        }
+      }
+      if (poly.size() < 6) {
+        if (selOp == 0) deselect();  // a click without a drag deselects
+        break;
+      }
+      int ox, oy;
+      uint32_t ow, oh;
+      std::vector<uint8_t> cov;
+      rasterPolygon(poly, W, H, ox, oy, ow, oh, cov);
+      if (ow) combineSelection(ox, oy, ow, oh, cov, selOp);
+      else if (selOp == 0) deselect();
+      break;
+    }
+    case ToolId::Transform:
+      xf.drag = 0;
+      break;
+    default:
+      break;
+  }
+  lasso.clear();
+}
+
+void App::toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt) {
+  if (xf.active) {
+    if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { applyTransform(); return; }
+    if (key == SDLK_ESCAPE) { cancelTransform(); return; }
+  }
+  if (ctrl) {
+    if (key == SDLK_A) selectAll();
+    else if (key == SDLK_D) deselect();
+    else if (key == SDLK_I && shift) invertSelection();
+    else if (key == SDLK_T) setTool(ToolId::Transform);
+    return;
+  }
+  switch (key) {
+    case SDLK_B: setTool(ToolId::Brush); break;
+    case SDLK_I: setTool(ToolId::Eyedropper); break;
+    case SDLK_G: setTool(shift ? ToolId::Gradient : ToolId::Fill); break;
+    case SDLK_U: setTool(tool == ToolId::Line ? ToolId::Rect : tool == ToolId::Rect ? ToolId::Ellipse : ToolId::Line); break;
+    case SDLK_M: setTool(tool == ToolId::SelRect ? ToolId::SelEllipse : ToolId::SelRect); break;
+    case SDLK_L: setTool(ToolId::Lasso); break;
+    case SDLK_W: setTool(ToolId::Wand); break;
+    case SDLK_V: setTool(ToolId::Transform); break;
+    case SDLK_H: setTool(ToolId::Hand); break;
+    case SDLK_DELETE:
+    case SDLK_BACKSPACE:
+      fillSelection(!alt);  // Delete clears, Alt+Backspace fills with the colour
+      break;
+    case SDLK_ESCAPE: deselect(); break;
+    default: break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// UI: tool bar with drawn icons, tool settings, on-canvas overlays
+
+static void drawIcon(ImDrawList* dl, ToolId t, ImVec2 c, float s, ImU32 col) {
+  float r = s * 0.36f, th = std::max(1.0f, s * 0.07f);
+  auto P = [&](float x, float y) { return ImVec2(c.x + x * r, c.y + y * r); };
+  switch (t) {
+    case ToolId::Brush:
+      dl->AddLine(P(0.9f, -0.9f), P(-0.2f, 0.2f), col, th * 1.6f);
+      dl->AddCircleFilled(P(-0.45f, 0.45f), r * 0.38f, col);
+      break;
+    case ToolId::Eyedropper:
+      dl->AddLine(P(0.2f, -0.2f), P(-0.8f, 0.8f), col, th * 1.5f);
+      dl->AddCircleFilled(P(0.55f, -0.55f), r * 0.35f, col);
+      break;
+    case ToolId::Fill:
+      dl->AddQuad(P(-0.8f, -0.1f), P(0.0f, -0.9f), P(0.8f, -0.1f), P(0.0f, 0.7f), col, th);
+      dl->AddCircleFilled(P(0.85f, 0.6f), r * 0.2f, col);
+      break;
+    case ToolId::Gradient:
+      dl->AddRectFilledMultiColor(P(-0.9f, -0.6f), P(0.9f, 0.6f), col, col & 0x00FFFFFF, col & 0x00FFFFFF, col);
+      dl->AddRect(P(-0.9f, -0.6f), P(0.9f, 0.6f), col, 0, th);
+      break;
+    case ToolId::Line: dl->AddLine(P(-0.8f, 0.8f), P(0.8f, -0.8f), col, th * 1.4f); break;
+    case ToolId::Rect: dl->AddRect(P(-0.8f, -0.6f), P(0.8f, 0.6f), col, 0, th * 1.3f); break;
+    case ToolId::Ellipse: dl->AddEllipse(c, ImVec2(r * 0.85f, r * 0.62f), col, 0, th * 1.3f); break;
+    case ToolId::SelRect:
+      for (int i = 0; i < 4; ++i) {
+        dl->AddLine(P(-0.8f + i * 0.45f, -0.6f), P(-0.6f + i * 0.45f, -0.6f), col, th);
+        dl->AddLine(P(-0.8f + i * 0.45f, 0.6f), P(-0.6f + i * 0.45f, 0.6f), col, th);
+      }
+      for (int i = 0; i < 3; ++i) {
+        dl->AddLine(P(-0.8f, -0.6f + i * 0.45f), P(-0.8f, -0.4f + i * 0.45f), col, th);
+        dl->AddLine(P(0.8f, -0.6f + i * 0.45f), P(0.8f, -0.4f + i * 0.45f), col, th);
+      }
+      break;
+    case ToolId::SelEllipse:
+      for (int i = 0; i < 12; i += 2) {
+        float a0 = float(i * kPi / 6), a1 = float((i + 1) * kPi / 6);
+        dl->AddLine(P(0.85f * std::cos(a0), 0.62f * std::sin(a0)), P(0.85f * std::cos(a1), 0.62f * std::sin(a1)), col, th);
+      }
+      break;
+    case ToolId::Lasso:
+      dl->AddEllipse(ImVec2(c.x, c.y - r * 0.2f), ImVec2(r * 0.8f, r * 0.5f), col, 0.3f, 0, th);
+      dl->AddBezierQuadratic(P(-0.4f, 0.2f), P(-0.7f, 0.7f), P(-0.2f, 0.95f), col, th);
+      break;
+    case ToolId::Wand:
+      dl->AddLine(P(-0.8f, 0.8f), P(0.3f, -0.3f), col, th * 1.5f);
+      dl->AddLine(P(0.6f, -0.95f), P(0.6f, -0.35f), col, th);
+      dl->AddLine(P(0.3f, -0.65f), P(0.9f, -0.65f), col, th);
+      break;
+    case ToolId::Transform:
+      dl->AddLine(P(-0.9f, 0), P(0.9f, 0), col, th);
+      dl->AddLine(P(0, -0.9f), P(0, 0.9f), col, th);
+      for (int k = 0; k < 4; ++k) {
+        float a = float(k * kPi / 2);
+        ImVec2 tip = P(0.9f * std::cos(a), 0.9f * std::sin(a));
+        ImVec2 l = P(0.55f * std::cos(a) - 0.25f * std::sin(a), 0.55f * std::sin(a) + 0.25f * std::cos(a));
+        ImVec2 rr = P(0.55f * std::cos(a) + 0.25f * std::sin(a), 0.55f * std::sin(a) - 0.25f * std::cos(a));
+        dl->AddTriangleFilled(tip, l, rr, col);
+      }
+      break;
+    case ToolId::Hand:
+      dl->AddRect(P(-0.5f, -0.2f), P(0.5f, 0.85f), col, r * 0.2f, th);
+      for (int k = 0; k < 4; ++k) dl->AddLine(P(-0.38f + k * 0.25f, -0.2f), P(-0.38f + k * 0.25f, -0.85f + (k == 0 || k == 3 ? 0.2f : 0)), col, th * 1.3f);
+      break;
+    default: break;
+  }
+}
+
+void App::drawToolbar() {
+  ImGuiWindowClass wc;
+  wc.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar;
+  ImGui::SetNextWindowClass(&wc);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 6));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 3));
+  if (!ImGui::Begin("Tools", nullptr, ImGuiWindowFlags_NoScrollbar)) { ImGui::End(); ImGui::PopStyleVar(2); return; }
+  float bs = std::min(ImGui::GetContentRegionAvail().x, 40.0f * ImGui::GetStyle().FontScaleDpi);
+  bs = std::max(bs, 24.0f);
+  int perRow = std::max(1, int((ImGui::GetContentRegionAvail().x + 2) / (bs + 2)));
+  int i = 0;
+  for (const ToolInfo& t : kTools) {
+    ImGui::PushID(int(t.id));
+    if (i % perRow) ImGui::SameLine();
+    bool sel = tool == t.id;
+    ImGui::PushStyleColor(ImGuiCol_Button, sel ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0));
+    if (ImGui::Button("##t", ImVec2(bs, bs))) setTool(t.id);
+    ImGui::PopStyleColor();
+    ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    drawIcon(ImGui::GetWindowDrawList(), t.id, ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), bs,
+             ImGui::GetColorU32(sel ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s  (%s)", t.name, t.key);
+    ImGui::PopID();
+    ++i;
+    // group separators: paint | shapes | selection | transform/navigation
+    if (t.id == ToolId::Gradient || t.id == ToolId::Ellipse || t.id == ToolId::Wand) {
+      ImGui::Dummy(ImVec2(0, 2));
+      ImGui::Separator();
+      i = 0;
+    }
+  }
+  // current colour swatch
+  ImGui::Dummy(ImVec2(0, 4));
+  ImGui::ColorButton("##cur", ImVec4(color[0], color[1], color[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(bs, bs));
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Current colour");
+  ImGui::End();
+  ImGui::PopStyleVar(2);
+}
+
+void App::drawToolOptions() {
+  const char* name = "Brush";
+  for (auto& t : kTools) if (t.id == tool) name = t.name;
+  ImGui::SeparatorText(name);
+  switch (tool) {
+    case ToolId::Fill:
+      ImGui::SliderFloat("Tolerance", &fillTol, 0.0f, 1.0f, "%.2f");
+      ImGui::Checkbox("Contiguous", &fillContiguous);
+      ImGui::Checkbox("Grow 1 px under line art", &fillGrow);
+      ImGui::TextDisabled("Fills on the active layer. Alt+Backspace fills the selection.");
+      break;
+    case ToolId::Wand:
+      ImGui::SliderFloat("Tolerance", &wandTol, 0.0f, 1.0f, "%.2f");
+      ImGui::Checkbox("Contiguous", &wandContiguous);
+      [[fallthrough]];
+    case ToolId::SelRect:
+    case ToolId::SelEllipse:
+    case ToolId::Lasso:
+      ImGui::TextDisabled("Shift: add   Alt: subtract   Ctrl+A all\nCtrl+D deselect   Ctrl+Shift+I invert\nDelete clears, Alt+Backspace fills");
+      if (ImGui::Button("Select all")) selectAll();
+      ImGui::SameLine();
+      if (ImGui::Button("Deselect")) deselect();
+      ImGui::SameLine();
+      if (ImGui::Button("Invert")) invertSelection();
+      break;
+    case ToolId::Rect:
+    case ToolId::Ellipse:
+      ImGui::Checkbox("Filled", &shapeFilled);
+      ImGui::TextDisabled("Outline uses the brush below. Shift: square / circle.");
+      break;
+    case ToolId::Line:
+      ImGui::TextDisabled("Drag to draw a straight line with the brush below.\nWith the Brush: Shift+click continues from the last stroke.");
+      break;
+    case ToolId::Gradient:
+      ImGui::TextDisabled("Drag: colour -> transparent (inside the selection if any).");
+      break;
+    case ToolId::Eyedropper:
+      ImGui::TextDisabled("Click or drag to pick the visible colour.\nAlt+click picks while painting.");
+      break;
+    case ToolId::Transform:
+      if (!xf.active) { ImGui::TextDisabled("Click the canvas to transform the layer / selection."); break; }
+      ImGui::TextDisabled("Drag inside: move   corners: scale (Shift keeps ratio)\nCtrl+corner: distort   outside: rotate (Shift 15 deg)");
+      if (ImGui::Button("Flip H")) {
+        double q[4][2]; memcpy(q, xf.q, sizeof q);
+        int m[4] = {1, 0, 3, 2};
+        for (int k = 0; k < 4; ++k) { xf.q[k][0] = q[m[k]][0]; xf.q[k][1] = q[m[k]][1]; }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Flip V")) {
+        double q[4][2]; memcpy(q, xf.q, sizeof q);
+        int m[4] = {3, 2, 1, 0};
+        for (int k = 0; k < 4; ++k) { xf.q[k][0] = q[m[k]][0]; xf.q[k][1] = q[m[k]][1]; }
+      }
+      if (ImGui::Button("Apply (Enter)")) applyTransform();
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel (Esc)")) cancelTransform();
+      break;
+    case ToolId::Hand:
+      ImGui::TextDisabled("Drag to pan. Wheel zooms, Shift+Space+drag rotates.");
+      break;
+    default:
+      break;
+  }
+}
+
+void App::drawToolOverlay() {
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  float s = ImGui::GetIO().DisplayFramebufferScale.x;
+  auto S = [&](double dx, double dy) { float x, y; docToScreen(dx, dy, x, y); return ImVec2(x / s, y / s); };
+  ImU32 white = IM_COL32(255, 255, 255, 220), black = IM_COL32(0, 0, 0, 220);
+  auto poly = [&](const std::vector<double>& p, bool closed) {
+    std::vector<ImVec2> pts;
+    for (size_t i = 0; i + 1 < p.size(); i += 2) pts.push_back(S(p[i], p[i + 1]));
+    if (pts.size() < 2) return;
+    dl->AddPolyline(pts.data(), int(pts.size()), black, 3.0f, closed ? ImDrawFlags_Closed : 0);
+    dl->AddPolyline(pts.data(), int(pts.size()), white, 1.0f, closed ? ImDrawFlags_Closed : 0);
+  };
+  if (toolDrag) {
+    switch (tool) {
+      case ToolId::Line:
+      case ToolId::Gradient: poly({t0x, t0y, t1x, t1y}, false); break;
+      case ToolId::Rect:
+      case ToolId::SelRect: poly(rectPoly(t0x, t0y, t1x, t1y), true); break;
+      case ToolId::Ellipse:
+      case ToolId::SelEllipse: poly(ellipsePoly(t0x, t0y, t1x, t1y), true); break;
+      case ToolId::Lasso: poly(lasso, false); break;
+      default: break;
+    }
+  }
+  if (xf.active) {
+    ImVec2 p[4];
+    for (int i = 0; i < 4; ++i) p[i] = S(xf.q[i][0], xf.q[i][1]);
+    // live preview of the floating pixels (the real resampling happens on Apply)
+    ImGui::GetBackgroundDrawList()->AddImageQuad(ImTextureRef(ImTextureID(uint64_t(xf.fl.imguiTex))), p[0], p[1], p[2], p[3]);
+    dl->AddPolyline(p, 4, black, 3.0f, ImDrawFlags_Closed);
+    dl->AddPolyline(p, 4, white, 1.0f, ImDrawFlags_Closed);
+    for (auto& c : p) {
+      dl->AddRectFilled(ImVec2(c.x - 5, c.y - 5), ImVec2(c.x + 5, c.y + 5), black);
+      dl->AddRectFilled(ImVec2(c.x - 4, c.y - 4), ImVec2(c.x + 4, c.y + 4), white);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// --tooltest: scripted scene exercising every tool (automated visual test)
+
+void App::buildToolTest() {
+  auto drag = [this](ToolId t, double x0, double y0, double x1, double y1, int op = 0) {
+    return [=, this] {
+      tool = t;
+      selOp = op;
+      t0x = x0; t0y = y0; t1x = x1; t1y = y1;
+      if (t == ToolId::Lasso) {
+        lasso.clear();
+        for (int i = 0; i < 40; ++i) {
+          double a = i * 2 * kPi / 40, r = 110 + 40 * std::sin(a * 5);
+          lasso.push_back(x0 + r * std::cos(a));
+          lasso.push_back(y0 + r * std::sin(a));
+        }
+      }
+      toolDrag = true;
+      toolUp(x1, y1);
+    };
+  };
+  auto rgb = [this](float r, float g, float b) { return [=, this] { color[0] = r; color[1] = g; color[2] = b; }; };
+  demo.push_back([this] { newDocument(1600, 1000, true); });
+  // selection + Edit > Fill: red rectangle, then a blue gradient clipped to an ellipse selection
+  demo.push_back(drag(ToolId::SelRect, 100, 100, 500, 400));
+  demo.push_back(rgb(0.85f, 0.15f, 0.15f));
+  demo.push_back([this] { fillSelection(false); });
+  demo.push_back(drag(ToolId::SelEllipse, 600, 100, 1000, 400));
+  demo.push_back(rgb(0.1f, 0.3f, 0.9f));
+  demo.push_back(drag(ToolId::Gradient, 600, 250, 1000, 250));
+  // subtract a hole from the selection with Alt, then fill it (hole stays empty)
+  demo.push_back(drag(ToolId::SelRect, 1100, 100, 1500, 400));
+  demo.push_back(drag(ToolId::SelEllipse, 1200, 175, 1400, 325, 2));
+  demo.push_back(rgb(0.2f, 0.6f, 0.3f));
+  demo.push_back([this] { fillSelection(false); });
+  demo.push_back([this] { deselect(); });
+  // line + shape tools
+  demo.push_back(rgb(0.05f, 0.05f, 0.05f));
+  demo.push_back([this] { tipIndex = 0; brushes[0].size = 8; });
+  demo.push_back(drag(ToolId::Line, 100, 480, 1500, 480));
+  demo.push_back(drag(ToolId::Rect, 100, 550, 400, 800));
+  demo.push_back([this] { shapeFilled = true; color[0] = 0.95f; color[1] = 0.75f; color[2] = 0.1f; });
+  demo.push_back(drag(ToolId::Ellipse, 450, 550, 750, 800));
+  demo.push_back([this] { shapeFilled = false; });
+  // fill tool: fill inside the outlined rectangle
+  demo.push_back(rgb(0.6f, 0.3f, 0.8f));
+  demo.push_back([this] { tool = ToolId::Fill; toolDown(250, 700, 0, 0); });
+  // magic wand on the yellow ellipse + Delete clears it (only the centre part via subtract)
+  demo.push_back([this] { tool = ToolId::Wand; selOp = 0; toolDown(600, 675, 0, 0); });
+  demo.push_back(drag(ToolId::SelRect, 450, 550, 600, 800, 2));
+  demo.push_back([this] { fillSelection(true); deselect(); });
+  // transform: rotate + scale the red rectangle's right half
+  demo.push_back(drag(ToolId::SelRect, 300, 100, 500, 400));
+  demo.push_back([this] { startTransform(); });
+  demo.push_back([this] {
+    double cx = 400, cy = 250, a = 0.35;
+    for (auto& c : xf.q) {
+      double x = (c[0] - cx) * 0.8, y = (c[1] - cy) * 0.8;
+      c[0] = cx + 850 + std::cos(a) * x - std::sin(a) * y;
+      c[1] = cy + 550 + std::sin(a) * x + std::cos(a) * y;
+    }
+  });
+  demo.push_back([this] { applyTransform(); });
+  // lasso selection left active: marching ants
+  demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
+  demo.push_back([this] { tool = ToolId::Brush; });
+}

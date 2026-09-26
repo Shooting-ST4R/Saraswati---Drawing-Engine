@@ -22,3 +22,9 @@ layout(set = 0, binding = 3, rgba8) IMG_QUAL uniform image2D aboveImg;
 
 layout(set = 1, binding = 0, rgba8) IMG_QUAL uniform image2D layerImg;
 layout(set = 0, binding = 4, rgba8) IMG_QUAL uniform image2D workImg;   // this frame's composite
+// Selection coverage (document size). Only read when a selection is active.
+#ifdef MASK_R32F
+layout(set = 0, binding = 5, r32f) IMG_QUAL uniform image2D selImg;
+#else
+layout(set = 0, binding = 5, r8) IMG_QUAL uniform image2D selImg;
+#endif

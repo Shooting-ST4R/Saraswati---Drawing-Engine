@@ -13,6 +13,7 @@ layout(push_constant) uniform ViewPC {
   vec4 color;         // stroke colour (straight rgb) + stroke opacity
   vec4 paper;         // premultiplied paper colour
   int mode;           // blend mode of the sampled layer
+  int antsPhase;      // marching-ants animation offset
 } pc;
 
 const int FLAG_STROKE = 1;   // live stroke in the mask applies to the sampled layer
@@ -22,7 +23,8 @@ const int FLAG_ABOVE_CACHE = 8;  // frame: all layers above are Normal, use the 
 const int FLAG_ABOVE  = 16;  // cache: blend into the "above" cache
 const int FLAG_INIT   = 32;  // cache: init pass (paper / transparent)
 const int FLAG_WORK   = 64;  // cache: blend into this frame's work image
-const int FLAG_ONLY_BELOW = 128;  // cache init: leave "above" alone (flatten for saving)
+const int FLAG_ONLY_BELOW = 128;
+const int FLAG_SEL    = 256;  // a selection is active: live stroke clipped to it, marching ants drawn  // cache init: leave "above" alone (flatten for saving)
 
 vec2 screenToDoc(vec2 s) {
   vec2 v = (s - pc.centre) / pc.zoom;
@@ -39,6 +41,7 @@ vec4 layerTexel(ivec2 p) {
 #ifdef WITH_STROKE
   if ((pc.flags & FLAG_STROKE) != 0) {
     float a = imageLoad(maskImg, p).r * pc.color.a;
+    if ((pc.flags & FLAG_SEL) != 0) a *= imageLoad(selImg, p).r;
     if ((pc.flags & FLAG_ERASER) != 0) c *= (1.0 - a);
     else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
   }

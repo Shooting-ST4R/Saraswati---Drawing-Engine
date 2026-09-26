@@ -13,7 +13,11 @@
 #include <cstring>
 #include <filesystem>
 
-#include "spv_cache.h"
+#include "spv_cache_r16.h"
+#include "spv_cache_r32f.h"
+#include "spv_gradient_r16.h"
+#include "spv_gradient_r32f.h"
+#include "spv_stamp.h"
 #include "spv_commit_r16.h"
 #include "spv_commit_r32f.h"
 #include "spv_dabs_r16.h"
@@ -47,7 +51,8 @@ struct ViewPC {
   float color[4];
   float paper[4];
   int32_t mode;
-  int32_t pad[3];
+  int32_t antsPhase;
+  int32_t pad[2];
 };
 static_assert(sizeof(ViewPC) == 96);
 struct DabPC {
@@ -59,11 +64,12 @@ struct CommitPC {
   int32_t origin[2], size[2];
   float color[4];
   int32_t eraser;
+  int32_t useSel;
 };
 
 enum : int {
   FLAG_STROKE = 1, FLAG_ERASER = 2, FLAG_LAYER = 4, FLAG_ABOVE_CACHE = 8, FLAG_ABOVE = 16,
-  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128
+  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256
 };
 
 static constexpr VkImageUsageFlags kLayerUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -190,6 +196,8 @@ void Renderer::init(SDL_Window* win, const RendererOptions& opt) {
     dai.pSetLayouts = &set0Layout;
     VK_CHECK(vkAllocateDescriptorSets(device, &dai, &s.set0));
   }
+  VK_CHECK(createBuffer(device, memProps, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, pickBuf, true));
   if (timestampsSupported) {
     VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -291,10 +299,12 @@ void Renderer::createDevice(const RendererOptions& opt) {
 
   VkPhysicalDeviceFeatures feats;
   vkGetPhysicalDeviceFeatures(phys, &feats);
-  VkFormatProperties fp;
+  VkFormatProperties fp, fp8;
   vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_R16_UNORM, &fp);
+  vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_R8_UNORM, &fp8);
   maskR16 = feats.shaderStorageImageExtendedFormats &&
-            (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+            (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+            (fp8.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
 
   uint32_t en = 0;
   vkEnumerateDeviceExtensionProperties(phys, nullptr, &en, nullptr);
@@ -352,15 +362,15 @@ void Renderer::createDevice(const RendererOptions& opt) {
 
 void Renderer::createPipelines() {
   // set 0: mask, dab buffer, below, above, work.  set 1: layer.
-  VkDescriptorSetLayoutBinding b0[5] = {};
-  for (uint32_t i = 0; i < 5; ++i) {
+  VkDescriptorSetLayoutBinding b0[6] = {};
+  for (uint32_t i = 0; i < 6; ++i) {
     b0[i].binding = i;
     b0[i].descriptorType = i == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b0[i].descriptorCount = 1;
     b0[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   }
   VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  lci.bindingCount = 5;
+  lci.bindingCount = 6;
   lci.pBindings = b0;
   VK_CHECK(vkCreateDescriptorSetLayout(device, &lci, nullptr, &set0Layout));
   VkDescriptorSetLayoutBinding b1{};
@@ -372,20 +382,20 @@ void Renderer::createPipelines() {
   lci.pBindings = &b1;
   VK_CHECK(vkCreateDescriptorSetLayout(device, &lci, nullptr, &set1Layout));
 
-  VkDescriptorSetLayout sets[2] = {set0Layout, set1Layout};
+  VkDescriptorSetLayout sets[3] = {set0Layout, set1Layout, set1Layout};
   VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
   VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-  plci.setLayoutCount = 2;
+  plci.setLayoutCount = 3;
   plci.pSetLayouts = sets;
   plci.pushConstantRangeCount = 1;
   plci.pPushConstantRanges = &pcr;
   VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &pipeLayout));
 
-  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1100 + 4 * (kFrames + 2)},
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1110 + 6 * (kFrames + 2)},
                                 {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFrames + 2}};
   VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  dpci.maxSets = 1100 + kFrames + 2;
+  dpci.maxSets = 1110 + kFrames + 2;
   dpci.poolSizeCount = 2;
   dpci.pPoolSizes = ps;
   VK_CHECK(vkCreateDescriptorPool(device, &dpci, nullptr, &descPool));
@@ -407,12 +417,16 @@ void Renderer::createPipelines() {
     dabPipe = compute(spv_dabs_r16, sizeof spv_dabs_r16);
     commitPipe = compute(spv_commit_r16, sizeof spv_commit_r16);
     framePipe = compute(spv_frame_r16, sizeof spv_frame_r16);
+    cachePipe = compute(spv_cache_r16, sizeof spv_cache_r16);
+    gradPipe = compute(spv_gradient_r16, sizeof spv_gradient_r16);
   } else {
     dabPipe = compute(spv_dabs_r32f, sizeof spv_dabs_r32f);
     commitPipe = compute(spv_commit_r32f, sizeof spv_commit_r32f);
     framePipe = compute(spv_frame_r32f, sizeof spv_frame_r32f);
+    cachePipe = compute(spv_cache_r32f, sizeof spv_cache_r32f);
+    gradPipe = compute(spv_gradient_r32f, sizeof spv_gradient_r32f);
   }
-  cachePipe = compute(spv_cache, sizeof spv_cache);
+  stampPipe = compute(spv_stamp, sizeof spv_stamp);
 
   // Render pass: swapchain colour, fully overwritten by the present triangle, then ImGui.
   VkAttachmentDescription att{};
@@ -593,7 +607,7 @@ void Renderer::createScreenImages() {
   destroyImage(device, below);
   destroyImage(device, above);
   destroyImage(device, work);
-  VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   VK_CHECK(createImage(device, memProps, extent.width, extent.height, VK_FORMAT_R8G8B8A8_UNORM, u, below));
   VK_CHECK(createImage(device, memProps, extent.width, extent.height, VK_FORMAT_R8G8B8A8_UNORM, u, above));
   VK_CHECK(createImage(device, memProps, extent.width, extent.height, VK_FORMAT_R8G8B8A8_UNORM, u, work));
@@ -610,13 +624,13 @@ void Renderer::createScreenImages() {
 }
 
 void Renderer::writeSet0(FrameSlot& s) {
-  VkDescriptorImageInfo imgs[4] = {};
+  VkDescriptorImageInfo imgs[5] = {};
   VkDescriptorBufferInfo buf{s.dabBuf.buffer, 0, VK_WHOLE_SIZE};
-  VkWriteDescriptorSet w[5] = {};
+  VkWriteDescriptorSet w[6] = {};
   uint32_t n = 0;
-  const GpuImage* src[5] = {&mask, nullptr, &below, &above, &work};
+  const GpuImage* src[6] = {&mask, nullptr, &below, &above, &work, &sel};
   int ii = 0;
-  for (uint32_t b = 0; b < 5; ++b) {
+  for (uint32_t b = 0; b < 6; ++b) {
     if (b == 1) {
       w[n] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
       w[n].dstSet = s.set0;
@@ -667,7 +681,8 @@ void Renderer::shutdown() {
   }
   if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
   vkDestroyCommandPool(device, oneShotPool, nullptr);
-  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe}) vkDestroyPipeline(device, p, nullptr);
+  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe, gradPipe, stampPipe}) vkDestroyPipeline(device, p, nullptr);
+  destroyBuffer(device, pickBuf);
   vkDestroyRenderPass(device, renderPass, nullptr);
   vkDestroyPipelineLayout(device, pipeLayout, nullptr);
   vkDestroyDescriptorPool(device, descPool, nullptr);
@@ -771,7 +786,11 @@ LayerLimit Renderer::computeLayerLimit(uint32_t w, uint32_t h) {
   L.layerBytes = probe(VK_FORMAT_R8G8B8A8_UNORM, kLayerUsage, bits);
   L.maskBytes = probe(maskR16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT,
                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, mbits);
-  if (!L.layerBytes || !L.maskBytes) { L.reason = "The driver refused an image of this size."; return L; }
+  uint32_t sbits = 0;
+  VkDeviceSize selBytes = probe(maskR16 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, sbits);
+  if (!L.layerBytes || !L.maskBytes || !selBytes) { L.reason = "The driver refused an image of this size."; return L; }
+  L.maskBytes += selBytes;  // stroke mask + selection
   if (maxAllocationSize && (L.layerBytes > maxAllocationSize || L.maskBytes > maxAllocationSize)) {
     L.reason = "One layer would exceed the driver's maximum allocation size.";
     return L;
@@ -785,7 +804,7 @@ LayerLimit Renderer::computeLayerLimit(uint32_t w, uint32_t h) {
     VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &mb};
     vkGetPhysicalDeviceMemoryProperties2(phys, &mp2);
     // what this process could allocate, plus what the current document would give back
-    avail = double(mb.heapBudget[heap]) - double(mb.heapUsage[heap]) + double(layerBytesTotal() + mask.bytes);
+    avail = double(mb.heapBudget[heap]) - double(mb.heapUsage[heap]) + double(layerBytesTotal() + mask.bytes + sel.bytes);
     avail = std::min(avail, double(memProps.memoryHeaps[heap].size));
   }
   double screen = 3.0 * extent.width * extent.height * 4.0;
@@ -811,6 +830,8 @@ void Renderer::destroyDocument() {
   for (auto& l : layers) destroyLayer(l);
   layers.clear();
   destroyImage(device, mask);
+  destroyImage(device, sel);
+  selectionActive = false;
   docW = docH = 0;
   strokeActive = strokeEnding = false;
   pendingDabs.clear();
@@ -879,11 +900,21 @@ bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err)
     docW = docH = 0;
     return false;
   }
+  r = createImage(device, memProps, w, h, maskR16 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R32_SFLOAT,
+                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, sel);
+  if (r != VK_SUCCESS) {
+    err = std::string("Could not create the selection mask (") + vkResultName(r) + ")";
+    destroyImage(device, mask);
+    docW = docH = 0;
+    return false;
+  }
   VkCommandBuffer cmd = beginOneShot();
-  imageBarrier(cmd, mask.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, kAllStages, 0, kAllStages, kAllAccess);
   VkClearColorValue zero{};
   VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vkCmdClearColorImage(cmd, mask.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+  for (GpuImage* img : {&mask, &sel}) {
+    imageBarrier(cmd, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, kAllStages, 0, kAllStages, kAllAccess);
+    vkCmdClearColorImage(cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+  }
   endOneShot(cmd);
   for (auto& s : slots) writeSet0(s);
   tilesX = (w + kTile - 1) / kTile;
@@ -1127,6 +1158,7 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   float p = whitePaper ? 1.0f : 0.0f;
   pc.paper[0] = pc.paper[1] = pc.paper[2] = pc.paper[3] = p;
   pc.mode = int(mode);
+  pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
 }
@@ -1291,27 +1323,31 @@ void Renderer::recordCommit(VkCommandBuffer cmd) {
   pc.color[0] = style.color[0]; pc.color[1] = style.color[1]; pc.color[2] = style.color[2];
   pc.color[3] = style.opacity;
   pc.eraser = style.eraser ? 1 : 0;
+  pc.useSel = selectionActive ? 1 : 0;
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
   vkCmdDispatch(cmd, (pc.size[0] + 15) / 16, (pc.size[1] + 15) / 16, 1);
   memoryBarrier(cmd, kCS, kRW, kCS | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 kRW | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 
-  if (haveUndo) {
-    for (auto& r : redoStack) dropUndo(r);
-    redoStack.clear();
-    undoStack.push_back(std::move(e));
-    size_t total = undoBytes();
-    while (!undoStack.empty() && (undoStack.size() > 50 || total > undoBudgetBytes)) {
-      total -= undoStack.front().bytes;
-      dropUndo(undoStack.front());
-      undoStack.pop_front();
-    }
+  if (haveUndo) pushUndo(std::move(e));
+}
+
+void Renderer::pushUndo(UndoEntry&& e) {
+  for (auto& r : redoStack) dropUndo(r);
+  redoStack.clear();
+  undoStack.push_back(std::move(e));
+  size_t total = undoBytes();
+  while (!undoStack.empty() && (undoStack.size() > 50 || total > undoBudgetBytes)) {
+    total -= undoStack.front().bytes;
+    dropUndo(undoStack.front());
+    undoStack.pop_front();
   }
 }
 
 void Renderer::recordUndoOps(VkCommandBuffer cmd) {
-  for (bool isUndo : undoOps) {
+  for (int op : undoOps) {
+    bool isUndo = op != 0;
     auto& from = isUndo ? undoStack : redoStack;
     auto& to = isUndo ? redoStack : undoStack;
     if (from.empty()) continue;
@@ -1335,7 +1371,8 @@ void Renderer::recordUndoOps(VkCommandBuffer cmd) {
     dropUndo(e);
     e.chunks = std::move(now);
     e.bytes = bytes;
-    to.push_back(std::move(e));
+    if (op == 2) dropUndo(e);
+    else to.push_back(std::move(e));
     cachesDirty = true;
   }
   undoOps.clear();
@@ -1387,6 +1424,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
     if (act->visible) flags |= FLAG_LAYER;
     if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0);
   }
+  if (selectionActive) flags |= FLAG_SEL;
   pushView(cmd, p.view, extent, flags, act ? act->opacity : 1.0f, act ? act->mode : BlendMode::Normal);
   vkCmdDispatch(cmd, gx, gy, 1);
   memoryBarrier(cmd, kCS, kRW, kCS, kRW);
@@ -1463,6 +1501,16 @@ bool Renderer::renderFrame(const FrameParams& p) {
     recordCaches(cmd, p);
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 3);
     recordFrameComposite(cmd, p);
+    if (pickPending && pickX >= 0 && pickY >= 0 && uint32_t(pickX) < extent.width && uint32_t(pickY) < extent.height) {
+      memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      VkBufferImageCopy c{};
+      c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      c.imageOffset = {pickX, pickY, 0};
+      c.imageExtent = {1, 1, 1};
+      vkCmdCopyImageToBuffer(cmd, work.image, VK_IMAGE_LAYOUT_GENERAL, pickBuf.buffer, 1, &c);
+    } else {
+      pickPending = false;
+    }
   } else if (timestampsSupported) {
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 1);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 2);
@@ -1531,6 +1579,13 @@ bool Renderer::renderFrame(const FrameParams& p) {
   if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swapchainDirty = true;
   else VK_CHECK(r);
 
+  if (pickPending) {
+    pickPending = false;
+    VK_CHECK(vkWaitForFences(device, 1, &s.fence, VK_TRUE, UINT64_MAX));
+    const uint8_t* px = (const uint8_t*)pickBuf.mapped;
+    for (int i = 0; i < 4; ++i) pickValue[i] = px[i] / 255.0f;
+    pickReady = true;
+  }
   if (wantShot) {
     VK_CHECK(vkWaitForFences(device, 1, &s.fence, VK_TRUE, UINT64_MAX));
     std::vector<uint8_t> rgb(size_t(extent.width) * extent.height * 3);

@@ -24,6 +24,7 @@ class BrushEngine {
   void begin(const PenSample& s, const BrushSettings& b);
   void add(const PenSample& s);
   bool active() const { return active_; }
+  const PenSample& lastSample() const { return last_; }
   void end() { active_ = false; }
   std::vector<Dab> out;  // dabs produced since last take()
  private:

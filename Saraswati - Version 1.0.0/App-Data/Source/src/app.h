@@ -21,10 +21,15 @@ struct Options {
   std::string screenshot;
   int frames = 5;
   bool demo = false;
+  bool toolTest = false;
   std::string open;             // file to open at startup
   std::vector<std::string> imports;  // import as layers at startup (test helper)
   std::string save;             // save as PSD when the demo / startup is done (test helper)
   int windowW = 1600, windowH = 1000;
+};
+
+enum class ToolId : int {
+  Brush, Eyedropper, Fill, Gradient, Line, Rect, Ellipse, SelRect, SelEllipse, Lasso, Wand, Transform, Hand, Count
 };
 
 class App {
@@ -66,6 +71,7 @@ class App {
   void tickBenchmark();
   void finishBenchmark();
   void buildDemo();
+  void buildToolTest();
   void tickDemo();
   // files
   void openFile(const std::string& path);
@@ -106,6 +112,54 @@ class App {
   double lastLatencyMs = 0, avgLatencyMs = 0;
   double cpuFrameMs = 0;
   uint64_t lastFrameNs = 0;
+
+  // ---- tools (tools.cpp) ----
+  ToolId tool = ToolId::Brush;
+  void setTool(ToolId t);
+  void drawToolbar();
+  void drawToolOptions();
+  void drawToolOverlay();
+  bool toolDown(double dx, double dy, float sx, float sy);
+  void toolMove(double dx, double dy, float sx, float sy);
+  void toolUp(double dx, double dy);
+  void toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt);
+  void docToScreen(double dx, double dy, float& sx, float& sy) const;  // framebuffer px
+  StrokeStyle currentStyle(bool eraser) const;
+  // selection (CPU copy is the source of truth; the GPU copy is for shading/clipping)
+  std::vector<uint8_t> selCpu;
+  int selX0 = 0, selY0 = 0, selX1 = 0, selY1 = 0;
+  bool selActive = false;
+  void resetSelection();
+  void combineSelection(int x, int y, uint32_t w, uint32_t h, const std::vector<uint8_t>& cov, int op);
+  void selectAll();
+  void deselect();
+  void invertSelection();
+  void fillSelection(bool erase);
+  bool floodMask(double dx, double dy, float tol, bool contiguous, std::vector<uint8_t>& mask, int& x0, int& y0, int& x1, int& y1);
+  // transform session
+  struct Xform {
+    bool active = false;
+    Floating fl;
+    int srcX = 0, srcY = 0;
+    double q[4][2] = {}, start[4][2] = {};
+    int drag = 0;  // 0 none, 1 move, 2 scale corner, 3 distort corner, 4 rotate
+    int corner = 0;
+    double gx = 0, gy = 0, a0 = 0;
+  } xf;
+  void startTransform();
+  void applyTransform();
+  void cancelTransform();
+  // tool state
+  bool toolDrag = false;
+  double t0x = 0, t0y = 0, t1x = 0, t1y = 0;
+  std::vector<double> lasso;
+  int selOp = 0;  // 0 replace, 1 add, 2 subtract
+  float fillTol = 0.08f, wandTol = 0.08f;
+  bool fillContiguous = true, wandContiguous = true, fillGrow = true, shapeFilled = false;
+  bool haveLastStroke = false;
+  double lastEndX = 0, lastEndY = 0;
+  bool picking = false;
+  bool altDown = false;
 
   // UI state
   bool showColor = true;

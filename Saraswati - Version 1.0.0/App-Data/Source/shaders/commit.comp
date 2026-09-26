@@ -10,6 +10,7 @@ layout(push_constant) uniform CommitPC {
   ivec2 size;
   vec4 color;   // straight rgb + stroke opacity
   int eraser;
+  int useSel;   // clip to the selection
 } pc;
 
 void main() {
@@ -18,10 +19,11 @@ void main() {
   ivec2 px = pc.origin + local;
   float m = imageLoad(maskImg, px).r;
   if (m <= 0.0) return;
+  imageStore(maskImg, px, vec4(0.0));
   float a = m * pc.color.a;
+  if (pc.useSel != 0) a *= imageLoad(selImg, px).r;
   vec4 c = imageLoad(layerImg, px);
   if (pc.eraser != 0) c *= (1.0 - a);
   else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
   imageStore(layerImg, px, c);
-  imageStore(maskImg, px, vec4(0.0));
 }
