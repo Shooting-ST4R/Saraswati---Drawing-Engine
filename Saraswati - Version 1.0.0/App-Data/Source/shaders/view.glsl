@@ -24,6 +24,7 @@ const int FLAG_ABOVE  = 16;  // cache: blend into the "above" cache
 const int FLAG_INIT   = 32;  // cache: init pass (paper / transparent)
 const int FLAG_WORK   = 64;  // cache: blend into this frame's work image
 const int FLAG_ONLY_BELOW = 128;
+const int FLAG_LOCK   = 512;  // live stroke on an alpha-locked layer
 const int FLAG_SEL    = 256;  // a selection is active: live stroke clipped to it, marching ants drawn  // cache init: leave "above" alone (flatten for saving)
 
 vec2 screenToDoc(vec2 s) {
@@ -42,7 +43,9 @@ vec4 layerTexel(ivec2 p) {
   if ((pc.flags & FLAG_STROKE) != 0) {
     float a = imageLoad(maskImg, p).r * pc.color.a;
     if ((pc.flags & FLAG_SEL) != 0) a *= imageLoad(selImg, p).r;
-    if ((pc.flags & FLAG_ERASER) != 0) c *= (1.0 - a);
+    if ((pc.flags & FLAG_LOCK) != 0) {
+      if ((pc.flags & FLAG_ERASER) == 0 && c.a > 0.0) c = vec4(mix(c.rgb / c.a, pc.color.rgb, a) * c.a, c.a);
+    } else if ((pc.flags & FLAG_ERASER) != 0) c *= (1.0 - a);
     else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
   }
 #endif

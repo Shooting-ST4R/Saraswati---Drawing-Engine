@@ -107,6 +107,7 @@ void App::strokeBegin(const PenSample& s, bool eraser) {
   st.color[2] = color[2];
   st.opacity = b.opacity;
   st.eraser = eraser || eraserToggle;
+  if (!st.eraser) noteColorUsed();
   R.beginStroke(active, st);
   engine.begin(s, b);
 }
@@ -140,6 +141,13 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   lastX = sx;
   lastY = sy;
   if (ImGui::GetIO().WantCaptureMouse) return;
+  if (ctrlDown && altDown && !spaceDown) {  // Ctrl+Alt+drag: brush size
+    sizeDrag = true;
+    sizeDragX = sx;
+    sizeDragY = sy;
+    sizeDragStart = brushes[tipIndex].size;
+    return;
+  }
   if (spaceDown) {
     drag = shiftDown ? Drag::Rotate : Drag::Pan;
     dragX = sx;
@@ -168,6 +176,10 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
   float sx = x * density, sy = y * density;
   lastX = sx;
   lastY = sy;
+  if (sizeDrag) {
+    brushes[tipIndex].size = std::clamp(float(sizeDragStart * std::pow(1.01, (sx - sizeDragX) / density)), 1.0f, 5000.0f);
+    return;
+  }
   if (drag == Drag::Pan) {
     double ddx = sx - dragX, ddy = sy - dragY;
     double c = std::cos(view.rotation), s = std::sin(view.rotation);
@@ -197,6 +209,7 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
 }
 
 void App::pointerUp(bool pen) {
+  if (sizeDrag) { sizeDrag = false; return; }
   if (drag != Drag::None) { drag = Drag::None; return; }
   if (toolDrag) {
     double dx, dy;
@@ -219,14 +232,27 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
     case SDLK_2: if (!ctrl) tipIndex = 1; break;
     case SDLK_3: if (!ctrl) tipIndex = 2; break;
     case SDLK_0: if (ctrl) fitView(); break;
-    case SDLK_E: if (!ctrl) eraserToggle = !eraserToggle; break;
+    case SDLK_E: if (!ctrl) eraserToggle = !eraserToggle; else if (!saving && R.hasDocument()) showDialog(DlgExport); break;
     case SDLK_LEFTBRACKET: brushes[tipIndex].size = std::max(1.0f, brushes[tipIndex].size / 1.15f); break;
     case SDLK_RIGHTBRACKET: brushes[tipIndex].size = std::min(5000.0f, brushes[tipIndex].size * 1.15f); break;
-    case SDLK_Z: if (ctrl) { if (shift) R.redo(); else R.undo(); } break;
-    case SDLK_Y: if (ctrl) R.redo(); break;
+    case SDLK_Z:
+      if (ctrl) {
+        if (xf.active) cancelTransform();  // undo while transforming = cancel the transform
+        else if (shift) R.redo();
+        else R.undo();
+      }
+      break;
+    case SDLK_Y: if (ctrl && !xf.active) R.redo(); break;
+    case SDLK_TAB: hideUI = !hideUI; break;
+    case SDLK_X: if (!ctrl) for (int c = 0; c < 3; ++c) std::swap(color[c], bgColor[c]); break;
+    case SDLK_EQUALS:
+    case SDLK_PLUS:
+    case SDLK_KP_PLUS: zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25); break;
+    case SDLK_MINUS:
+    case SDLK_KP_MINUS: zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8); break;
     case SDLK_R: if (!ctrl) view.rotation = 0; break;
-    case SDLK_N: if (ctrl) showNewDoc = true; break;
-    case SDLK_O: if (ctrl && !saving) showDialog(DlgOpen); break;
+    case SDLK_N: if (ctrl) requestAction(PA_New); break;
+    case SDLK_O: if (ctrl && !saving) requestAction(PA_OpenDialog); break;
     case SDLK_I: if (ctrl && !shift && !saving && R.hasDocument()) showDialog(DlgImport); break;
     case SDLK_S:
       if (ctrl && !saving && R.hasDocument()) {
@@ -243,7 +269,8 @@ void App::handleEvent(const SDL_Event& e) {
   framesToRender = std::max(framesToRender, 2);
   switch (e.type) {
     case SDL_EVENT_QUIT:
-      running = false;
+      if (opt.exitAfter) running = false;
+      else requestAction(PA_Quit);
       break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
     case SDL_EVENT_WINDOW_RESIZED:
@@ -320,7 +347,7 @@ void App::handleEvent(const SDL_Event& e) {
       if (e.drop.data) {
         // dropping onto an existing document imports as a layer; hold Ctrl to open instead
         if (R.hasDocument() && !ctrlDown) importAsLayer(e.drop.data);
-        else openFile(e.drop.data);
+        else requestAction(PA_OpenPath, e.drop.data);
       }
       break;
     case SDL_EVENT_KEY_DOWN:
@@ -353,6 +380,7 @@ bool App::newDocument(uint32_t w, uint32_t h, bool white) {
   resetSelection();
   haveLastStroke = false;
   fitView();
+  savedRevision = R.revision;
   return true;
 }
 
@@ -366,171 +394,346 @@ void App::addLayer() {
 // ---------------------------------------------------------------------------
 // UI
 
+// Full-width slider with its label inside the value text (no clipped labels on the right).
+static bool sliderF(const char* id, float* v, float mn, float mx, const char* fmt, ImGuiSliderFlags f = 0) {
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  return ImGui::SliderFloat(id, v, mn, mx, fmt, f);
+}
+
 void App::drawBrushPanel() {
   if (!ImGui::Begin("Tool Settings", &showBrush)) { ImGui::End(); return; }
   drawToolOptions();
   bool usesBrush = tool == ToolId::Brush || tool == ToolId::Line || ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
   if (!usesBrush) {
     if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
-      ImGui::SliderFloat("Opacity", &brushes[tipIndex].opacity, 0.0f, 1.0f, "%.2f");
+      sliderF("##op", &brushes[tipIndex].opacity, 0.0f, 1.0f, "Opacity  %.2f");
       ImGui::Checkbox("Erase instead of paint (E)", &eraserToggle);
     }
     ImGui::End();
     return;
   }
-  ImGui::SeparatorText("Brush tip");
+  ImGui::SeparatorText("Brush");
+  // brush list (one row per tip, current one highlighted)
   for (int i = 0; i < 3; ++i) {
-    if (i) ImGui::SameLine();
-    if (ImGui::RadioButton(kTipNames[i], tipIndex == i)) tipIndex = i;
+    char label[64];
+    snprintf(label, sizeof label, "%s  (%d)", kTipNames[i], i + 1);
+    if (ImGui::Selectable(label, tipIndex == i)) tipIndex = i;
   }
   ImGui::Checkbox("Eraser (E)", &eraserToggle);
   BrushSettings& b = brushes[tipIndex];
-  ImGui::SliderFloat("Size", &b.size, 1.0f, 5000.0f, "%.1f px", ImGuiSliderFlags_Logarithmic);
-  ImGui::SliderFloat("Opacity", &b.opacity, 0.0f, 1.0f, "%.2f");
-  ImGui::SliderFloat("Flow", &b.flow, 0.01f, 1.0f, "%.2f");
+  sliderF("##size", &b.size, 1.0f, 5000.0f, "Size  %.1f px", ImGuiSliderFlags_Logarithmic);
+  sliderF("##opacity", &b.opacity, 0.0f, 1.0f, "Opacity  %.2f");
+  sliderF("##flow", &b.flow, 0.01f, 1.0f, "Flow  %.2f");
   float sp = b.spacing * 100;
-  if (ImGui::SliderFloat("Spacing", &sp, 1.0f, 100.0f, "%.0f %%")) b.spacing = sp / 100;
-  if (b.tip == Tip::Soft) ImGui::SliderFloat("Hardness", &b.hardness, 0.0f, 1.0f, "%.2f");
+  if (sliderF("##spacing", &sp, 1.0f, 100.0f, "Spacing  %.0f %%")) b.spacing = sp / 100;
+  if (b.tip == Tip::Soft) sliderF("##hard", &b.hardness, 0.0f, 1.0f, "Hardness  %.2f");
   if (b.tip == Tip::Textured) {
-    ImGui::SliderFloat("Texture", &b.texStrength, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("Grain scale", &b.texScale, 1.0f, 64.0f, "%.1f px", ImGuiSliderFlags_Logarithmic);
+    sliderF("##tex", &b.texStrength, 0.0f, 1.0f, "Texture  %.2f");
+    sliderF("##grain", &b.texScale, 1.0f, 64.0f, "Grain scale  %.1f px", ImGuiSliderFlags_Logarithmic);
   }
-  ImGui::SeparatorText("Pressure");
-  ImGui::Checkbox("Pressure -> size", &b.pressureSize);
+  ImGui::SeparatorText("Pen pressure");
+  ImGui::Checkbox("Size", &b.pressureSize);
+  ImGui::SameLine();
+  ImGui::Checkbox("Opacity", &b.pressureOpacity);
   if (b.pressureSize) {
     float m = b.minSize * 100;
-    if (ImGui::SliderFloat("Min size", &m, 0.0f, 100.0f, "%.0f %%")) b.minSize = m / 100;
+    if (sliderF("##min", &m, 0.0f, 100.0f, "Min size  %.0f %%")) b.minSize = m / 100;
   }
-  ImGui::Checkbox("Pressure -> opacity", &b.pressureOpacity);
-  ImGui::SliderFloat("Curve (gamma)", &b.gamma, 0.2f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+  sliderF("##gamma", &b.gamma, 0.2f, 5.0f, "Curve  %.2f  (soft < 1 < firm)", ImGuiSliderFlags_Logarithmic);
+  // curve preview: pen pressure (x) -> effect (y)
+  float w = ImGui::GetContentRegionAvail().x, h = std::min(70.0f, w * 0.35f);
+  ImVec2 p0 = ImGui::GetCursorScreenPos();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), ImGui::GetColorU32(ImGuiCol_FrameBg), 3);
+  ImVec2 pts[33];
+  for (int i = 0; i <= 32; ++i) {
+    float x = i / 32.0f, y = std::pow(x, b.gamma);
+    pts[i] = ImVec2(p0.x + 4 + x * (w - 8), p0.y + h - 4 - y * (h - 8));
+  }
+  dl->AddPolyline(pts, 33, ImGui::GetColorU32(ImGuiCol_Text), 1.5f);
+  float pp = std::pow(std::clamp(penPressure, 0.0f, 1.0f), b.gamma);
+  dl->AddCircleFilled(ImVec2(p0.x + 4 + penPressure * (w - 8), p0.y + h - 4 - pp * (h - 8)), 3.5f, ImGui::GetColorU32(ImGuiCol_SliderGrabActive));
+  ImGui::Dummy(ImVec2(w, h));
+  ImGui::TextDisabled("Dot = current pen pressure");
   ImGui::End();
 }
 
 void App::drawColorPanel() {
   if (!ImGui::Begin("Colour", &showColor)) { ImGui::End(); return; }
-  float w = ImGui::GetContentRegionAvail().x;
-  ImGui::SetNextItemWidth(std::min(w, std::max(120.0f, ImGui::GetContentRegionAvail().y - 60)));
-  ImGui::ColorPicker3("##colour", color,
-                      ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_NoSidePreview);
+  ImVec2 avail = ImGui::GetContentRegionAvail();
+  float side = std::max(90.0f, std::min(avail.x, avail.y - 4 * ImGui::GetFrameHeightWithSpacing() - 30));
+  ImGui::SetNextItemWidth(side);
+  ImGui::ColorPicker3("##wheel", color,
+                      ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoSidePreview |
+                          ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoSmallPreview);
+  // foreground / background swatches (click the back one or press X to swap)
+  float sw = ImGui::GetFrameHeight() * 1.4f;
+  ImVec2 c0 = ImGui::GetCursorScreenPos();
+  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 0.55f, c0.y + sw * 0.45f));
+  if (ImGui::ColorButton("##bg", ImVec4(bgColor[0], bgColor[1], bgColor[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(sw, sw)))
+    for (int k = 0; k < 3; ++k) std::swap(color[k], bgColor[k]);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Background colour - click or X to swap");
+  ImGui::SetCursorScreenPos(c0);
+  ImGui::ColorButton("##fg", ImVec4(color[0], color[1], color[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(sw, sw));
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Current colour");
+  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 1.75f, c0.y));
+  // hex
+  char hex[8];
+  snprintf(hex, sizeof hex, "%02X%02X%02X", int(color[0] * 255 + 0.5f), int(color[1] * 255 + 0.5f), int(color[2] * 255 + 0.5f));
+  ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x));
+  if (ImGui::InputText("##hex", hex, sizeof hex, ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase)) {
+    unsigned v = 0;
+    if (strlen(hex) == 6 && sscanf(hex, "%x", &v) == 1)
+      for (int k = 0; k < 3; ++k) color[k] = ((v >> (16 - 8 * k)) & 255) / 255.0f;
+  }
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hex colour (RRGGBB)");
+  ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + sw * 1.55f));
+  // H in degrees, S and V in percent
+  float h, sat, val;
+  ImGui::ColorConvertRGBtoHSV(color[0], color[1], color[2], h, sat, val);
+  if (sat > 0.0f && val > 0.0f) lastHue = h;
+  float H = lastHue * 360, S = sat * 100, V = val * 100;
+  bool ch = sliderF("##h", &H, 0, 360, "H  %.0f deg");
+  ch |= sliderF("##s", &S, 0, 100, "S  %.0f %%");
+  ch |= sliderF("##v", &V, 0, 100, "V  %.0f %%");
+  if (ch) {
+    lastHue = std::clamp(H / 360.0f, 0.0f, 0.9999f);
+    ImGui::ColorConvertHSVtoRGB(lastHue, S / 100, V / 100, color[0], color[1], color[2]);
+  }
+  // recently used colours
+  if (!recentColors.empty()) {
+    float bs = ImGui::GetFrameHeight() * 0.8f;
+    int perRow = std::max(1, int(ImGui::GetContentRegionAvail().x / (bs + 3)));
+    for (size_t i = 0; i < recentColors.size(); ++i) {
+      if (i % size_t(perRow)) ImGui::SameLine(0, 3);
+      ImGui::PushID(int(i));
+      auto& c = recentColors[i];
+      if (ImGui::ColorButton("##r", ImVec4(c[0], c[1], c[2], 1), 0, ImVec2(bs, bs)))
+        for (int k = 0; k < 3; ++k) color[k] = c[k];
+      ImGui::PopID();
+    }
+  }
   ImGui::End();
 }
 
+void App::noteColorUsed() {
+  std::array<float, 3> c{color[0], color[1], color[2]};
+  auto same = [&](const std::array<float, 3>& o) {
+    return std::abs(o[0] - c[0]) < 0.002f && std::abs(o[1] - c[1]) < 0.002f && std::abs(o[2] - c[2]) < 0.002f;
+  };
+  recentColors.erase(std::remove_if(recentColors.begin(), recentColors.end(), same), recentColors.end());
+  recentColors.insert(recentColors.begin(), c);
+  if (recentColors.size() > 16) recentColors.resize(16);
+}
+
 void App::buildDefaultLayout(unsigned int dockId) {
+  // [tools] [ canvas ............................ ] [ colour / tool settings / layers ]
   ImGui::DockBuilderRemoveNode(dockId);
   ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
   ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->WorkSize);
-  ImGuiID centre = dockId, left, right, tools;
-  tools = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.035f, nullptr, &centre);
-  left = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.19f, nullptr, &centre);
-  right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.23f, nullptr, &centre);
-  ImGuiID leftBottom, rightBottom;
-  leftBottom = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.45f, nullptr, &left);
-  rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
+  ImGuiID centre = dockId;
+  ImGuiID tools = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.032f, nullptr, &centre);
+  ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.21f, nullptr, &centre);
+  ImGuiID rightMid, rightBottom;
+  ImGuiID rightTop = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.34f, nullptr, &rightMid);
+  rightBottom = ImGui::DockBuilderSplitNode(rightMid, ImGuiDir_Down, 0.50f, nullptr, &rightMid);
   ImGui::DockBuilderDockWindow("Tools", tools);
-  ImGui::DockBuilderDockWindow("Tool Settings", left);
-  ImGui::DockBuilderDockWindow("Colour", leftBottom);
-  ImGui::DockBuilderDockWindow("Layers", right);
-  ImGui::DockBuilderDockWindow("Performance", rightBottom);
+  ImGui::DockBuilderDockWindow("Colour", rightTop);
+  ImGui::DockBuilderDockWindow("Tool Settings", rightMid);
+  ImGui::DockBuilderDockWindow("Layers", rightBottom);
+  ImGui::DockBuilderDockWindow("Performance", rightBottom);  // tab next to Layers when opened
   ImGui::DockBuilderFinish(dockId);
+}
+
+static void drawEye(ImDrawList* dl, ImVec2 c, float r, bool open, ImU32 col) {
+  if (open) {
+    dl->AddEllipse(c, ImVec2(r, r * 0.55f), col, 0, 0, 1.5f);
+    dl->AddCircleFilled(c, r * 0.3f, col);
+  } else {
+    dl->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y), col, 1.5f);
+  }
 }
 
 void App::drawLayerPanel() {
   if (!ImGui::Begin("Layers", &showLayers)) { ImGui::End(); return; }
   if (!R.hasDocument()) { ImGui::TextUnformatted("No document"); ImGui::End(); return; }
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
-  ImGui::Text("Layers: %d / %d  (%s each)", int(R.layers.size()), R.limit.maxLayers, fmtBytes(double(R.limit.layerBytes)).c_str());
-  bool busy = R.stroking();
-  ImGui::BeginDisabled(busy);
-  if (ImGui::Button("New")) addLayer();
-  ImGui::SameLine();
-  if (ImGui::Button("Duplicate")) {
-    std::string err;
-    int i = R.duplicateLayer(active, err);
-    if (i < 0) error(err); else active = i;
-  }
-  ImGui::SameLine();
-  ImGui::BeginDisabled(R.layers.size() <= 1);
-  if (ImGui::Button("Delete")) { R.deleteLayer(active); active = std::min(active, int(R.layers.size()) - 1); }
-  ImGui::EndDisabled();
-  ImGui::SameLine();
-  if (ImGui::ArrowButton("##up", ImGuiDir_Up) && active + 1 < int(R.layers.size())) { R.moveLayer(active, 1); ++active; }
-  ImGui::SameLine();
-  if (ImGui::ArrowButton("##down", ImGuiDir_Down) && active > 0) { R.moveLayer(active, -1); --active; }
-
+  R.updateThumbnails(2);
+  bool locked = R.stroking() || xf.active;
+  ImGui::BeginDisabled(locked);
   Layer& L = R.layers[active];
-  if (renameFor != int(L.id)) {
-    snprintf(renameBuf, sizeof renameBuf, "%s", L.name.c_str());
-    renameFor = int(L.id);
-  }
-  if (ImGui::InputText("Name", renameBuf, sizeof renameBuf)) L.name = renameBuf;
-  int mode = int(L.mode);
-  if (ImGui::BeginCombo("Blend", blendModeName(L.mode), ImGuiComboFlags_HeightLarge)) {
+  // blend mode + opacity + alpha lock of the active layer
+  float wAvail = ImGui::GetContentRegionAvail().x;
+  ImGui::SetNextItemWidth(wAvail * 0.5f);
+  if (ImGui::BeginCombo("##blend", blendModeName(L.mode), ImGuiComboFlags_HeightLarge)) {
     for (int m = 0; m < int(BlendMode::Count); ++m) {
-      if (ImGui::Selectable(blendModeName(BlendMode(m)), m == mode)) { L.mode = BlendMode(m); R.markCachesDirty(); }
+      if (ImGui::Selectable(blendModeName(BlendMode(m)), m == int(L.mode)) && m != int(L.mode)) {
+        R.recordLayerProps(active);
+        L.mode = BlendMode(m);
+        R.markCachesDirty();
+      }
       if (m == 0 || m == 5 || m == 11 || m == 20 || m == 23) ImGui::Separator();
     }
     ImGui::EndCombo();
   }
+  ImGui::SameLine();
+  float before = L.opacity;
   float op = L.opacity * 100;
-  if (ImGui::SliderFloat("Opacity##layer", &op, 0.0f, 100.0f, "%.0f %%")) { L.opacity = op / 100; R.markCachesDirty(); }
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  bool changed = ImGui::SliderFloat("##lop", &op, 0.0f, 100.0f, "%.0f %%");
+  if (ImGui::IsItemActivated()) { L.opacity = before; R.recordLayerProps(active); }
+  if (changed) { L.opacity = op / 100; R.markCachesDirty(); }
+  bool lock = L.lockAlpha;
+  if (ImGui::Checkbox("Lock transparency", &lock)) { R.recordLayerProps(active); L.lockAlpha = lock; }
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Paint only where the layer already has pixels");
+  // layer buttons
+  float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5;
+  if (ImGui::Button("New", ImVec2(bw, 0))) addLayer();
+  ImGui::SameLine();
+  if (ImGui::Button("Copy", ImVec2(bw, 0))) {
+    std::string err;
+    int i = R.duplicateLayer(active, err);
+    if (i < 0) error(err); else active = i;
+  }
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate layer");
+  ImGui::SameLine();
+  ImGui::BeginDisabled(R.layers.size() <= 1);
+  if (ImGui::Button("Delete", ImVec2(bw, 0))) { R.deleteLayer(active); active = std::min(active, int(R.layers.size()) - 1); }
   ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Delete layer (undoable)");
+  ImGui::SameLine();
+  if (ImGui::ArrowButton("##up", ImGuiDir_Up) && active + 1 < int(R.layers.size())) { R.moveLayer(active, 1); ++active; }
+  ImGui::SameLine();
+  if (ImGui::ArrowButton("##down", ImGuiDir_Down) && active > 0) { R.moveLayer(active, -1); --active; }
   ImGui::Separator();
+  // layer list, top layer first: eye | thumbnail | name + mode/opacity
   ImGui::BeginChild("list");
+  float rowH = std::max(40.0f, ImGui::GetTextLineHeight() * 2.6f);
+  float thumb = rowH - 6;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
   for (int i = int(R.layers.size()) - 1; i >= 0; --i) {
     Layer& l = R.layers[i];
     ImGui::PushID(int(l.id));
-    if (ImGui::Checkbox("##vis", &l.visible)) R.markCachesDirty();
-    ImGui::SameLine();
-    char label[200];
-    snprintf(label, sizeof label, "%s  (%s, %.0f%%)", l.name.c_str(), blendModeName(l.mode), l.opacity * 100);
-    if (ImGui::Selectable(label, i == active) && !busy) active = i;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    if (ImGui::Selectable("##row", i == active, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick,
+                          ImVec2(w, rowH))) {
+      active = i;
+      if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        renameIndex = i;
+        snprintf(renameText, sizeof renameText, "%s", l.name.c_str());
+        ImGui::OpenPopup("Rename layer");
+      }
+    }
+    if (ImGui::BeginDragDropSource()) {
+      ImGui::SetDragDropPayload("SARASWATI_LAYER", &i, sizeof i);
+      ImGui::Text("Move %s", l.name.c_str());
+      ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+      if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("SARASWATI_LAYER")) {
+        int from = *static_cast<const int*>(pl->Data);
+        R.moveLayerTo(from, i);
+        active = i;
+      }
+      ImGui::EndDragDropTarget();
+    }
+    // eye (visibility)
+    ImGui::SetCursorScreenPos(ImVec2(p.x + 2, p.y + (rowH - 22) / 2));
+    if (ImGui::InvisibleButton("##eye", ImVec2(22, 22))) { R.recordLayerProps(i); l.visible = !l.visible; R.markCachesDirty(); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(l.visible ? "Hide layer" : "Show layer");
+    drawEye(dl, ImVec2(p.x + 13, p.y + rowH / 2), 8, l.visible, ImGui::GetColorU32(l.visible ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+    // thumbnail on a checkerboard
+    float tw = thumb, th = thumb;
+    if (l.thumb.width && l.thumb.height) {
+      float a = float(l.thumb.width) / float(l.thumb.height);
+      if (a >= 1) th = thumb / a; else tw = thumb * a;
+    }
+    ImVec2 t0(p.x + 30 + (thumb - tw) / 2, p.y + 3 + (thumb - th) / 2), t1(t0.x + tw, t0.y + th);
+    dl->AddRectFilled(t0, t1, IM_COL32(205, 205, 205, 255));
+    for (float yy = 0; yy < th; yy += 6)
+      for (float xx = (int(yy / 6) % 2) * 6.0f; xx < tw; xx += 12)
+        dl->AddRectFilled(ImVec2(t0.x + xx, t0.y + yy), ImVec2(std::min(t0.x + xx + 6, t1.x), std::min(t0.y + yy + 6, t1.y)), IM_COL32(245, 245, 245, 255));
+    if (l.thumbTex) dl->AddImage(ImTextureRef(ImTextureID(uint64_t(l.thumbTex))), t0, t1);
+    dl->AddRect(t0, t1, ImGui::GetColorU32(ImGuiCol_Border));
+    // name + details
+    float tx = p.x + 38 + thumb;
+    dl->AddText(ImVec2(tx, p.y + rowH / 2 - ImGui::GetTextLineHeight() - 1), ImGui::GetColorU32(ImGuiCol_Text), l.name.c_str());
+    char info[96];
+    snprintf(info, sizeof info, "%s  %.0f%%%s", blendModeName(l.mode), l.opacity * 100, l.lockAlpha ? "  locked" : "");
+    dl->AddText(ImVec2(tx, p.y + rowH / 2 + 1), ImGui::GetColorU32(ImGuiCol_TextDisabled), info);
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 2));
+    ImGui::Dummy(ImVec2(0, 0));
     ImGui::PopID();
   }
+  if (renameIndex >= 0) ImGui::OpenPopup("Rename layer");
+  if (ImGui::BeginPopup("Rename layer")) {
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    bool done = ImGui::InputText("##name", renameText, sizeof renameText, ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::SameLine();
+    done |= ImGui::Button("OK");
+    if (done && renameIndex >= 0 && renameIndex < int(R.layers.size())) {
+      R.recordLayerProps(renameIndex);
+      R.layers[renameIndex].name = renameText;
+      renameIndex = -1;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+  } else {
+    renameIndex = -1;
+  }
   ImGui::EndChild();
+  ImGui::EndDisabled();
   ImGui::End();
 }
 
 void App::drawPerfPanel() {
   if (!ImGui::Begin("Performance", &showPerf)) { ImGui::End(); return; }
-  ImGui::Text("%s", R.deviceName.c_str());
-  ImGui::TextWrapped("%s", R.driverInfo.c_str());
-  if (R.cpuEmulation) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "CPU emulation (numbers are not representative)");
+  ImGui::TextWrapped("%s", R.deviceName.c_str());
+  ImGui::TextDisabled("%s", R.driverInfo.c_str());
+  if (R.cpuEmulation) ImGui::TextWrapped("CPU emulation - timings are not representative.");
   ImGui::Separator();
   ImGui::Text("FPS %.1f   CPU frame %.2f ms", ImGui::GetIO().Framerate, cpuFrameMs);
   const GpuTimings& t = R.lastTimings;
-  if (R.timestampsSupported)
-    ImGui::Text("GPU ms: dabs %.2f  commit %.2f\n        caches %.2f  composite %.2f\n        total %.2f",
-                t.dabs, t.commit, t.caches, t.composite, t.total);
-  else
+  if (R.timestampsSupported) {
+    ImGui::Text("GPU  total %.2f ms", t.total);
+    ImGui::TextDisabled("dabs %.2f  commit %.2f  caches %.2f  composite %.2f", t.dabs, t.commit, t.caches, t.composite);
+  } else {
     ImGui::TextUnformatted("GPU timestamps not supported");
-  ImGui::Text("Input -> present: last %.2f ms, avg %.2f ms", lastLatencyMs, avgLatencyMs);
-  ImGui::Text("Dabs this frame: %u   total %llu", R.lastFrameDabs, (unsigned long long)R.totalDabs);
-  ImGui::Text("Layers VRAM: %s / budget %s", fmtBytes(double(R.layerBytesTotal())).c_str(),
-              fmtBytes(double(R.memoryBudgetBytes)).c_str());
-  ImGui::Text("Undo RAM: %s / %s (%zu steps)", fmtBytes(double(R.undoBytes())).c_str(),
-              fmtBytes(double(R.undoBudgetBytes)).c_str(), R.undoSteps());
-  ImGui::Text("Stroke mask: %s", R.maskR16 ? "R16_UNORM" : "R32_SFLOAT");
-  const char* names[] = {"IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"};
+  }
+  ImGui::Text("Input -> present  %.2f ms (avg %.2f)", lastLatencyMs, avgLatencyMs);
+  ImGui::Text("Dabs this frame %u", R.lastFrameDabs);
+  ImGui::Text("Layers VRAM %s / %s%s", fmtBytes(double(R.layerBytesTotal())).c_str(), fmtBytes(double(R.memoryBudgetBytes)).c_str(),
+              R.cpuEmulation ? " (est.)" : "");
+  ImGui::Text("Undo RAM %s / %s, %zu steps", fmtBytes(double(R.undoBytes())).c_str(), fmtBytes(double(R.undoBudgetBytes)).c_str(),
+              R.undoSteps());
+  const char* names[] = {"Immediate (lowest latency, tearing)", "Mailbox (low latency)", "FIFO (vsync)", "FIFO relaxed"};
   const char* cur = int(R.presentMode) < 4 ? names[R.presentMode] : "?";
-  if (ImGui::BeginCombo("Present mode", cur)) {
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  if (ImGui::BeginCombo("##present", cur)) {
     for (VkPresentModeKHR m : R.presentModes)
       if (int(m) < 3 && ImGui::Selectable(names[m], m == R.presentMode)) R.setPresentMode(m);
     ImGui::EndCombo();
   }
   ImGui::SeparatorText("Benchmark");
-  ImGui::InputInt("Doc width", &benchUiW, 1000);
-  ImGui::InputInt("Doc height", &benchUiH, 1000);
-  ImGui::InputInt("Brush px", &benchUiBrush, 100);
-  ImGui::Combo("Tip", &benchUiTip, kTipNames, 3);
-  ImGui::InputInt("Layers", &benchUiLayers);
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  int wh[2] = {benchUiW, benchUiH};
+  if (ImGui::InputInt2("##bdoc", wh)) { benchUiW = std::clamp(wh[0], 16, 300000); benchUiH = std::clamp(wh[1], 16, 300000); }
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Document width x height (px)");
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+  ImGui::SliderInt("##bbrush", &benchUiBrush, 1, 5000, "Brush %d px", ImGuiSliderFlags_Logarithmic);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::Combo("##btip", &benchUiTip, kTipNames, 3);
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+  ImGui::SliderInt("##blayers", &benchUiLayers, 1, 16, "%d layers");
+  ImGui::SameLine();
   ImGui::BeginDisabled(bench.running || R.stroking());
-  if (ImGui::Button("Run benchmark"))
-    startBenchmark(uint32_t(std::max(1, benchUiW)), uint32_t(std::max(1, benchUiH)), float(std::clamp(benchUiBrush, 1, 5000)),
-                   Tip(benchUiTip), std::max(1, benchUiLayers));
+  if (ImGui::Button("Run benchmark", ImVec2(-FLT_MIN, 0)))
+    startBenchmark(uint32_t(benchUiW), uint32_t(benchUiH), float(benchUiBrush), Tip(benchUiTip), benchUiLayers);
   ImGui::EndDisabled();
   if (!bench.report.empty()) {
-    ImGui::SameLine();
-    if (ImGui::Button("Copy report")) ImGui::SetClipboardText(bench.report.c_str());
+    if (ImGui::SmallButton("Copy report")) ImGui::SetClipboardText(bench.report.c_str());
     ImGui::TextWrapped("%s", bench.report.c_str());
   }
   ImGui::End();
@@ -539,8 +742,17 @@ void App::drawPerfPanel() {
 void App::drawNewDocDialog() {
   if (showNewDoc) { ImGui::OpenPopup("New Document"); showNewDoc = false; }
   if (!ImGui::BeginPopupModal("New Document", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
-  ImGui::InputInt("Width (px)", &newW, 100);
-  ImGui::InputInt("Height (px)", &newH, 100);
+  struct Preset { const char* name; int w, h; };
+  static const Preset presets[] = {{"A4 300 dpi", 2480, 3508}, {"A3 300 dpi", 3508, 4961}, {"Full HD", 1920, 1080},
+                                   {"4K UHD", 3840, 2160}, {"Square 4000", 4000, 4000}, {"Huge 30000", 30000, 30000}};
+  for (int i = 0; i < 6; ++i) {
+    if (i % 3) ImGui::SameLine();
+    if (ImGui::Button(presets[i].name, ImVec2(120, 0))) { newW = presets[i].w; newH = presets[i].h; }
+  }
+  ImGui::SetNextItemWidth(250);
+  int wh[2] = {newW, newH};
+  if (ImGui::InputInt2("Width x height (px)", wh)) { newW = wh[0]; newH = wh[1]; }
+  if (ImGui::Button("Swap")) std::swap(newW, newH);
   newW = std::clamp(newW, 1, 300000);
   newH = std::clamp(newH, 1, 300000);
   ImGui::Checkbox("White paper (off = transparent)", &newWhite);
@@ -550,36 +762,121 @@ void App::drawNewDocDialog() {
     newLimitH = newH;
   }
   if (newLimit.ok)
-    ImGui::Text("Max layers: %d  (%s per layer, %s usable GPU memory)", newLimit.maxLayers,
-                fmtBytes(double(newLimit.layerBytes)).c_str(), fmtBytes(double(newLimit.usableBytes)).c_str());
+    ImGui::Text("Up to %d layers%s  (%s per layer)", newLimit.maxLayers, R.cpuEmulation ? " (estimate, CPU emulation)" : "",
+                fmtBytes(double(newLimit.layerBytes)).c_str());
   else
-    ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", newLimit.reason.c_str());
+    ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "%s", newLimit.reason.c_str());
   ImGui::BeginDisabled(!newLimit.ok);
-  if (ImGui::Button("Create", ImVec2(120, 0))) {
+  if (ImGui::Button("Create", ImVec2(120, 0)) || (newLimit.ok && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
     newDocument(uint32_t(newW), uint32_t(newH), newWhite);
     ImGui::CloseCurrentPopup();
   }
   ImGui::EndDisabled();
   ImGui::SameLine();
-  if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+  if (ImGui::Button("Cancel", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
   ImGui::EndPopup();
 }
 
+// ---- unsaved changes ----
+
+void App::requestAction(int a, const std::string& path) {
+  pendingAction = a;
+  pendingPath = path;
+  if (modified()) askUnsaved = true;
+  else performAction();
+}
+
+void App::performAction() {
+  int a = pendingAction;
+  pendingAction = PA_None;
+  continueAfterSave = false;
+  switch (a) {
+    case PA_Quit: running = false; break;
+    case PA_New: showNewDoc = true; break;
+    case PA_OpenDialog: showDialog(DlgOpen); break;
+    case PA_OpenPath: openFile(pendingPath); break;
+    default: break;
+  }
+}
+
+void App::drawUnsavedDialog() {
+  if (askUnsaved) { ImGui::OpenPopup("Unsaved changes"); askUnsaved = false; }
+  if (!ImGui::BeginPopupModal("Unsaved changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+  std::string name = documentPath.empty() ? std::string("Untitled")
+                                          : fs::path(reinterpret_cast<const char8_t*>(documentPath.c_str())).filename().string();
+  ImGui::Text("Save changes to \"%s\" first?", name.c_str());
+  ImGui::Spacing();
+  if (ImGui::Button("Save", ImVec2(110, 0)) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+    continueAfterSave = true;
+    if (documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
+    ImGui::CloseCurrentPopup();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Don't save", ImVec2(110, 0))) { performAction(); ImGui::CloseCurrentPopup(); }
+  ImGui::SameLine();
+  if (ImGui::Button("Cancel", ImVec2(110, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    pendingAction = PA_None;
+    ImGui::CloseCurrentPopup();
+  }
+  ImGui::EndPopup();
+}
+
+void App::updateTitle() {
+  std::string name = documentPath.empty() ? std::string("Untitled")
+                                          : fs::path(reinterpret_cast<const char8_t*>(documentPath.c_str())).filename().string();
+  std::string t = name + (modified() ? " *" : "") + "  -  Saraswati " SARASWATI_VERSION;
+  if (t != lastTitle) { SDL_SetWindowTitle(window, t.c_str()); lastTitle = t; }
+}
+
+void App::drawStatusBar() {
+  static const char* kToolNames[] = {"Brush", "Eyedropper", "Fill", "Gradient", "Line", "Rectangle", "Ellipse",
+                                     "Rectangle select", "Ellipse select", "Lasso", "Magic wand", "Transform", "Hand"};
+  ImGuiWindowFlags f = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
+  if (ImGui::BeginViewportSideBar("##status", ImGui::GetMainViewport(), ImGuiDir_Down, ImGui::GetFrameHeight(), f)) {
+    if (ImGui::BeginMenuBar()) {
+      const char* toolName = kToolNames[std::clamp(int(tool), 0, 12)];
+      if (tool == ToolId::Brush) ImGui::Text("%s%s", kTipNames[tipIndex], eraserToggle ? " (eraser)" : "");
+      else ImGui::TextUnformatted(toolName);
+      ImGui::Separator();
+      double dx, dy;
+      screenToDoc(lastX, lastY, dx, dy);
+      if (dx >= 0 && dy >= 0 && dx < R.docW && dy < R.docH) ImGui::Text("%5d, %5d px", int(dx), int(dy));
+      else ImGui::TextDisabled("    -,     - px");
+      ImGui::Separator();
+      ImGui::Text("%.1f %%", view.zoom * 100);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Wheel / + - zoom, Ctrl+0 fit, Ctrl+1 100 %%");
+      ImGui::Text("%.0f deg", std::fmod(view.rotation * 180 / kPi + 36000, 360.0));
+      ImGui::Separator();
+      ImGui::Text("%u x %u", R.docW, R.docH);
+      if (selActive) { ImGui::Separator(); ImGui::Text("Selection %d x %d", selX1 - selX0, selY1 - selY0); }
+      if (xf.active) { ImGui::Separator(); ImGui::TextUnformatted("Transforming - Enter applies, Esc cancels"); }
+      ImGui::Separator();
+      if (saving) ImGui::TextUnformatted("Saving...");
+      else if (SDL_GetTicksNS() < toastUntil) ImGui::TextUnformatted(toast.c_str());
+      else if (R.cpuEmulation) ImGui::TextDisabled("CPU emulation");
+      ImGui::EndMenuBar();
+    }
+  }
+  ImGui::End();
+}
+
 void App::drawUI() {
+  updateTitle();
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
-      if (ImGui::MenuItem("New...", "Ctrl+N")) showNewDoc = true;
+      if (ImGui::MenuItem("New...", "Ctrl+N")) requestAction(PA_New);
       drawFileDialogs();
       ImGui::Separator();
-      if (ImGui::MenuItem("Quit")) running = false;
+      if (ImGui::MenuItem("Quit")) requestAction(PA_Quit);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Edit")) {
-      if (ImGui::MenuItem("Undo", "Ctrl+Z", false, R.canUndo() && !R.stroking())) R.undo();
-      if (ImGui::MenuItem("Redo", "Ctrl+Y", false, R.canRedo() && !R.stroking())) R.redo();
+      bool canEdit = !R.stroking() && !xf.active;
+      if (ImGui::MenuItem("Undo", "Ctrl+Z", false, R.canUndo() && canEdit)) R.undo();
+      if (ImGui::MenuItem("Redo", "Ctrl+Y", false, R.canRedo() && canEdit)) R.redo();
       ImGui::Separator();
-      if (ImGui::MenuItem("Fill", "Alt+Backspace", false, !R.busy())) fillSelection(false);
-      if (ImGui::MenuItem("Clear", "Delete", false, !R.busy())) fillSelection(true);
+      if (ImGui::MenuItem("Fill", "Alt+Backspace", false, !R.busy() && !xf.active)) fillSelection(false);
+      if (ImGui::MenuItem("Clear", "Delete", false, !R.busy() && !xf.active)) fillSelection(true);
       if (ImGui::MenuItem("Transform", "Ctrl+T", false, !R.busy())) setTool(ToolId::Transform);
       ImGui::Separator();
       if (ImGui::MenuItem("Select all", "Ctrl+A")) selectAll();
@@ -590,24 +887,25 @@ void App::drawUI() {
     if (ImGui::BeginMenu("View")) {
       if (ImGui::MenuItem("Fit to window", "Ctrl+0")) fitView();
       if (ImGui::MenuItem("100 %", "Ctrl+1")) view.zoom = 1;
+      if (ImGui::MenuItem("Zoom in", "+")) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 1.25);
+      if (ImGui::MenuItem("Zoom out", "-")) zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8);
       if (ImGui::MenuItem("Reset rotation", "R")) view.rotation = 0;
+      ImGui::Separator();
+      ImGui::MenuItem("Hide panels", "Tab", &hideUI);
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
-      ImGui::MenuItem("Tool Settings", nullptr, &showBrush);
       ImGui::MenuItem("Colour", nullptr, &showColor);
+      ImGui::MenuItem("Tool Settings", nullptr, &showBrush);
       ImGui::MenuItem("Layers", nullptr, &showLayers);
       ImGui::MenuItem("Performance", nullptr, &showPerf);
       ImGui::Separator();
-      if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = showPerf = true; }
+      if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = true; hideUI = false; }
       ImGui::EndMenu();
     }
-    ImGui::Separator();
-    if (saving) { ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Saving..."); ImGui::Separator(); }
-    ImGui::Text("%u x %u   zoom %.1f %%   rot %.0f deg   %s%s", R.docW, R.docH, view.zoom * 100,
-                std::fmod(view.rotation * 180 / kPi + 360 * 100, 360.0), kTipNames[tipIndex], eraserToggle ? " (eraser)" : "");
     ImGui::EndMainMenuBar();
   }
+  drawStatusBar();
   // Dockspace: panels snap to the edges, resize, and combine into tab stacks; the central
   // node is see-through and is the canvas.
   ImGuiID dockId = ImGui::GetID("MainDock");
@@ -617,19 +915,24 @@ void App::drawUI() {
     float s = ImGui::GetIO().DisplayFramebufferScale.x;
     canvasX = c->Pos.x * s; canvasY = c->Pos.y * s; canvasW = c->Size.x * s; canvasH = c->Size.y * s;
   }
-  drawToolbar();
-  if (showBrush) drawBrushPanel();
-  if (showColor) drawColorPanel();
-  if (showLayers) drawLayerPanel();
-  if (showPerf) drawPerfPanel();
+  if (!hideUI) {
+    drawToolbar();
+    if (showColor) drawColorPanel();
+    if (showBrush) drawBrushPanel();
+    if (showLayers) drawLayerPanel();
+    if (showPerf) drawPerfPanel();
+  } else {
+    R.updateThumbnails(1);
+  }
   drawNewDocDialog();
+  drawUnsavedDialog();
   if (!R.lastError.empty()) { error(R.lastError); R.lastError.clear(); }
   if (errorOpen) { ImGui::OpenPopup("Message"); errorOpen = false; }
   if (ImGui::BeginPopupModal("Message", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::PushTextWrapPos(500);
     ImGui::TextUnformatted(errorMsg.c_str());
     ImGui::PopTextWrapPos();
-    if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button("OK", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Enter)) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
   }
   drawToolOverlay();
@@ -638,16 +941,21 @@ void App::drawUI() {
     if (R.takePick(rgba) && rgba[3] > 0.01f)
       for (int k = 0; k < 3; ++k) color[k] = std::clamp(rgba[k] / rgba[3], 0.0f, 1.0f);
   }
-  // brush outline at the cursor
-  bool brushCursor = (tool == ToolId::Brush && !altDown) || tool == ToolId::Line ||
+  // brush outline at the cursor (or at the resize anchor while Ctrl+Alt+dragging the size)
+  bool brushCursor = (tool == ToolId::Brush && !altDown) || tool == ToolId::Line || sizeDrag ||
                      ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
-  if (brushCursor && !ImGui::GetIO().WantCaptureMouse && R.hasDocument() && drag == Drag::None) {
+  if (brushCursor && (sizeDrag || !ImGui::GetIO().WantCaptureMouse) && R.hasDocument() && drag == Drag::None) {
     float s = ImGui::GetIO().DisplayFramebufferScale.x;
     float r = float(brushes[tipIndex].size * 0.5 * view.zoom) / s;
-    ImVec2 c(lastX / s, lastY / s);
+    ImVec2 c = sizeDrag ? ImVec2(sizeDragX / s, sizeDragY / s) : ImVec2(lastX / s, lastY / s);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     dl->AddCircle(c, std::max(r, 1.5f) + 1, IM_COL32(255, 255, 255, 160), 0, 1.0f);
     dl->AddCircle(c, std::max(r, 1.5f), IM_COL32(0, 0, 0, 200), 0, 1.0f);
+    if (sizeDrag) {
+      char t[32];
+      snprintf(t, sizeof t, "%.1f px", brushes[tipIndex].size);
+      dl->AddText(ImVec2(c.x + 6, c.y + 6), IM_COL32(255, 255, 255, 255), t);
+    }
   }
 }
 
@@ -658,7 +966,7 @@ void App::startBenchmark(uint32_t w, uint32_t h, float brush, Tip tip, int layer
   if (!newDocument(w, h, true)) return;
   for (int i = 1; i < layers; ++i) {
     std::string err;
-    int li = R.addLayer(int(R.layers.size()), err);
+    int li = R.addLayer(int(R.layers.size()), err, false);
     if (li < 0) { error("Benchmark: " + err); break; }
   }
   active = int(R.layers.size()) / 2;  // layers above and below the active one exercise both caches
@@ -854,6 +1162,55 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
+  if (xf.active) R.destroyFloating(xf.fl);
+  saveSettings();
+}
+
+// Settings: brushes, colours, current tool and last folder, as "key value" lines.
+void App::loadSettings() {
+  if (settingsPath.empty()) return;
+  FILE* f = fopen(settingsPath.c_str(), "r");
+  if (!f) return;
+  char line[1024];
+  while (fgets(line, sizeof line, f)) {
+    char key[64] = {};
+    int n = 0;
+    if (sscanf(line, "%63s %n", key, &n) != 1) continue;
+    const char* v = line + n;
+    std::string k = key;
+    if (k == "tool") { int t = atoi(v); if (t >= 0 && t < int(ToolId::Count) && ToolId(t) != ToolId::Transform) tool = ToolId(t); }
+    else if (k == "tip") tipIndex = std::clamp(atoi(v), 0, 2);
+    else if (k == "color") sscanf(v, "%f %f %f", &color[0], &color[1], &color[2]);
+    else if (k == "bg") sscanf(v, "%f %f %f", &bgColor[0], &bgColor[1], &bgColor[2]);
+    else if (k == "folder") { lastFolder = v; while (!lastFolder.empty() && (lastFolder.back() == '\n' || lastFolder.back() == '\r')) lastFolder.pop_back(); }
+    else if (k == "fill") sscanf(v, "%f %f", &fillTol, &wandTol);
+    else if (k == "perf") showPerf = atoi(v) != 0;
+    else if (k.rfind("brush", 0) == 0 && k.size() == 6) {
+      int i = std::clamp(k[5] - '0', 0, 2);
+      BrushSettings& b = brushes[i];
+      int ps = 1, po = 0;
+      sscanf(v, "%f %f %f %f %f %f %f %d %f %d %f", &b.size, &b.opacity, &b.flow, &b.spacing, &b.hardness, &b.texStrength,
+             &b.texScale, &ps, &b.minSize, &po, &b.gamma);
+      b.pressureSize = ps != 0;
+      b.pressureOpacity = po != 0;
+    }
+  }
+  fclose(f);
+}
+
+void App::saveSettings() {
+  if (settingsPath.empty()) return;
+  FILE* f = fopen(settingsPath.c_str(), "w");
+  if (!f) return;
+  fprintf(f, "tool %d\ntip %d\ncolor %f %f %f\nbg %f %f %f\nfill %f %f\nperf %d\n", int(tool == ToolId::Transform ? ToolId::Brush : tool),
+          tipIndex, color[0], color[1], color[2], bgColor[0], bgColor[1], bgColor[2], fillTol, wandTol, showPerf ? 1 : 0);
+  for (int i = 0; i < 3; ++i) {
+    const BrushSettings& b = brushes[i];
+    fprintf(f, "brush%d %f %f %f %f %f %f %f %d %f %d %f\n", i, b.size, b.opacity, b.flow, b.spacing, b.hardness, b.texStrength,
+            b.texScale, b.pressureSize ? 1 : 0, b.minSize, b.pressureOpacity ? 1 : 0, b.gamma);
+  }
+  if (!lastFolder.empty()) fprintf(f, "folder %s\n", lastFolder.c_str());
+  fclose(f);
 }
 
 void App::showDialog(int kind) {
@@ -861,6 +1218,10 @@ void App::showDialog(int kind) {
   auto* ctx = new Ctx{this, kind};
   auto cb = [](void* ud, const char* const* list, int) {
     Ctx* c = static_cast<Ctx*>(ud);
+    if (list && !list[0] && c->kind == DlgSave) {  // save dialog cancelled: drop a pending quit/new/open
+      std::lock_guard<std::mutex> lock(c->app->dialogMutex);
+      c->app->dialogResults.push_back({0, ""});
+    }
     if (list && list[0]) {
       std::lock_guard<std::mutex> lock(c->app->dialogMutex);
       c->app->dialogResults.push_back({c->kind, list[0]});
@@ -870,11 +1231,15 @@ void App::showDialog(int kind) {
     }
     delete c;
   };
+  std::string folder = lastFolder.empty() ? (fs::path(userData) / "documents").string() : lastFolder;
   if (kind == DlgSave) {
-    std::string def = documentPath.empty() ? (fs::path(userData) / "documents" / "Untitled.psd").string() : documentPath;
+    std::string def = documentPath.empty() ? (fs::path(folder) / "Untitled.psd").string() : documentPath;
     SDL_ShowSaveFileDialog(cb, ctx, window, kSaveFilters, 1, def.c_str());
+  } else if (kind == DlgExport) {
+    static const SDL_DialogFileFilter f[] = {{"PNG image", "png"}, {"JPEG image", "jpg;jpeg"}};
+    SDL_ShowSaveFileDialog(cb, ctx, window, f, 2, (fs::path(folder) / "Untitled.png").string().c_str());
   } else if (kind == DlgOpen) {
-    std::string def = (fs::path(userData) / "documents").string();
+    std::string def = folder;
     SDL_ShowOpenFileDialog(cb, ctx, window, kOpenFilters, 3, def.c_str(), false);
   } else {
     SDL_ShowOpenFileDialog(cb, ctx, window, kImageFilters, 1, nullptr, false);
@@ -888,31 +1253,51 @@ void App::processDialogResults() {
     res.swap(dialogResults);
   }
   for (auto& [kind, path] : res) {
+    if (kind == 0) { continueAfterSave = false; pendingAction = PA_None; continue; }
     if (kind == DlgOpen) openFile(path);
     else if (kind == DlgImport) importAsLayer(path);
     else if (kind == DlgSave) {
       std::string p = path;
       if (!isPsdPath(p)) p += ".psd";
       saveFile(p);
-    } else error("File dialog failed: " + path);
+    } else if (kind == DlgExport) {
+      std::string p = path, e = fs::path(reinterpret_cast<const char8_t*>(p.c_str())).extension().string();
+      for (auto& c : e) c = char(std::tolower((unsigned char)c));
+      if (e != ".png" && e != ".jpg" && e != ".jpeg") p += ".png";
+      exportFlat(p);
+    } else {
+      error("File dialog failed: " + path);
+      continueAfterSave = false;
+      pendingAction = PA_None;
+    }
   }
   std::lock_guard<std::mutex> lock(saveMutex);
   if (saveDone) {
     saveDone = false;
     if (saveThread.joinable()) saveThread.join();
-    if (!saveMessage.empty()) error(saveMessage);
+    if (!saveMessage.empty()) {
+      error(saveMessage);
+      continueAfterSave = false;
+      pendingAction = PA_None;
+    } else if (saveOk) {
+      savedRevision = revisionAtSave;
+      toast = "Saved " + fs::path(reinterpret_cast<const char8_t*>(documentPath.c_str())).filename().string();
+      toastUntil = SDL_GetTicksNS() + 3000000000ull;
+      if (continueAfterSave) performAction();
+    }
   }
 }
 
 void App::drawFileDialogs() {
   bool busy = R.stroking() || saving;
-  if (ImGui::MenuItem("Open...", "Ctrl+O", false, !busy)) showDialog(DlgOpen);
+  if (ImGui::MenuItem("Open...", "Ctrl+O", false, !busy)) requestAction(PA_OpenDialog);
   if (ImGui::MenuItem("Import image as layer...", "Ctrl+I", false, !busy && R.hasDocument())) showDialog(DlgImport);
   ImGui::Separator();
   if (ImGui::MenuItem("Save", "Ctrl+S", false, !busy && R.hasDocument())) {
     if (documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
   }
   if (ImGui::MenuItem("Save as PSD...", "Ctrl+Shift+S", false, !busy && R.hasDocument())) showDialog(DlgSave);
+  if (ImGui::MenuItem("Export PNG / JPEG...", "Ctrl+E", false, !busy && R.hasDocument())) showDialog(DlgExport);
 }
 
 // Uploads straight-alpha pixels into layer `index` at (x, y).
@@ -940,7 +1325,7 @@ void App::openFile(const std::string& path) {
       DocLayer& L = doc.layers[i];
       int idx = 0;
       if (i > 0) {
-        idx = R.addLayer(int(i), err);
+        idx = R.addLayer(int(i), err, false);
         if (idx < 0) { doc.warnings.push_back(err); break; }
       }
       if (!uploadStraight(R, idx, L.x, L.y, L.w, L.h, L.rgba, err)) { doc.warnings.push_back(err); }
@@ -954,6 +1339,7 @@ void App::openFile(const std::string& path) {
     active = int(R.layers.size()) - 1;
     documentPath = path;
     R.markCachesDirty();
+    savedRevision = R.revision;
     if (!doc.warnings.empty()) {
       std::string m = "Opened " + name + " with notes:";
       for (auto& w : doc.warnings) m += "\n- " + w;
@@ -966,8 +1352,9 @@ void App::openFile(const std::string& path) {
     if (!uploadStraight(R, 0, 0, 0, img.w, img.h, img.rgba, err)) error(err);
     R.layers[0].name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).stem().string();
     documentPath.clear();  // images are imported; saving asks for a .psd name
+    savedRevision = R.revision;
   }
-  SDL_SetWindowTitle(window, ("Saraswati " SARASWATI_VERSION " - " + name).c_str());
+  lastFolder = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).parent_path().string();
 }
 
 void App::importAsLayer(const std::string& path) {
@@ -1033,6 +1420,8 @@ void App::saveFile(const std::string& path) {
   saving = true;
   saveProgress = 0;
   documentPath = path;
+  revisionAtSave = R.revision;
+  lastFolder = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).parent_path().string();
   saveThread = std::thread([this, doc, merged, path] {
     for (auto& L : doc->layers) unpremultiply(L.rgba);
     unpremultiply(merged->rgba);
@@ -1041,12 +1430,35 @@ void App::saveFile(const std::string& path) {
     bool ok = savePsd(path, *doc, *merged, e, &prog);
     std::lock_guard<std::mutex> lock(saveMutex);
     saveMessage = ok ? std::string() : "Save failed: " + e;
+    saveOk = ok;
     if (ok) SDL_Log("saved %s", path.c_str());
     saveDone = true;
     saving = false;
   });
-  std::string name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).filename().string();
-  SDL_SetWindowTitle(window, ("Saraswati " SARASWATI_VERSION " - " + name).c_str());
+}
+
+void App::exportFlat(const std::string& path) {
+  if (!R.hasDocument() || R.stroking() || saving) return;
+  R.waitIdle();
+  auto merged = std::make_shared<ImageRGBA>();
+  merged->w = R.docW;
+  merged->h = R.docH;
+  std::string err;
+  if (!R.readMergedPixels(merged->rgba, err)) { error("Export failed: " + err); return; }
+  if (saveThread.joinable()) saveThread.join();
+  saving = true;
+  revisionAtSave = savedRevision;  // exporting does not count as saving the document
+  saveThread = std::thread([this, merged, path] {
+    unpremultiply(merged->rgba);
+    std::string e;
+    bool ok = exportImage(path, *merged, e);
+    std::lock_guard<std::mutex> lock(saveMutex);
+    saveMessage = ok ? std::string() : "Export failed: " + e;
+    saveOk = false;
+    if (ok) { toast = "Exported " + fs::path(reinterpret_cast<const char8_t*>(path.c_str())).filename().string(); toastUntil = SDL_GetTicksNS() + 3000000000ull; }
+    saveDone = true;
+    saving = false;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1476,8 @@ int App::run() {
     fs::create_directories(fs::path(userData) / "settings", ec);
     iniPath = (fs::path(userData) / "settings" / "layout.ini").string();
     io.IniFilename = iniPath.c_str();
+    settingsPath = (fs::path(userData) / "settings" / "settings.txt").string();
+    loadSettings();
   }
   R.onResize();
   for (int i = 0; i < 2; ++i) {

@@ -15,18 +15,25 @@ brushes. Architecture: [DESIGN.md](DESIGN.md).
 - **Tools:** brush, eyedropper (also Alt+click), fill (bucket), gradient, line, rectangle,
   ellipse (outline or filled), rectangle / ellipse / lasso / magic-wand selection, move /
   transform (scale, rotate, 4-corner distort, flip), hand.
-- **Layers:** new, duplicate, delete, reorder, visibility, opacity, rename, and all 28 Clip Studio
+- **Layers:** thumbnails, new, duplicate, delete, drag-to-reorder, visibility, opacity, rename,
+  lock transparency, and all 28 Clip Studio
   Paint **blend modes** (Normal … Brightness). All layers live in GPU memory; the maximum layer
   count is computed from your VRAM and the document size and shown in *New Document* and *Layers*.
-- **Undo / redo** (50 steps, kept in system RAM).
+- **Undo / redo** (50 steps, kept in system RAM) for strokes, fills, transforms and layer
+  operations (add, delete, duplicate, reorder, visibility, opacity, blend mode, rename, lock).
+  Selection changes are not undoable yet.
+- **Safety:** unsaved changes are marked with `*` in the title; quitting, *New* and *Open* ask to
+  save first. Saves are atomic (written to a temporary file, then swapped in).
 - **Files:** open and save **PSD** (and **PSB** for documents over 30,000 px or 4 GB) with layers,
   names, opacity, visibility and blend modes — the exchange format with Photoshop, Clip Studio
   Paint, Krita etc. Open / import **PNG, JPEG, GIF (first frame), WebP, SVG, BMP, TGA**; drag files
   onto the window to import them as layers (Ctrl+drop opens as a new document).
 - **Interface:** dockable panels — drag a panel's tab to an edge to snap it, onto another panel to
   combine them as tabs, drag the separators to resize; *Window › Reset layout* restores the default.
-  Neutral-grey theme so the UI does not tint your colour perception. The layout is remembered in
-  `User-Data/settings/`.
+  Neutral-grey theme so the UI does not tint your colour perception. Tab hides all panels.
+  The layout, brush settings, colours and last folder are remembered in `User-Data/settings/`.
+- **Colour panel:** HSV wheel, foreground/background swatches (X swaps), hex entry, H/S/V in
+  degrees/percent, recently used colours. Status bar with tool, cursor position, zoom and rotation.
 - **Performance panel** (FPS, GPU time per stage, input → present latency, VRAM, undo RAM,
   present mode) and a built-in **benchmark**.
 
@@ -66,7 +73,8 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 |---|---|
 | Brush / eraser toggle | B / E (the pen's eraser end erases automatically) |
 | Brush tips | 1 Hard Round · 2 Textured Pen · 3 Soft Round |
-| Brush size | [ and ] |
+| Brush size | [ and ], or Ctrl+Alt+drag on the canvas |
+| Swap colour / background colour | X |
 | Straight line from the last stroke | Shift+click |
 | Eyedropper | I, or Alt+click while painting |
 | Fill / gradient | G / Shift+G |
@@ -79,9 +87,12 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 | Move / transform | V or Ctrl+T · corners scale (Shift keeps ratio) · Ctrl+corner distorts · outside rotates · Enter applies, Esc cancels |
 | Pan | Space+drag, middle mouse, or H |
 | Rotate view | Shift+Space+drag · R resets |
-| Zoom | mouse wheel (at the cursor) · Ctrl+0 fit · Ctrl+1 100 % |
+| Zoom | mouse wheel (at the cursor) · + / − · Ctrl+0 fit · Ctrl+1 100 % |
+| Hide / show all panels | Tab |
 | Undo / redo | Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) |
 | New / open / import / save / save as | Ctrl+N / Ctrl+O / Ctrl+I / Ctrl+S / Ctrl+Shift+S |
+| Export flattened PNG / JPEG | Ctrl+E |
+| Layers | drag a row to reorder · double-click to rename · eye icon toggles visibility |
 
 ## Performance test (RTX 3090 PC)
 

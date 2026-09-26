@@ -36,5 +36,8 @@ bool loadPsd(const std::string& path, DocFile& out, std::string& err);
 bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merged, std::string& err,
              float* progress = nullptr);
 
+// Flattened PNG (with alpha) or JPEG (over white), chosen by the file extension.
+bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err);
+
 void premultiply(std::vector<uint8_t>& rgba);
 void unpremultiply(std::vector<uint8_t>& rgba);

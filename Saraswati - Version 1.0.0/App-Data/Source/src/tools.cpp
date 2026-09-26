@@ -131,7 +131,8 @@ void App::docToScreen(double dx, double dy, float& sx, float& sy) const {
   sy = float(R.extent.height * 0.5 + view.zoom * (s * vx + c * vy));
 }
 
-StrokeStyle App::currentStyle(bool eraser) const {
+StrokeStyle App::currentStyle(bool eraser) {
+  if (!eraser) noteColorUsed();
   const BrushSettings& b = brushes[tipIndex];
   StrokeStyle st;
   st.tip = b.tip;
@@ -301,16 +302,20 @@ void App::startTransform() {
     x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1;
     if (!R.readLayerRegion(active, x0, y0, uint32_t(x1 - x0), uint32_t(y1 - y0), px, err)) { error(err); return; }
   } else {
-    // whole layer: find the painted bounds
-    if (!R.readLayerRegion(active, 0, 0, uint32_t(W), uint32_t(H), px, err)) { error(err); return; }
+    // whole layer: read back only its tracked painted bounds, then find the exact bounds inside
+    const Layer& L = R.layers[active];
+    int bx0 = L.bx0, by0 = L.by0, bx1 = L.bx1, by1 = L.by1;
+    if (bx0 >= bx1) { error("The layer is empty - nothing to transform."); tool = ToolId::Brush; return; }
+    int bw = bx1 - bx0;
+    if (!R.readLayerRegion(active, bx0, by0, uint32_t(bw), uint32_t(by1 - by0), px, err)) { error(err); return; }
     x0 = W; y0 = H; x1 = 0; y1 = 0;
-    for (int y = 0; y < H; ++y)
-      for (int x = 0; x < W; ++x)
-        if (px[(size_t(y) * W + x) * 4 + 3]) { x0 = std::min(x0, x); x1 = std::max(x1, x + 1); y0 = std::min(y0, y); y1 = std::max(y1, y + 1); }
+    for (int y = by0; y < by1; ++y)
+      for (int x = bx0; x < bx1; ++x)
+        if (px[(size_t(y - by0) * bw + (x - bx0)) * 4 + 3]) { x0 = std::min(x0, x); x1 = std::max(x1, x + 1); y0 = std::min(y0, y); y1 = std::max(y1, y + 1); }
     if (x0 >= x1) { error("The layer is empty - nothing to transform."); tool = ToolId::Brush; return; }
     std::vector<uint8_t> crop(size_t(x1 - x0) * (y1 - y0) * 4);
     for (int y = y0; y < y1; ++y)
-      memcpy(&crop[size_t(y - y0) * (x1 - x0) * 4], &px[(size_t(y) * W + x0) * 4], size_t(x1 - x0) * 4);
+      memcpy(&crop[size_t(y - y0) * (x1 - x0) * 4], &px[(size_t(y - by0) * bw + (x0 - bx0)) * 4], size_t(x1 - x0) * 4);
     px.swap(crop);
   }
   uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
@@ -330,6 +335,7 @@ void App::startTransform() {
   st.opacity = 1;
   if (!R.paintCoverage(active, x0, y0, w, h, cov.data(), st, err)) { R.destroyFloating(xf.fl); error(err); return; }
   xf.active = true;
+  xf.layerId = R.layers[active].id;
   xf.srcX = x0;
   xf.srcY = y0;
   double q[4][2] = {{double(x0), double(y0)}, {double(x1), double(y0)}, {double(x1), double(y1)}, {double(x0), double(y1)}};
@@ -350,10 +356,11 @@ void App::applyTransform() {
   double src[4][2] = {{0, 0}, {double(xf.fl.w), 0}, {double(xf.fl.w), double(xf.fl.h)}, {0, double(xf.fl.h)}};
   double hm[9], inv[9];
   std::string err;
-  if (homography(src, xf.q, hm) && invert3(hm, inv)) {
+  int li = R.indexOf(xf.layerId);  // the layer the pixels came from, even if another one is selected now
+  if (li >= 0 && homography(src, xf.q, hm) && invert3(hm, inv)) {
     double mnx = 1e300, mny = 1e300, mxx = -1e300, mxy = -1e300;
     for (auto& c : xf.q) { mnx = std::min(mnx, c[0]); mxx = std::max(mxx, c[0]); mny = std::min(mny, c[1]); mxy = std::max(mxy, c[1]); }
-    R.stamp(active, xf.fl, inv, int(std::floor(mnx)) - 1, int(std::floor(mny)) - 1, int(std::ceil(mxx)) + 1,
+    R.stamp(li, xf.fl, inv, int(std::floor(mnx)) - 1, int(std::floor(mny)) - 1, int(std::ceil(mxx)) + 1,
             int(std::ceil(mxy)) + 1, err);
     if (!err.empty()) error(err);
   } else {
@@ -636,8 +643,10 @@ void App::toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt) {
     case SDLK_V: setTool(ToolId::Transform); break;
     case SDLK_H: setTool(ToolId::Hand); break;
     case SDLK_DELETE:
+      fillSelection(true);  // clear the selection (or the layer)
+      break;
     case SDLK_BACKSPACE:
-      fillSelection(!alt);  // Delete clears, Alt+Backspace fills with the colour
+      if (alt) fillSelection(false);  // Alt+Backspace fills with the colour
       break;
     case SDLK_ESCAPE: deselect(); break;
     default: break;
@@ -669,7 +678,7 @@ static void drawIcon(ImDrawList* dl, ToolId t, ImVec2 c, float s, ImU32 col) {
       break;
     case ToolId::Line: dl->AddLine(P(-0.8f, 0.8f), P(0.8f, -0.8f), col, th * 1.4f); break;
     case ToolId::Rect: dl->AddRect(P(-0.8f, -0.6f), P(0.8f, 0.6f), col, 0, th * 1.3f); break;
-    case ToolId::Ellipse: dl->AddEllipse(c, ImVec2(r * 0.85f, r * 0.62f), col, 0, th * 1.3f); break;
+    case ToolId::Ellipse: dl->AddEllipse(c, ImVec2(r * 0.85f, r * 0.62f), col, 0.0f, 0, th * 1.3f); break;
     case ToolId::SelRect:
       for (int i = 0; i < 4; ++i) {
         dl->AddLine(P(-0.8f + i * 0.45f, -0.6f), P(-0.6f + i * 0.45f, -0.6f), col, th);
@@ -754,6 +763,7 @@ void App::drawToolbar() {
 }
 
 void App::drawToolOptions() {
+  if (tool == ToolId::Brush) return;  // the brush settings follow in the panel
   const char* name = "Brush";
   for (auto& t : kTools) if (t.id == tool) name = t.name;
   ImGui::SeparatorText(name);
@@ -919,6 +929,20 @@ void App::buildToolTest() {
     }
   });
   demo.push_back([this] { applyTransform(); });
+  // layer undo: paint a teal dot on a new layer, delete the layer, undo -> the dot must come back;
+  // then reorder + undo/redo, and a property change + undo
+  demo.push_back([this] { addLayer(); });
+  demo.push_back(rgb(0.0f, 0.55f, 0.55f));
+  demo.push_back([this] { tipIndex = 0; brushes[0].size = 120; strokeBegin({1450, 150, 1.0f}, false); strokeAdd({1451, 150, 1.0f}); strokeEnd(); });
+  demo.push_back([this] { R.deleteLayer(active); active = 0; });
+  demo.push_back([this] { R.undo(); });
+  demo.push_back([this] { active = 1; R.moveLayerTo(1, 0); });
+  demo.push_back([this] { R.undo(); });
+  demo.push_back([this] { R.redo(); });
+  demo.push_back([this] { R.undo(); });
+  demo.push_back([this] { R.recordLayerProps(1); R.layers[1].opacity = 0.2f; R.markCachesDirty(); });
+  demo.push_back([this] { R.undo(); });  // opacity back to 100 %
+  demo.push_back([this] { brushes[0].size = 8; });
   // lasso selection left active: marching ants
   demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
   demo.push_back([this] { tool = ToolId::Brush; });

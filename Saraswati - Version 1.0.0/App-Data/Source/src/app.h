@@ -2,6 +2,7 @@
 #pragma once
 #include "brush.h"
 #include "renderer.h"
+#include <array>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -124,7 +125,8 @@ class App {
   void toolUp(double dx, double dy);
   void toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt);
   void docToScreen(double dx, double dy, float& sx, float& sy) const;  // framebuffer px
-  StrokeStyle currentStyle(bool eraser) const;
+  StrokeStyle currentStyle(bool eraser);  // also records the colour in the recent-colours strip
+  void noteColorUsed();
   // selection (CPU copy is the source of truth; the GPU copy is for shading/clipping)
   std::vector<uint8_t> selCpu;
   int selX0 = 0, selY0 = 0, selX1 = 0, selY1 = 0;
@@ -139,6 +141,7 @@ class App {
   // transform session
   struct Xform {
     bool active = false;
+    uint32_t layerId = 0;  // the layer the pixels were lifted from
     Floating fl;
     int srcX = 0, srcY = 0;
     double q[4][2] = {}, start[4][2] = {};
@@ -163,11 +166,45 @@ class App {
 
   // UI state
   bool showColor = true;
+  bool hideUI = false;          // Tab: canvas only
+  // unsaved-changes guard
+  uint64_t savedRevision = 0;
+  enum PendingAction { PA_None, PA_Quit, PA_New, PA_OpenDialog, PA_OpenPath };
+  int pendingAction = PA_None;
+  std::string pendingPath;
+  bool askUnsaved = false, continueAfterSave = false;
+  uint64_t revisionAtSave = 0;
+  bool saveOk = false;
+  void requestAction(int a, const std::string& path = {});
+  void performAction();
+  bool modified() const { return R.hasDocument() && R.revision != savedRevision; }
+  void updateTitle();
+  std::string lastTitle;
+  // colour
+  float bgColor[3] = {1, 1, 1};
+  float lastHue = 0;
+  std::vector<std::array<float, 3>> recentColors;
+  // status / toast
+  std::string toast;
+  uint64_t toastUntil = 0;
+  void drawStatusBar();
+  void drawUnsavedDialog();
+  // brush size drag (Ctrl+Alt+drag)
+  bool sizeDrag = false;
+  float sizeDragX = 0, sizeDragY = 0, sizeDragStart = 0;
+  // layer rename popup
+  int renameIndex = -1;
+  char renameText[128] = {};
+  // settings
+  std::string settingsPath, lastFolder;
+  void loadSettings();
+  void saveSettings();
+  void exportFlat(const std::string& path);
   bool resetLayout = false;
   std::string iniPath;
   // free canvas area (the dockspace's central node), in framebuffer pixels
   float canvasX = 0, canvasY = 0, canvasW = 0, canvasH = 0;
-  bool showBrush = true, showLayers = true, showPerf = true, showNewDoc = false;
+  bool showBrush = true, showLayers = true, showPerf = false, showNewDoc = false;
   int newW = 3000, newH = 2000;
   bool newWhite = true;
   LayerLimit newLimit;
@@ -179,7 +216,7 @@ class App {
   std::string userData;
   std::string documentPath;
   // pending results from SDL's async file dialogs (callbacks may run on another thread)
-  enum DialogKind { DlgOpen = 1, DlgImport = 2, DlgSave = 3 };
+  enum DialogKind { DlgOpen = 1, DlgImport = 2, DlgSave = 3, DlgExport = 4 };
   std::mutex dialogMutex;
   std::vector<std::pair<int, std::string>> dialogResults;
   void showDialog(int kind);

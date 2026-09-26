@@ -217,6 +217,65 @@ bool Renderer::stamp(int layer, const Floating& f, const double inv[9], int rx0,
   endOneShot(cmd);
   if (haveUndo) pushUndo(std::move(e));
   else err = "Not enough memory to keep undo for the transform.";
+  growBounds(L, rx0, ry0, rx1, ry1);
   cachesDirty = true;
+  ++revision;
   return true;
+}
+
+// Renders dirty layer thumbnails (max side 64 px) with the cache shader in document space.
+void Renderer::updateThumbnails(int maxCount) {
+  const uint32_t T = 64;
+  for (auto& l : layers) {
+    if (maxCount <= 0) break;
+    if (!l.thumbDirty) continue;
+    l.thumbDirty = false;
+    --maxCount;
+    uint32_t tw = docW >= docH ? T : std::max(1u, T * docW / docH);
+    uint32_t th = docW >= docH ? std::max(1u, T * docH / docW) : T;
+    if (!l.thumb.image) {
+      if (createImage(device, memProps, tw, th, VK_FORMAT_R8G8B8A8_UNORM,
+                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, l.thumb) != VK_SUCCESS)
+        continue;
+      VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      dai.descriptorPool = descPool;
+      dai.descriptorSetCount = 1;
+      dai.pSetLayouts = &set0Layout;
+      if (vkAllocateDescriptorSets(device, &dai, &l.thumbSet0) != VK_SUCCESS) { destroyImage(device, l.thumb); continue; }
+      VkDescriptorImageInfo ii{VK_NULL_HANDLE, l.thumb.view, VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet w[3] = {};
+      for (int k = 0; k < 3; ++k) {
+        w[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[k].dstSet = l.thumbSet0;
+        w[k].dstBinding = uint32_t(2 + k);
+        w[k].descriptorCount = 1;
+        w[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[k].pImageInfo = &ii;
+      }
+      vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
+      VkCommandBuffer c0 = beginOneShot();
+      imageBarrier(c0, l.thumb.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+      endOneShot(c0);
+      l.thumbTex = ImGui_ImplVulkan_AddTexture(l.thumb.view, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    VkCommandBuffer cmd = beginOneShot();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &l.thumbSet0, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
+    View v;
+    v.panX = docW * 0.5;
+    v.panY = docH * 0.5;
+    v.zoom = double(l.thumb.width) / docW;
+    VkExtent2D ext{l.thumb.width, l.thumb.height};
+    forceTransparentPaper = true;
+    pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
+    vkCmdDispatch(cmd, (ext.width + 15) / 16, (ext.height + 15) / 16, 1);
+    memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+    pushView(cmd, v, ext, 0, 1, BlendMode::Normal);
+    vkCmdDispatch(cmd, (ext.width + 15) / 16, (ext.height + 15) / 16, 1);
+    forceTransparentPaper = false;
+    endOneShot(cmd);
+  }
 }

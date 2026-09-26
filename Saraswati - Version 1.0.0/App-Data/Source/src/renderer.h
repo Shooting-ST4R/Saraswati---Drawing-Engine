@@ -34,6 +34,23 @@ struct Layer {
   bool visible = true;
   float opacity = 1.0f;
   BlendMode mode = BlendMode::Normal;
+  bool lockAlpha = false;  // paint only where the layer already has pixels
+  // conservative bounds of painted pixels (empty when x0 >= x1)
+  int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+  // small preview for the layer panel (rendered on the GPU)
+  GpuImage thumb;
+  VkDescriptorSet thumbSet0 = VK_NULL_HANDLE;
+  VkDescriptorSet thumbTex = VK_NULL_HANDLE;
+  bool thumbDirty = true;
+};
+
+// Layer properties that are undoable as one step.
+struct LayerProps {
+  std::string name;
+  bool visible = true;
+  float opacity = 1.0f;
+  BlendMode mode = BlendMode::Normal;
+  bool lockAlpha = false;
 };
 
 struct View {
@@ -94,10 +111,17 @@ class Renderer {
   LayerLimit computeLayerLimit(uint32_t w, uint32_t h);
   bool newDocument(uint32_t w, uint32_t h, bool whitePaper, std::string& err);
   bool hasDocument() const { return docW > 0; }
-  int addLayer(int index, std::string& err);  // inserts at index; returns index or -1
+  int addLayer(int index, std::string& err, bool undoable = true);  // inserts at index; returns index or -1
   int duplicateLayer(int index, std::string& err);
   void deleteLayer(int index);
-  void moveLayer(int index, int delta);
+  void moveLayer(int index, int delta) { moveLayerTo(index, index + delta); }
+  void moveLayerTo(int from, int to);  // one undo step
+  int indexOf(uint32_t id) const { return findLayer(id); }
+  void closeDocument() { destroyDocument(); runDeferred(true); }
+  void recordLayerProps(int index);  // call before changing name/visibility/opacity/mode/lock (undo step)
+  void updateThumbnails(int maxCount);
+  int heldLayers() const;            // deleted layers kept alive by undo
+  uint64_t revision = 0;             // increases with every change to the document
   bool uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* premulRgba, std::string& err);
   bool readLayerPixels(int index, std::vector<uint8_t>& premulRgba, std::string& err);  // whole layer
   bool readMergedPixels(std::vector<uint8_t>& premulRgba, std::string& err);            // flattened doc
@@ -184,12 +208,21 @@ class Renderer {
 
  private:
   struct Chunk { GpuBuffer buf; uint32_t firstTile = 0, tileCount = 0; };
+  enum class UndoKind { Tiles, Props, Order, Deleted, Added };
   struct UndoEntry {
+    UndoKind kind = UndoKind::Tiles;
     uint32_t layerId = 0;
     std::vector<VkRect2D> tiles;
     std::vector<Chunk> chunks;
     size_t bytes = 0;
+    LayerProps props;             // Props
+    std::vector<uint32_t> order;  // Order: layer ids bottom to top
+    Layer held;                   // Deleted: the layer, kept alive for undo
+    int index = 0;                // Deleted: where it was
   };
+  void growBounds(Layer& l, int x0, int y0, int x1, int y1);
+  bool applyLayerUndo(UndoEntry& e);  // non-tile kinds; swaps the entry with the current state
+  bool forceTransparentPaper = false;
   struct FrameSlot {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;

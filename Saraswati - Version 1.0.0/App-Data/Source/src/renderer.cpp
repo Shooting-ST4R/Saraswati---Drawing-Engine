@@ -65,11 +65,12 @@ struct CommitPC {
   float color[4];
   int32_t eraser;
   int32_t useSel;
+  int32_t lockAlpha;
 };
 
 enum : int {
   FLAG_STROKE = 1, FLAG_ERASER = 2, FLAG_LAYER = 4, FLAG_ABOVE_CACHE = 8, FLAG_ABOVE = 16,
-  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256
+  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512
 };
 
 static constexpr VkImageUsageFlags kLayerUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -391,11 +392,12 @@ void Renderer::createPipelines() {
   plci.pPushConstantRanges = &pcr;
   VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &pipeLayout));
 
-  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1110 + 6 * (kFrames + 2)},
-                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFrames + 2}};
+  // per layer: its own set + a thumbnail set 0; plus frame slots, flatten and floating sets
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1110 + 6 * 1010 + 6 * (kFrames + 2)},
+                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1010 + kFrames + 2}};
   VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  dpci.maxSets = 1110 + kFrames + 2;
+  dpci.maxSets = 2120 + kFrames + 2;
   dpci.poolSizeCount = 2;
   dpci.pPoolSizes = ps;
   VK_CHECK(vkCreateDescriptorPool(device, &dpci, nullptr, &descPool));
@@ -515,7 +517,7 @@ void Renderer::initImGui() {
   info.Device = device;
   info.QueueFamily = queueFamily;
   info.Queue = queue;
-  info.DescriptorPoolSize = 16;
+  info.DescriptorPoolSize = 1100;  // layer thumbnails + transform preview
   info.MinImageCount = 2;
   info.ImageCount = std::max(2u, swapImageCount);
   info.PipelineInfoMain.RenderPass = renderPass;
@@ -873,16 +875,96 @@ bool Renderer::createLayer(Layer& l, std::string& err) {
 }
 
 void Renderer::destroyLayer(Layer& l) {
-  GpuImage img = l.image;
-  VkDescriptorSet set = l.set;
+  GpuImage img = l.image, thumb = l.thumb;
+  VkDescriptorSet sets[2] = {l.set, l.thumbSet0};
+  VkDescriptorSet tex = l.thumbTex;
   VkDevice dev = device;
   VkDescriptorPool pool = descPool;
-  defer([dev, img, set, pool]() mutable {
+  defer([dev, img, thumb, sets, tex, pool]() mutable {
+    if (tex) ImGui_ImplVulkan_RemoveTexture(tex);
     destroyImage(dev, img);
-    if (set) vkFreeDescriptorSets(dev, pool, 1, &set);
+    destroyImage(dev, thumb);
+    for (VkDescriptorSet s : sets)
+      if (s) vkFreeDescriptorSets(dev, pool, 1, &s);
   });
   l.image = {};
-  l.set = VK_NULL_HANDLE;
+  l.thumb = {};
+  l.set = l.thumbSet0 = l.thumbTex = VK_NULL_HANDLE;
+}
+
+void Renderer::growBounds(Layer& l, int x0, int y0, int x1, int y1) {
+  x0 = std::max(x0, 0); y0 = std::max(y0, 0);
+  x1 = std::min(x1, int(docW)); y1 = std::min(y1, int(docH));
+  if (x0 >= x1 || y0 >= y1) return;
+  if (l.bx0 >= l.bx1) { l.bx0 = x0; l.by0 = y0; l.bx1 = x1; l.by1 = y1; }
+  else { l.bx0 = std::min(l.bx0, x0); l.by0 = std::min(l.by0, y0); l.bx1 = std::max(l.bx1, x1); l.by1 = std::max(l.by1, y1); }
+  l.thumbDirty = true;
+}
+
+int Renderer::heldLayers() const {
+  int n = 0;
+  for (auto* st : {&undoStack, &redoStack})
+    for (auto& e : *st) n += e.kind == UndoKind::Deleted ? 1 : 0;
+  return n;
+}
+
+void Renderer::recordLayerProps(int index) {
+  if (index < 0 || index >= int(layers.size())) return;
+  const Layer& l = layers[index];
+  UndoEntry e;
+  e.kind = UndoKind::Props;
+  e.layerId = l.id;
+  e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha};
+  pushUndo(std::move(e));
+  ++revision;
+}
+
+// Swaps a non-tile undo entry with the current document state (so the same entry redoes).
+bool Renderer::applyLayerUndo(UndoEntry& e) {
+  switch (e.kind) {
+    case UndoKind::Props: {
+      int i = findLayer(e.layerId);
+      if (i < 0) return false;
+      Layer& l = layers[i];
+      LayerProps cur{l.name, l.visible, l.opacity, l.mode, l.lockAlpha};
+      l.name = e.props.name; l.visible = e.props.visible; l.opacity = e.props.opacity;
+      l.mode = e.props.mode; l.lockAlpha = e.props.lockAlpha;
+      e.props = cur;
+      return true;
+    }
+    case UndoKind::Order: {
+      std::vector<uint32_t> cur;
+      for (auto& l : layers) cur.push_back(l.id);
+      std::vector<Layer> re;
+      for (uint32_t id : e.order) {
+        int i = findLayer(id);
+        if (i >= 0) re.push_back(std::move(layers[i]));
+      }
+      if (re.size() != layers.size()) return false;
+      layers = std::move(re);
+      e.order = cur;
+      return true;
+    }
+    case UndoKind::Deleted: {  // bring the layer back
+      int at = std::clamp(e.index, 0, int(layers.size()));
+      e.layerId = e.held.id;
+      layers.insert(layers.begin() + at, std::move(e.held));
+      e.held = Layer{};
+      e.kind = UndoKind::Added;
+      return true;
+    }
+    case UndoKind::Added: {  // remove it again, keeping it alive
+      int i = findLayer(e.layerId);
+      if (i < 0) return false;
+      e.held = std::move(layers[i]);
+      e.index = i;
+      layers.erase(layers.begin() + i);
+      e.kind = UndoKind::Deleted;
+      return true;
+    }
+    default:
+      return false;
+  }
 }
 
 bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err) {
@@ -932,17 +1014,27 @@ bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err)
   return true;
 }
 
-int Renderer::addLayer(int index, std::string& err) {
-  if (int(layers.size()) >= limit.maxLayers) {
-    err = "Layer limit reached (" + std::to_string(limit.maxLayers) + " layers fit in GPU memory at this document size).";
+int Renderer::addLayer(int index, std::string& err, bool undoable) {
+  int held = heldLayers();
+  if (int(layers.size()) + held >= limit.maxLayers) {
+    err = "Layer limit reached (" + std::to_string(limit.maxLayers) + " layers fit in GPU memory at this document size" +
+          (held ? ", " + std::to_string(held) + " of them are deleted layers kept for undo" : std::string()) + ").";
     return -1;
   }
   Layer l;
   if (!createLayer(l, err)) return -1;
   l.name = "Layer " + std::to_string(l.id);
   index = std::clamp(index, 0, int(layers.size()));
+  uint32_t id = l.id;
   layers.insert(layers.begin() + index, std::move(l));
   cachesDirty = true;
+  if (undoable) {
+    UndoEntry e;
+    e.kind = UndoKind::Added;
+    e.layerId = id;
+    pushUndo(std::move(e));
+  }
+  ++revision;
   return index;
 }
 
@@ -956,6 +1048,9 @@ int Renderer::duplicateLayer(int index, std::string& err) {
   dst.visible = src.visible;
   dst.opacity = src.opacity;
   dst.mode = src.mode;
+  dst.lockAlpha = src.lockAlpha;
+  dst.bx0 = src.bx0; dst.by0 = src.by0; dst.bx1 = src.bx1; dst.by1 = src.by1;
+  dst.thumbDirty = true;
   VkCommandBuffer cmd = beginOneShot();
   VkImageCopy c{};
   c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -969,25 +1064,30 @@ int Renderer::duplicateLayer(int index, std::string& err) {
 void Renderer::deleteLayer(int index) {
   if (index < 0 || index >= int(layers.size()) || layers.size() <= 1) return;
   if (strokeActive && layers[index].id == strokeLayerId) return;
-  uint32_t id = layers[index].id;
-  auto dropFor = [&](std::deque<UndoEntry>& st) {
-    for (auto it = st.begin(); it != st.end();) {
-      if (it->layerId == id) { dropUndo(*it); it = st.erase(it); }
-      else ++it;
-    }
-  };
-  dropFor(undoStack);
-  dropFor(redoStack);
-  destroyLayer(layers[index]);
+  // kept alive in the undo entry (its VRAM is released when the entry drops off the history)
+  UndoEntry e;
+  e.kind = UndoKind::Deleted;
+  e.layerId = layers[index].id;
+  e.index = index;
+  e.held = std::move(layers[index]);
   layers.erase(layers.begin() + index);
+  pushUndo(std::move(e));
   cachesDirty = true;
+  ++revision;
 }
 
-void Renderer::moveLayer(int index, int delta) {
-  int j = index + delta;
+void Renderer::moveLayerTo(int index, int j) {
+  if (index == j) return;
   if (index < 0 || j < 0 || index >= int(layers.size()) || j >= int(layers.size())) return;
-  std::swap(layers[index], layers[j]);
+  UndoEntry e;
+  e.kind = UndoKind::Order;
+  for (auto& l : layers) e.order.push_back(l.id);
+  pushUndo(std::move(e));
+  Layer tmp = std::move(layers[index]);
+  layers.erase(layers.begin() + index);
+  layers.insert(layers.begin() + j, std::move(tmp));
   cachesDirty = true;
+  ++revision;
 }
 
 bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* rgba, std::string& err) {
@@ -1018,7 +1118,9 @@ bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h
     endOneShot(cmd);
   }
   destroyBuffer(device, stage);
+  growBounds(layers[index], x0, y0, x1, y1);
   cachesDirty = true;
+  ++revision;
   return true;
 }
 
@@ -1155,7 +1257,7 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   pc.color[1] = style.color[1];
   pc.color[2] = style.color[2];
   pc.color[3] = style.opacity;
-  float p = whitePaper ? 1.0f : 0.0f;
+  float p = (whitePaper && !forceTransparentPaper) ? 1.0f : 0.0f;
   pc.paper[0] = pc.paper[1] = pc.paper[2] = pc.paper[3] = p;
   pc.mode = int(mode);
   pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
@@ -1279,6 +1381,7 @@ bool Renderer::copyTiles(VkCommandBuffer cmd, Layer& layer, const std::vector<Vk
 }
 
 void Renderer::dropUndo(UndoEntry& e) {
+  if (e.kind == UndoKind::Deleted) destroyLayer(e.held);
   std::vector<Chunk> ch = std::move(e.chunks);
   VkDevice dev = device;
   defer([dev, ch]() mutable { for (auto& c : ch) destroyBuffer(dev, c.buf); });
@@ -1324,6 +1427,10 @@ void Renderer::recordCommit(VkCommandBuffer cmd) {
   pc.color[3] = style.opacity;
   pc.eraser = style.eraser ? 1 : 0;
   pc.useSel = selectionActive ? 1 : 0;
+  pc.lockAlpha = layer.lockAlpha ? 1 : 0;
+  if (!style.eraser && !layer.lockAlpha) growBounds(layer, sx0, sy0, sx1, sy1);
+  layer.thumbDirty = true;
+  ++revision;
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
   vkCmdDispatch(cmd, (pc.size[0] + 15) / 16, (pc.size[1] + 15) / 16, 1);
@@ -1353,6 +1460,17 @@ void Renderer::recordUndoOps(VkCommandBuffer cmd) {
     if (from.empty()) continue;
     UndoEntry e = std::move(from.back());
     from.pop_back();
+    ++revision;
+    cachesDirty = true;
+    if (e.kind != UndoKind::Tiles) {
+      if (applyLayerUndo(e)) {
+        if (op == 2) dropUndo(e);
+        else to.push_back(std::move(e));
+      } else {
+        dropUndo(e);
+      }
+      continue;
+    }
     int li = findLayer(e.layerId);
     if (li < 0) { dropUndo(e); continue; }
     // swap: current tiles -> new buffers, stored tiles -> layer
@@ -1369,6 +1487,8 @@ void Renderer::recordUndoOps(VkCommandBuffer cmd) {
     memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
                   kCS | VK_PIPELINE_STAGE_TRANSFER_BIT, kRW | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     dropUndo(e);
+    for (auto& t : e.tiles)
+      growBounds(layers[li], t.offset.x, t.offset.y, t.offset.x + int(t.extent.width), t.offset.y + int(t.extent.height));
     e.chunks = std::move(now);
     e.bytes = bytes;
     if (op == 2) dropUndo(e);
@@ -1423,6 +1543,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &act->set, 0, nullptr);
     if (act->visible) flags |= FLAG_LAYER;
     if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0);
+    if (act->lockAlpha) flags |= FLAG_LOCK;
   }
   if (selectionActive) flags |= FLAG_SEL;
   pushView(cmd, p.view, extent, flags, act ? act->opacity : 1.0f, act ? act->mode : BlendMode::Normal);
@@ -1492,15 +1613,17 @@ bool Renderer::renderFrame(const FrameParams& p) {
     vkCmdResetQueryPool(cmd, queryPool, q0, kTimestampCount);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, q0 + 0);
   }
+  FrameParams q = p;
   if (hasDocument()) {
     recordUndoOps(cmd);
+    q.activeLayer = std::clamp(p.activeLayer, 0, int(layers.size()) - 1);
     recordDabs(cmd, s);
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 1);
     recordCommit(cmd);
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 2);
-    recordCaches(cmd, p);
+    recordCaches(cmd, q);
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 3);
-    recordFrameComposite(cmd, p);
+    recordFrameComposite(cmd, q);
     if (pickPending && pickX >= 0 && pickY >= 0 && uint32_t(pickX) < extent.width && uint32_t(pickY) < extent.height) {
       memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
       VkBufferImageCopy c{};

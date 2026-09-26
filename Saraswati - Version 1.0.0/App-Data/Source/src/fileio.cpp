@@ -3,6 +3,7 @@
 #include "nanosvg.h"
 #include "nanosvgrast.h"
 #include "stb_image.h"
+#include "stb_image_write.h"
 #include <webp/decode.h>
 
 #include <algorithm>
@@ -135,6 +136,23 @@ bool loadImageFile(const std::string& path, ImageRGBA& out, std::string& err) {
   out.rgba.assign(px, px + size_t(w) * h * 4);
   stbi_image_free(px);
   return true;
+}
+
+bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err) {
+  std::string ext = lowerExt(path);
+  int ok = 0;
+  if (ext == ".jpg" || ext == ".jpeg") {
+    std::vector<uint8_t> rgb(size_t(img.w) * img.h * 3);
+    for (size_t i = 0, n = size_t(img.w) * img.h; i < n; ++i) {
+      unsigned a = img.rgba[i * 4 + 3];
+      for (int k = 0; k < 3; ++k) rgb[i * 3 + k] = uint8_t((img.rgba[i * 4 + k] * a + 255 * (255 - a) + 127) / 255);
+    }
+    ok = stbi_write_jpg(path.c_str(), int(img.w), int(img.h), 3, rgb.data(), 92);
+  } else {
+    ok = stbi_write_png(path.c_str(), int(img.w), int(img.h), 4, img.rgba.data(), int(img.w) * 4);
+  }
+  if (!ok) err = "Could not write " + path;
+  return ok != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +288,7 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
     DocLayer layer;
     std::vector<std::pair<int16_t, uint64_t>> ch;
     int section = 0;  // lsct: 1/2 group folder, 3 group end marker
+    bool clipped = false;
   };
   std::vector<Rec> recs;
   if (lmLen > 0) {
@@ -299,7 +318,7 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
           if (memcmp(key, "pass", 4)) doc.warnings.push_back(std::string("Unsupported blend mode '") + std::string(key, 4) + "' shown as Normal");
         }
         rec.layer.opacity = r.u8() / 255.0f;
-        r.u8();  // clipping
+        if (r.u8() != 0) rec.clipped = true;  // clipping mask
         uint8_t flags = r.u8();
         rec.layer.visible = !(flags & 2);
         r.u8();
@@ -386,6 +405,13 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
     if (rec.section == 3) { if (stack.size() > 1) stack.pop_back(); continue; }
     rec.layer.visible = rec.layer.visible && stack.back();
   }
+  bool anyMask = false, anyClip = false;
+  for (auto& rec : recs) {
+    for (auto& c : rec.ch) anyMask |= c.first <= -2;
+    anyClip |= rec.clipped && rec.section == 0;
+  }
+  if (anyMask) doc.warnings.push_back("Layer masks are not supported yet and were ignored (the unmasked pixels are shown).");
+  if (anyClip) doc.warnings.push_back("Clipping masks are not supported yet; clipped layers are shown unclipped.");
   if (anyGroup) doc.warnings.push_back("Layer folders were flattened (1.0.0 has no groups); hidden folders keep their layers hidden.");
   for (auto& rec : recs)
     if (rec.section == 0) doc.layers.push_back(std::move(rec.layer));

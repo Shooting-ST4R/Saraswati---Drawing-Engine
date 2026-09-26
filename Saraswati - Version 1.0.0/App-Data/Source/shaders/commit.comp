@@ -11,6 +11,7 @@ layout(push_constant) uniform CommitPC {
   vec4 color;   // straight rgb + stroke opacity
   int eraser;
   int useSel;   // clip to the selection
+  int lockAlpha;  // keep the layer's alpha (paint only over existing pixels)
 } pc;
 
 void main() {
@@ -23,7 +24,9 @@ void main() {
   float a = m * pc.color.a;
   if (pc.useSel != 0) a *= imageLoad(selImg, px).r;
   vec4 c = imageLoad(layerImg, px);
-  if (pc.eraser != 0) c *= (1.0 - a);
+  if (pc.lockAlpha != 0) {
+    if (pc.eraser == 0 && c.a > 0.0) c = vec4(mix(c.rgb / c.a, pc.color.rgb, a) * c.a, c.a);
+  } else if (pc.eraser != 0) c *= (1.0 - a);
   else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
   imageStore(layerImg, px, c);
 }

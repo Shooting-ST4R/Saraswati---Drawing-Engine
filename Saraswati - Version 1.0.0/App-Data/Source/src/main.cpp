@@ -217,6 +217,7 @@ int main(int argc, char** argv) {
       rc = app.run();
     }
     renderer.waitIdle();
+    renderer.closeDocument();  // layer thumbnails are ImGui textures: release them before ImGui
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
