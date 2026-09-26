@@ -109,33 +109,59 @@ float BrushEngine::diameterAt(float pressure) const {
 
 void BrushEngine::emit(double x, double y, float pressure) {
   float p = std::pow(std::clamp(pressure, 0.0f, 1.0f), b_.gamma);
-  float r = diameterAt(pressure) * 0.5f;
-  float a = b_.flow * (b_.pressureOpacity ? p : 1.0f);
-  if (b_.sizeJitter > 0 && b_.particles == 0) r *= 1.0f - b_.sizeJitter * rnd();
-  if (b_.flowJitter > 0) a *= 1.0f - b_.flowJitter * rnd();
-  if (b_.scatter > 0) {
-    float ang = rnd() * float(2 * kPi), d = std::sqrt(rnd()) * b_.scatter * r * 2;
-    x += d * std::cos(ang);
-    y += d * std::sin(ang);
-  }
-  double ang = b_.angle * kPi / 180.0;
-  if (b_.followStroke) ang += std::atan2(dirY_, dirX_);
-  float ca = float(std::cos(ang)), sa = float(std::sin(ang));
-  float invRound = 1.0f / std::clamp(b_.roundness, 0.05f, 1.0f);
-  if (a <= 0.0f) return;
-  if (b_.particles > 0) {  // spray: dots spread over the dab's disc
-    for (int i = 0; i < b_.particles; ++i) {
-      float pa = rnd() * float(2 * kPi), pd = std::sqrt(rnd()) * r;
-      float pr = std::max(0.5f, b_.particleSize * 0.5f * (1.0f - b_.sizeJitter * rnd()));
-      out.push_back({float(x + pd * std::cos(pa)), float(y + pd * std::sin(pa)), pr, a, 1, 0, 1, 0});
+  if (emitted_) dist_ += std::hypot(x - emX_, y - emY_);
+  emX_ = x;
+  emY_ = y;
+  emitted_ = true;
+  float taper = b_.taperIn > 0 ? float(std::clamp(dist_ / b_.taperIn, 0.0, 1.0)) : 1.0f;
+  for (int c = 0; c < std::max(1, b_.count); ++c) {
+    float r = diameterAt(pressure) * 0.5f * (0.15f + 0.85f * taper);
+    float a = b_.flow * (b_.pressureOpacity ? p : 1.0f) * (b_.pressureFlow ? p : 1.0f);
+    if (b_.sizeJitter > 0 && b_.particles == 0) r *= 1.0f - b_.sizeJitter * rnd();
+    if (b_.flowJitter > 0) a *= 1.0f - b_.flowJitter * rnd();
+    double dx = x, dy = y;
+    if (b_.scatter > 0) {
+      float d = (b_.bothAxes ? std::sqrt(rnd()) : rnd() * 2 - 1) * b_.scatter * r * 2;
+      if (b_.bothAxes) {
+        float ang = rnd() * float(2 * kPi);
+        dx += d * std::cos(ang);
+        dy += d * std::sin(ang);
+      } else {  // across the stroke only
+        dx += -dirY_ * d;
+        dy += dirX_ * d;
+      }
     }
-    return;
+    double ang = b_.angle * kPi / 180.0;
+    if (b_.followStroke) ang += std::atan2(dirY_, dirX_);
+    if (b_.angleJitter > 0) ang += (rnd() - 0.5f) * b_.angleJitter * 2 * kPi;
+    float ca = float(std::cos(ang)), sa = float(std::sin(ang));
+    float round = std::clamp(b_.roundness * (1.0f - b_.roundJitter * rnd()), 0.05f, 1.0f);
+    float invRound = 1.0f / round;
+    if (a <= 0.0f) continue;
+    if (b_.particles > 0) {  // spray: dots spread over the dab's disc
+      for (int i = 0; i < b_.particles; ++i) {
+        float pa = rnd() * float(2 * kPi), pd = std::sqrt(rnd()) * r;
+        float pr = std::max(0.5f, b_.particleSize * 0.5f * (1.0f - b_.sizeJitter * rnd()));
+        float tip = -1;
+        if (!tipSlots.empty()) tip = float(tipSlots[size_t(rnd() * tipSlots.size()) % tipSlots.size()]), pr *= 1.41421356f;
+        out.push_back({float(dx + pd * std::cos(pa)), float(dy + pd * std::sin(pa)), pr, a, 1, 0, 1, tip});
+      }
+      continue;
+    }
+    float tip = -1;
+    if (!tipSlots.empty()) {  // sampled tip: pick one, maybe mirrored; radius covers the square's corners
+      size_t k = b_.tipOrder == 1 ? size_t(rnd() * tipSlots.size()) % tipSlots.size() : tipCounter_++ % tipSlots.size();
+      tip = float(tipSlots[k]);
+      if (b_.flipXJitter && rnd() < 0.5f) tip += 0.25f;
+      if (b_.flipYJitter && rnd() < 0.5f) tip += 0.5f;
+      r *= 1.41421356f;
+    }
+    if (r < 0.5f) {  // sub-pixel dab: keep a 1 px footprint, scale alpha by area
+      a *= (r * r) / 0.25f;
+      r = 0.5f;
+    }
+    out.push_back({float(dx), float(dy), r, a, ca, sa, invRound, tip});
   }
-  if (r < 0.5f) {  // sub-pixel dab: keep a 1 px footprint, scale alpha by area
-    a *= (r * r) / 0.25f;
-    r = 0.5f;
-  }
-  out.push_back({float(x), float(y), r, a, ca, sa, invRound, 0});
 }
 
 void BrushEngine::begin(const PenSample& s, const BrushSettings& b, uint32_t seed, bool spline) {
@@ -149,6 +175,9 @@ void BrushEngine::begin(const PenSample& s, const BrushSettings& b, uint32_t see
   last_ = s;
   rng_ = seed * 2654435761u + 12345u;
   if (!rng_) rng_ = 1;
+  dist_ = 0;
+  emitted_ = false;
+  tipCounter_ = 0;
   dirX_ = 1;
   dirY_ = 0;
   emit(s.x, s.y, s.pressure);
@@ -234,4 +263,55 @@ void BrushEngine::walkTo(const PenSample& s) {
   }
   toNext_ -= (len - t);
   last_ = s;
+}
+
+// ---------------------------------------------------------------------------
+// Imported-brush fields as "key=value" pairs separated by ';' (names never contain ';' or '=').
+
+std::string brushExtraToString(const BrushSettings& b) {
+  std::string o;
+  auto kv = [&](const char* k, const std::string& v) { o += std::string(k) + "=" + v + ";"; };
+  auto f = [&](const char* k, float v) { char buf[48]; snprintf(buf, sizeof buf, "%g", v); kv(k, buf); };
+  std::string tips;
+  for (size_t i = 0; i < b.tips.size(); ++i) tips += (i ? "," : "") + b.tips[i];
+  if (!tips.empty()) kv("tips", tips);
+  f("tipOrder", float(b.tipOrder)); f("flipX", b.flipXJitter); f("flipY", b.flipYJitter);
+  f("angleJ", b.angleJitter); f("roundJ", b.roundJitter); f("count", float(b.count)); f("both", b.bothAxes);
+  if (!b.texture.empty()) kv("texture", b.texture);
+  f("patScale", b.patScale); f("texMode", float(b.texMode)); f("texInv", b.texInvert);
+  f("texBr", b.texBrightness); f("texCo", b.texContrast);
+  if (!b.dualTip.empty()) kv("dual", b.dualTip);
+  f("dualScale", b.dualScale); f("taperIn", b.taperIn); f("pFlow", b.pressureFlow);
+  return o;
+}
+
+void brushExtraFromString(BrushSettings& b, const std::string& s) {
+  size_t p = 0;
+  while (p < s.size()) {
+    size_t e = s.find(';', p);
+    std::string item = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    p = e == std::string::npos ? s.size() : e + 1;
+    size_t eq = item.find('=');
+    if (eq == std::string::npos) continue;
+    std::string k = item.substr(0, eq), v = item.substr(eq + 1);
+    float n = float(atof(v.c_str()));
+    if (k == "tips") { b.tips.clear(); size_t q = 0; while (q <= v.size()) { size_t c = v.find(',', q); std::string t = v.substr(q, c == std::string::npos ? std::string::npos : c - q); if (!t.empty()) b.tips.push_back(t); if (c == std::string::npos) break; q = c + 1; } }
+    else if (k == "tipOrder") b.tipOrder = int(n);
+    else if (k == "flipX") b.flipXJitter = n != 0;
+    else if (k == "flipY") b.flipYJitter = n != 0;
+    else if (k == "angleJ") b.angleJitter = n;
+    else if (k == "roundJ") b.roundJitter = n;
+    else if (k == "count") b.count = std::clamp(int(n), 1, 16);
+    else if (k == "both") b.bothAxes = n != 0;
+    else if (k == "texture") b.texture = v;
+    else if (k == "patScale") b.patScale = n;
+    else if (k == "texMode") b.texMode = int(n);
+    else if (k == "texInv") b.texInvert = n != 0;
+    else if (k == "texBr") b.texBrightness = n;
+    else if (k == "texCo") b.texContrast = n;
+    else if (k == "dual") b.dualTip = v;
+    else if (k == "dualScale") b.dualScale = n;
+    else if (k == "taperIn") b.taperIn = n;
+    else if (k == "pFlow") b.pressureFlow = n != 0;
+  }
 }

@@ -67,6 +67,10 @@ struct DabPC {
   int32_t origin[2], size[2];
   int32_t first, count, flags;  // flags: 1 = build-up
   float hardness, texStrength, texScale;
+  int32_t texSlot, texMode;     // pattern texture of an imported brush (-1 = procedural grain)
+  float patScale, texBrightness, texContrast;
+  int32_t texInvert, dualSlot;
+  float dualScale;
 };
 struct CommitPC {
   int32_t origin[2], size[2];
@@ -200,10 +204,21 @@ void Renderer::init(SDL_Window* win, const RendererOptions& opt) {
     VK_CHECK(createBuffer(device, memProps, sizeof(Dab) * kMaxDabsPerFrame, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, s.dabBuf, true));
     if (!fxBuf.buffer) {
-      fxCapacity = 2048;
-      VK_CHECK(createBuffer(device, memProps, VkDeviceSize(fxCapacity) * 96, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      fxCapacity = 2048;  // + the brush tip rects after the layer records
+      VkDeviceSize bytes = VkDeviceSize(fxCapacity) * 96 + VkDeviceSize(kMaxTips) * 16;
+      VK_CHECK(createBuffer(device, memProps, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, fxBuf, true));
-      memset(fxBuf.mapped, 0, size_t(fxCapacity) * 96);
+      memset(fxBuf.mapped, 0, size_t(bytes));
+    }
+    if (!tipAtlas.image) {
+      VK_CHECK(createImage(device, memProps, kTipAtlas, kTipAtlas, VK_FORMAT_R8_UNORM,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, tipAtlas));
+      VkCommandBuffer c = beginOneShot();
+      imageBarrier(c, tipAtlas.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, kAllStages, 0, kAllStages, kAllAccess);
+      VkClearColorValue zero{};
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vkCmdClearColorImage(c, tipAtlas.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+      endOneShot(c);
     }
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = descPool;
@@ -378,15 +393,15 @@ void Renderer::createDevice(const RendererOptions& opt) {
 
 void Renderer::createPipelines() {
   // set 0: mask, dab buffer, below, above, work.  set 1: layer.
-  VkDescriptorSetLayoutBinding b0[7] = {};
-  for (uint32_t i = 0; i < 7; ++i) {  // 6: per-layer effects (tone, layer colour)
+  VkDescriptorSetLayoutBinding b0[8] = {};
+  for (uint32_t i = 0; i < 8; ++i) {  // 6: per-layer effects (+ brush tip rects), 7: brush tip atlas
     b0[i].binding = i;
     b0[i].descriptorType = i == 1 || i == 6 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b0[i].descriptorCount = 1;
     b0[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   }
   VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  lci.bindingCount = 7;
+  lci.bindingCount = 8;
   lci.pBindings = b0;
   VK_CHECK(vkCreateDescriptorSetLayout(device, &lci, nullptr, &set0Layout));
   VkDescriptorSetLayoutBinding b1{};
@@ -690,6 +705,7 @@ void Renderer::shutdown() {
   destroyDocument();
   runDeferred(true);
   destroyBuffer(device, fxBuf);
+  destroyImage(device, tipAtlas);
   for (auto& pool : chunkPool) {
     for (auto& b : pool) destroyBuffer(device, b);
     pool.clear();
@@ -1461,6 +1477,14 @@ void Renderer::recordDabs(VkCommandBuffer cmd, FrameSlot& s) {
     pc.hardness = style.hardness;
     pc.texStrength = style.texStrength;
     pc.texScale = style.texScale;
+    pc.texSlot = style.texSlot;
+    pc.texMode = style.texMode;
+    pc.patScale = style.patScale;
+    pc.texBrightness = style.texBrightness;
+    pc.texContrast = style.texContrast;
+    pc.texInvert = style.texInvert ? 1 : 0;
+    pc.dualSlot = style.dualSlot;
+    pc.dualScale = style.dualScale;
     vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.size[0] + 15) / 16, (pc.size[1] + 15) / 16, 1);

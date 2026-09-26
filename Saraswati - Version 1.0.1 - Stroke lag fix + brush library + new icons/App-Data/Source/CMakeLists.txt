@@ -123,6 +123,9 @@ add_executable(Saraswati WIN32
   src/backup.cpp
   src/tone.cpp
   src/layer_meta.cpp
+  src/tips.cpp
+  src/brush_import.cpp
+  src/drop_import.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp
@@ -146,6 +149,7 @@ target_compile_definitions(Saraswati PRIVATE
   SARASWATI_VERSION="${PROJECT_VERSION}")
 if(WIN32)
   target_compile_definitions(Saraswati PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(Saraswati PRIVATE urlmon)  # images dropped from a web browser
 endif()
 target_link_libraries(Saraswati PRIVATE SDL3::SDL3-static webpdecoder ${CMAKE_DL_LIBS})
 if(MSVC)

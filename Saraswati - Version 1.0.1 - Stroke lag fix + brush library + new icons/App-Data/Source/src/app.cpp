@@ -143,6 +143,7 @@ void App::strokeBegin(const PenSample& s, bool eraser, bool spline) {
   st.opacity = b.opacity;
   st.eraser = eraser || eraserToggle || b.eraser;
   if (!st.eraser) noteColorUsed();
+  applyBrushTips(b, st, engine);
   R.beginStroke(active, st);
   engine.begin(s, b, strokeSeed++, spline && prefs.smoothStrokes);
   // mouse positions are whole screen pixels (pen positions are sub-pixel via Windows Ink HIMETRIC)
@@ -420,12 +421,11 @@ void App::handleEvent(const SDL_Event& e) {
       if (!ImGui::GetIO().WantCaptureMouse && e.wheel.y != 0)
         zoomAt(e.wheel.mouse_x * density, e.wheel.mouse_y * density, std::pow(double(prefs.wheelZoom), e.wheel.y));
       break;
-    case SDL_EVENT_DROP_FILE:
-      if (e.drop.data) {
-        // dropping onto an existing document imports as a layer; hold Ctrl to open instead
-        if (R.hasDocument() && !ctrlDown) importAsLayer(e.drop.data);
-        else requestAction(PA_OpenPath, e.drop.data);
-      }
+    case SDL_EVENT_DROP_FILE:  // images -> new layer (at the drop point), documents, brushes / brush packs
+      if (e.drop.data) handleDropFile(e.drop.data, e.drop.x, e.drop.y);
+      break;
+    case SDL_EVENT_DROP_TEXT:  // e.g. an image dragged out of a web browser
+      if (e.drop.data) handleDropText(e.drop.data, e.drop.x, e.drop.y);
       break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
@@ -731,7 +731,9 @@ static void drawEye(ImDrawList* dl, ImVec2 c, float r, bool open, ImU32 col) {
 }
 
 void App::drawLayerPanel() {
-  if (!ImGui::Begin("Layers", &showLayers)) { ImGui::End(); return; }
+  if (!ImGui::Begin("Layers", &showLayers)) { layersPanelMin = layersPanelMax = ImVec2(0, 0); ImGui::End(); return; }
+  layersPanelMin = ImGui::GetWindowPos();  // drops onto the panel add a layer
+  layersPanelMax = ImVec2(layersPanelMin.x + ImGui::GetWindowSize().x, layersPanelMin.y + ImGui::GetWindowSize().y);
   if (!R.hasDocument()) { ImGui::TextUnformatted("No document"); ImGui::End(); return; }
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
   R.updateThumbnails(2);
@@ -1512,6 +1514,7 @@ void App::drawUI() {
   drawSelectionBar();
   drawBubbleButtons();
   drawRestoreDialog();
+  drawImportReport();
   drawAdjustDialog();
   if (growPopup) { ImGui::OpenPopup("Grow / shrink selection"); growPopup = false; }
   if (ImGui::BeginPopupModal("Grow / shrink selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1752,17 +1755,19 @@ void App::buildSplineTest() {
 // --brushtest: one stroke with every brush of the library (visual check of the brush engine)
 void App::buildBrushTest() {
   demo.push_back([this] { newDocument(1800, 1300, true); });
-  int n = int(brushes.size());
+  int first = std::clamp(brushTestFrom, 0, int(brushes.size()) - 1);
+  int n = int(brushes.size()) - first;
   int perCol = (n + 1) / 2;
-  for (int i = 0; i < n; ++i) {
-    demo.push_back([this, i, perCol] {
+  for (int k = 0; k < n; ++k) {
+    int i = first + k;
+    demo.push_back([this, i, k, perCol] {
       tipIndex = i;
       BrushSettings& b = brushes[i];
       float sz = std::min(b.size, 44.0f);
       if (b.particles) sz = 60;
       float keep = b.size;
       b.size = sz;
-      double x0 = (i / perCol) * 900 + 60, y = 45 + (i % perCol) * (1300.0 - 60) / perCol;
+      double x0 = (k / perCol) * 900 + 60, y = 45 + (k % perCol) * (1300.0 - 60) / perCol;
       color[0] = 0.08f; color[1] = 0.1f; color[2] = 0.16f;
       if (b.eraser) {  // show erasers on a grey band
         eraserToggle = false;
@@ -1913,6 +1918,15 @@ void App::loadSettings() {
             keys[a][1] = KeyCombo{SDL_Keycode(k2), m2};
           }
     }
+    else if (k == "brushx") {  // "|name|key=value;..."
+      std::string rest = v;
+      while (!rest.empty() && (rest.back() == '\n' || rest.back() == '\r')) rest.pop_back();
+      size_t bar = rest.find('|', 1);
+      if (rest.size() > 1 && rest[0] == '|' && bar != std::string::npos) {
+        std::string name = rest.substr(1, bar - 1);
+        for (auto& b : brushes) if (b.name == name) brushExtraFromString(b, rest.substr(bar + 1));
+      }
+    }
     else if (k == "brushsel") {
       std::string name = v;
       while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
@@ -1937,6 +1951,9 @@ void App::saveSettings() {
             b.spacing, b.hardness, b.roundness, b.angle, b.followStroke ? 1 : 0, b.texStrength, b.texScale, b.scatter,
             b.sizeJitter, b.flowJitter, b.buildUp ? 1 : 0, b.particles, b.particleSize, b.pressureSize ? 1 : 0, b.minSize,
             b.pressureOpacity ? 1 : 0, b.gamma, b.eraser ? 1 : 0, b.group.c_str(), b.name.c_str());
+  for (const BrushSettings& b : brushes)  // imported-brush fields (tips, texture, dynamics)
+    if (!b.tips.empty() || !b.texture.empty() || !b.dualTip.empty() || b.count != 1 || b.angleJitter > 0 || b.taperIn > 0)
+      fprintf(f, "brushx |%s|%s\n", b.name.c_str(), brushExtraToString(b).c_str());
   fprintf(f, "hold %d %d\n", prefs.springTools ? 1 : 0, prefs.holdMs);
   fprintf(f, "backup %d %d %d\n", prefs.backupOn ? 1 : 0, prefs.backupMinutes, prefs.backupKeep);
   fprintf(f, "fps %d\n", prefs.fpsLimit);
@@ -1973,6 +1990,9 @@ void App::showDialog(int kind) {
   } else if (kind == DlgExport) {
     static const SDL_DialogFileFilter f[] = {{"PNG image", "png"}, {"JPEG image", "jpg;jpeg"}};
     SDL_ShowSaveFileDialog(cb, ctx, window, f, 2, (fs::path(folder) / "Untitled.png").string().c_str());
+  } else if (kind == DlgBrushes) {
+    static const SDL_DialogFileFilter f[] = {{"Brushes (Photoshop, Clip Studio, packs)", "abr;sut;zip"}};
+    SDL_ShowOpenFileDialog(cb, ctx, window, f, 1, nullptr, false);
   } else if (kind == DlgOpen) {
     std::string def = folder;
     SDL_ShowOpenFileDialog(cb, ctx, window, kOpenFilters, 3, def.c_str(), false);
@@ -1991,6 +2011,7 @@ void App::processDialogResults() {
     if (kind == 0) { continueAfterSave = false; pendingAction = PA_None; continue; }
     if (kind == DlgOpen) openFile(path);
     else if (kind == DlgImport) importAsLayer(path);
+    else if (kind == DlgBrushes) importBrushFile(path);
     else if (kind == DlgSave) {
       std::string p = path;
       if (!isPsdPath(p)) p += ".psd";
@@ -2029,6 +2050,7 @@ void App::drawFileDialogs() {
   if (ImGui::MenuItem("Open...", sk(Act::Open), false, !busy)) requestAction(PA_OpenDialog);
   if (ImGui::MenuItem("Restore from backup...", nullptr, false, !busy && !userData.empty())) showRestore = true;
   if (ImGui::MenuItem("Import image as layer...", sk(Act::Import), false, !busy && R.hasDocument())) showDialog(DlgImport);
+  if (ImGui::MenuItem("Import brushes (.abr, .sut, .zip)...")) showDialog(DlgBrushes);
   ImGui::Separator();
   if (ImGui::MenuItem("Save", sk(Act::Save), false, !busy && R.hasDocument())) {
     if (documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
@@ -2130,7 +2152,7 @@ void App::openFile(const std::string& path) {
   lastFolder = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).parent_path().string();
 }
 
-void App::importAsLayer(const std::string& path) {
+void App::importAsLayer(const std::string& path, double cx, double cy) {
   if (!R.hasDocument() || R.stroking() || saving) return;
   std::string err;
   std::string name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).stem().string();
@@ -2146,8 +2168,8 @@ void App::importAsLayer(const std::string& path) {
     L.name = name;
     L.w = img.w;
     L.h = img.h;
-    L.x = (int32_t(R.docW) - int32_t(img.w)) / 2;  // centred
-    L.y = (int32_t(R.docH) - int32_t(img.h)) / 2;
+    L.x = cx >= 0 ? int32_t(std::lround(cx - img.w * 0.5)) : (int32_t(R.docW) - int32_t(img.w)) / 2;  // centred (on the drop point)
+    L.y = cy >= 0 ? int32_t(std::lround(cy - img.h * 0.5)) : (int32_t(R.docH) - int32_t(img.h)) / 2;
     L.rgba = std::move(img.rgba);
     layers.push_back(std::move(L));
   }
@@ -2341,6 +2363,7 @@ int App::run() {
     settingsPath = (fs::path(userData) / "settings" / "settings.txt").string();
     fonts.startScan((fs::path(userData) / "settings" / "fontcache.txt").string());
     backupStartup();
+    loadTipLibrary();  // imported brush tips (before the brushes that use them)
     loadSettings();
     applyPrefs();
     if (prefs.perfAtStart) showPerf = true;
@@ -2360,6 +2383,12 @@ int App::run() {
     R.renderFrame(p);
   }
   uint32_t w = opt.docW ? opt.docW : 3000, h = opt.docH ? opt.docH : 2000;
+  for (const std::string& f : opt.brushFiles) {  // test helper: import brushes, then e.g. --brushtest shows them
+    size_t before = brushes.size();
+    importBrushFile(f);
+    brushTestFrom = int(before);
+    for (const std::string& line : importReport) fprintf(stderr, "import: %s\n", line.c_str());
+  }
   if (opt.demo) buildDemo();
   else if (opt.toolTest) { opt.demo = true; buildToolTest(); }
   else if (opt.brushTest) { opt.demo = true; buildBrushTest(); }
@@ -2372,6 +2401,11 @@ int App::run() {
     if (opt.brushPx > 0) brushes[tipIndex].size = opt.brushPx;
     if (!opt.open.empty()) openFile(opt.open);
     for (auto& f : opt.imports) importAsLayer(f);
+    for (auto& f : opt.drops) {  // same path as a real drop, at the canvas centre
+      handleDropFile(f, (canvasX + canvasW * 0.5f) / density, (canvasY + canvasH * 0.5f) / density);
+      for (const std::string& line : importReport) fprintf(stderr, "import: %s\n", line.c_str());
+      importReport.clear();
+    }
   }
 
   bool wantShot = !opt.screenshot.empty();

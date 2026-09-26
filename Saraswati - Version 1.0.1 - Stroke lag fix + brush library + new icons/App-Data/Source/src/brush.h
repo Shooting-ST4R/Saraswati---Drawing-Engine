@@ -30,9 +30,29 @@ struct BrushSettings {
   bool pressureOpacity = false;
   float gamma = 1.0f;       // pressure curve
   bool eraser = false;      // this brush erases
+  // --- imported brushes (Photoshop .abr / Clip Studio .sut) ---
+  std::vector<std::string> tips;  // sampled tip images (tip library names); empty = round tip
+  int tipOrder = 0;               // several tips: 0 in order, 1 random
+  bool flipXJitter = false, flipYJitter = false;
+  float angleJitter = 0;          // 0..1 of a full turn
+  float roundJitter = 0;          // 0..1
+  int count = 1;                  // dabs per step (scattering)
+  bool bothAxes = true;           // scatter in all directions (else across the stroke)
+  std::string texture;            // pattern image (replaces the paper grain); texStrength = depth
+  float patScale = 1;             // pattern scale (1 = one texel per document px)
+  int texMode = 0;                // 0 multiply, 1 subtract, 2 darken, 3 height
+  bool texInvert = false;
+  float texBrightness = 0, texContrast = 0;  // -1..1
+  std::string dualTip;            // dual brush: second tip multiplied in
+  float dualScale = 1;
+  float taperIn = 0;              // px: the stroke starts thin and grows over this length
+  bool pressureFlow = false;
+  std::string notes;              // what the importer could not reproduce
 };
 
 std::vector<BrushSettings> builtInBrushes();
+std::string brushExtraToString(const BrushSettings& b);  // imported-brush fields ("key=value;...")
+void brushExtraFromString(BrushSettings& b, const std::string& s);
 
 struct PenSample { double x, y; float pressure; };
 
@@ -50,6 +70,7 @@ class BrushEngine {
   // real position at that moment), correcting at most the snapping error itself - no lag or
   // drift like a stabiliser.
   void setQuantization(double q) { quant_ = q; }
+  std::vector<int> tipSlots;  // atlas slots of the brush's tips (set before begin)
   bool active() const { return active_; }
   const PenSample& lastSample() const { return pts_.empty() ? last_ : pts_.back(); }
   void end();
@@ -69,5 +90,8 @@ class BrushEngine {
   double toNext_ = 0;
   double dirX_ = 1, dirY_ = 0;
   uint32_t rng_ = 1;
+  double dist_ = 0, emX_ = 0, emY_ = 0;  // stroke length so far (start taper)
+  bool emitted_ = false;
+  uint32_t tipCounter_ = 0;
   bool active_ = false;
 };

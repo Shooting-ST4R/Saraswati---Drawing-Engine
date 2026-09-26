@@ -1,5 +1,6 @@
 // Saraswati — entry point: command line, SDL window, Vulkan, Dear ImGui.
 #include "app.h"
+#include <filesystem>
 
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_vulkan.h>
@@ -140,6 +141,25 @@ static void loadUiFont() {
   ImFontConfig fc;
   fc.FontDataOwnedByAtlas = false;
   ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)kFontUi, int(sizeof kFontUi), 15.0f, &fc);
+  // fallback for names the UI font has no glyphs for (Chinese / Japanese / Korean brush and layer
+  // names): the first installed system CJK font is merged in; glyphs load only when first used
+  static const char* const kFallbacks[] = {
+#ifdef _WIN32
+      "C:\\Windows\\Fonts\\YuGothM.ttc", "C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\meiryo.ttc",
+      "C:\\Windows\\Fonts\\msgothic.ttc", "C:\\Windows\\Fonts\\malgun.ttf",
+#else
+      "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+      "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+      "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+#endif
+  };
+  for (const char* f : kFallbacks) {
+    std::error_code ec;
+    if (!std::filesystem::exists(f, ec)) continue;
+    ImFontConfig mc;
+    mc.MergeMode = true;
+    if (ImGui::GetIO().Fonts->AddFontFromFileTTF(f, 15.0f, &mc)) break;
+  }
 }
 
 static bool parseSize(const char* s, uint32_t& w, uint32_t& h) {
@@ -185,6 +205,8 @@ int main(int argc, char** argv) {
     else if (a == "--open") opt.open = next();
     else if (a == "--save") opt.save = next();
     else if (a == "--import") opt.imports.push_back(next());
+    else if (a == "--brushes") opt.brushFiles.push_back(next());
+    else if (a == "--drop") opt.drops.push_back(next());
     else if (a == "--screenshot") opt.screenshot = next();
     else if (a == "--frames") opt.frames = atoi(next());
     else if (a == "--window") {

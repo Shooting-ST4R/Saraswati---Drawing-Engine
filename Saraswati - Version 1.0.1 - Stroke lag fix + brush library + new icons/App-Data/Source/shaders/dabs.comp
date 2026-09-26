@@ -15,7 +15,47 @@ layout(push_constant) uniform DabPC {
   float hardness;     // 1 = crisp anti-aliased edge; lower = soft falloff from hardness * r to r
   float texStrength;  // paper grain strength (any brush)
   float texScale;     // grain size in document px
+  int texSlot;        // pattern texture (imported brushes), -1 = the procedural grain
+  int texMode;        // 0 multiply, 1 subtract, 2 darken, 3 height
+  float patScale;     // pattern texels per document px
+  float texBrightness, texContrast;  // -1..1
+  int texInvert;
+  int dualSlot;       // dual brush tip, -1 = none
+  float dualScale;    // dual tip size relative to the main tip
 } pc;
+
+// Brush tip / pattern atlas and the tips' rects (stored after the 2048 layer-effect records)
+layout(set = 0, binding = 7, r8) readonly uniform image2D tipAtlas;
+layout(std430, set = 0, binding = 6) readonly buffer TipRects { vec4 tipData[]; };
+const int TIP_RECT_BASE = 2048 * 96 / 16;
+
+float atlasTexel(ivec2 p) { return imageLoad(tipAtlas, p).r; }
+
+// bilinear sample of a tip at uv (0..1 over the tip), 0 outside
+float sampleTip(int slot, vec2 uv) {
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
+  vec4 r = tipData[TIP_RECT_BASE + slot];
+  vec2 t = r.xy + uv * r.zw - 0.5;
+  ivec2 i = ivec2(floor(t));
+  vec2 f = t - vec2(i);
+  ivec2 lo = ivec2(r.xy), hi = ivec2(r.xy + r.zw) - 1;
+  float a = mix(atlasTexel(clamp(i, lo, hi)), atlasTexel(clamp(i + ivec2(1, 0), lo, hi)), f.x);
+  float b = mix(atlasTexel(clamp(i + ivec2(0, 1), lo, hi)), atlasTexel(clamp(i + ivec2(1, 1), lo, hi)), f.x);
+  return mix(a, b, f.y);
+}
+
+// tiled pattern (canvas space), bilinear with wrap-around
+float samplePattern(int slot, vec2 p) {
+  vec4 r = tipData[TIP_RECT_BASE + slot];
+  vec2 t = p - 0.5;
+  ivec2 i = ivec2(floor(t));
+  vec2 f = t - vec2(i);
+  ivec2 sz = ivec2(r.zw);
+  ivec2 o = ivec2(r.xy);
+  float a = mix(atlasTexel(o + (i % sz + sz) % sz), atlasTexel(o + ((i + ivec2(1, 0)) % sz + sz) % sz), f.x);
+  float b = mix(atlasTexel(o + ((i + ivec2(0, 1)) % sz + sz) % sz), atlasTexel(o + ((i + ivec2(1, 1)) % sz + sz) % sz), f.x);
+  return mix(a, b, f.y);
+}
 
 uint hashu(ivec2 p) {
   uint h = uint(p.x) * 0x8da6b343u ^ uint(p.y) * 0xd8163841u;
@@ -47,20 +87,53 @@ void main() {
   vec2 p = vec2(px) + 0.5;
   float m = imageLoad(maskImg, px).r;
   float texMul = 1.0;
-  if (pc.texStrength > 0.0) texMul = mix(1.0, grain(p), pc.texStrength);
+  float pat = 1.0;
+  if (pc.texSlot >= 0) {  // imported pattern texture
+    pat = samplePattern(pc.texSlot, p * pc.patScale);
+    pat = clamp((pat - 0.5) * (1.0 + pc.texContrast) + 0.5 + pc.texBrightness, 0.0, 1.0);
+    if (pc.texInvert != 0) pat = 1.0 - pat;
+  } else if (pc.texStrength > 0.0) {
+    texMul = mix(1.0, grain(p), pc.texStrength);
+  }
   bool buildUp = (pc.flags & 1) != 0;
   for (int i = 0; i < pc.count; ++i) {
     Dab d = dabs[pc.first + i];
     vec2 v = p - d.pos;
+    // bitmap tips can be wider than the radius along one axis only when not square: the bbox
+    // covers radius + 1, and the tip is scaled to fit inside it
     if (dot(v, v) >= (d.radius + 1.0) * (d.radius + 1.0)) continue;
     // elliptical tip: rotate into the tip frame and stretch the minor axis
     v = vec2(d.cosA * v.x + d.sinA * v.y, (-d.sinA * v.x + d.cosA * v.y) * d.invRound);
-    float dist = length(v);
-    float aa = clamp(d.radius - dist + 0.5, 0.0, 1.0);  // crisp, anti-aliased edge
-    float cov = aa;
-    if (pc.hardness < 0.999) {
-      float inner = pc.hardness * d.radius;
-      cov = min(aa, 1.0 - smoothstep(inner, d.radius + 1e-3, dist));
+    float cov;
+    if (d.pad >= 0.0) {  // sampled tip from the atlas
+      int slot = int(floor(d.pad));
+      float fl = fract(d.pad);
+      vec4 r = tipData[TIP_RECT_BASE + slot];
+      vec2 u = v / max(d.radius * 0.70710678, 1e-3);     // -1..1 across the tip's longer side (radius = half diagonal)
+      if (fl >= 0.2 && fl < 0.3 || fl >= 0.7) u.x = -u.x;  // flip X (+0.25)
+      if (fl >= 0.45) u.y = -u.y;                         // flip Y (+0.5)
+      u *= max(r.z, r.w) / r.zw;
+      cov = sampleTip(slot, u * 0.5 + 0.5);
+    } else {
+      float dist = length(v);
+      float aa = clamp(d.radius - dist + 0.5, 0.0, 1.0);  // crisp, anti-aliased edge
+      cov = aa;
+      if (pc.hardness < 0.999) {
+        float inner = pc.hardness * d.radius;
+        cov = min(aa, 1.0 - smoothstep(inner, d.radius + 1e-3, dist));
+      }
+    }
+    if (pc.dualSlot >= 0) {  // dual brush: a second tip multiplied in
+      vec2 u2 = (p - d.pos) / max(d.radius * pc.dualScale, 1e-3);
+      vec4 r2 = tipData[TIP_RECT_BASE + pc.dualSlot];
+      u2 *= max(r2.z, r2.w) / r2.zw;
+      cov *= sampleTip(pc.dualSlot, u2 * 0.5 + 0.5);
+    }
+    if (pc.texSlot >= 0) {
+      if (pc.texMode == 1) cov = max(0.0, cov - (1.0 - pat) * pc.texStrength);
+      else if (pc.texMode == 2) cov = min(cov, mix(1.0, pat, pc.texStrength));
+      else if (pc.texMode == 3) cov = clamp(cov * 2.0 - (1.0 - pat) * 2.0 * pc.texStrength, 0.0, 1.0);
+      else cov *= mix(1.0, pat, pc.texStrength);
     }
     float a = cov * texMul * d.alpha;
     if (buildUp) m = m + a * (1.0 - m);  // airbrush: builds up inside the stroke

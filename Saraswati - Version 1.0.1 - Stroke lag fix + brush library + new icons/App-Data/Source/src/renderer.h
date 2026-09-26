@@ -110,6 +110,12 @@ struct StrokeStyle {
   bool eraser = false;
   bool overlay = false;  // preview highlight only (magic wand): never clipped by selection / lock
   bool ignoreSelection = false;  // commit everywhere the mask says (e.g. "clear outside the selection")
+  // imported brushes: pattern texture and dual tip (tip-atlas slots, -1 = none)
+  int texSlot = -1, texMode = 0;
+  bool texInvert = false;
+  float patScale = 1, texBrightness = 0, texContrast = 0;
+  int dualSlot = -1;
+  float dualScale = 1;
 };
 
 struct RendererOptions {
@@ -434,7 +440,18 @@ class Renderer {
   uint32_t fxCapacity = 0;
   void writeFxBinding(VkDescriptorSet set);
   void updateFx();
-  float compositeOpacity(const Layer& l) const;  // tone "reflect layer opacity" uses the opacity for the dots instead
+  float compositeOpacity(const Layer& l) const;
+ public:
+  // Brush tip / pattern atlas (imported brushes): an R8 image with the tips packed in; the dab
+  // shader samples it (Dab.pad = slot index, + 0.25 flip X, + 0.5 flip Y).
+  int tipAdd(uint32_t w, uint32_t h, const uint8_t* alpha, std::string& err);  // -> slot, or -1
+  static constexpr uint32_t kTipAtlas = 8192, kMaxTips = 4096;
+ private:
+  GpuImage tipAtlas;
+  struct TipRect { uint32_t x, y, w, h; };
+  std::vector<TipRect> tipRects;
+  uint32_t shelfX = 0, shelfY = 0, shelfH = 0;
+  void writeTipBinding(VkDescriptorSet set);  // tone "reflect layer opacity" uses the opacity for the dots instead
 
   SDL_Window* window = nullptr;
   VkSurfaceKHR surface = VK_NULL_HANDLE;

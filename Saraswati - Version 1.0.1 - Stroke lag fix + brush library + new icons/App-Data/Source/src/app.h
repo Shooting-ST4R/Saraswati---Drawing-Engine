@@ -36,6 +36,8 @@ struct Options {
   bool splineTest = false;
   std::string open;             // file to open at startup
   std::vector<std::string> imports;  // import as layers at startup (test helper)
+  std::vector<std::string> brushFiles;  // brushes to import at startup (--brushes)
+  std::vector<std::string> drops;       // files dropped onto the canvas centre at startup (--drop, tests drag and drop)
   std::string save;             // save as PSD when the demo / startup is done (test helper)
   int windowW = 1600, windowH = 1000;
   bool windowSet = false;
@@ -43,6 +45,13 @@ struct Options {
 
 enum class ToolId : int {
   Brush, Eyedropper, Fill, Gradient, Line, Rect, Ellipse, SelRect, SelEllipse, Lasso, Wand, Transform, Hand, Text, Count
+};
+
+struct TipImageData {  // an imported brush tip / pattern (alpha, 255 = paint)
+  uint32_t w = 0, h = 0;
+  std::vector<uint8_t> a;
+  int slot = -1;  // GPU atlas slot once uploaded
+  bool failed = false;
 };
 
 void applyUiScale(float scale);  // main.cpp
@@ -94,7 +103,16 @@ class App {
   void tickDemo();
   // files
   void openFile(const std::string& path);
-  void importAsLayer(const std::string& path);
+  void importAsLayer(const std::string& path, double cx = -1, double cy = -1);  // cx/cy: centre (document px)
+  // brush import and drag & drop (drop_import.cpp)
+  void importBrushFile(const std::string& path);
+  void drawImportReport();
+  std::vector<std::string> importReport;
+  bool showImportReport = false;
+  void handleDropFile(const std::string& path, float x, float y);
+  void handleDropText(const std::string& text, float x, float y);
+  bool dropIsOverLayers(float x, float y) const;
+  ImVec2 layersPanelMin{0, 0}, layersPanelMax{0, 0};
   void saveFile(const std::string& path);
 
   SDL_Window* window;
@@ -394,6 +412,14 @@ class App {
   void updateBubblePreview();
   void drawBubbleSettings();
   void drawBubbleButtons();
+  // brush tip library (tips.cpp)
+  using TipImage = TipImageData;
+  std::map<std::string, TipImage> tipLib;
+  void loadTipLibrary();
+  std::string addTipImage(const std::string& base, uint32_t w, uint32_t h, std::vector<uint8_t> alpha);
+  int tipSlot(const std::string& name);
+  const TipImage* tipImage(const std::string& name) const;
+  void applyBrushTips(const BrushSettings& b, StrokeStyle& st, BrushEngine& e);
   // automatic backups (backup.cpp)
   struct BackupInfo { std::string path, document, when; uint64_t bytes = 0; };
   struct BackupLayer {
@@ -432,6 +458,7 @@ class App {
   std::string pendingSavePath, pathBeforeSave;
   uint64_t lastPresentNs = 0;
   size_t backupTestLayers = 0;
+  int brushTestFrom = 0;
   std::atomic<bool> saveVerifying{false};
   // sublayers (e.g. a bubble under its text): always directly below their parent, move with it
   bool isSublayer(const Layer& l) const { return l.parentId && R.indexOf(l.parentId) >= 0; }
@@ -501,7 +528,7 @@ class App {
   std::string userData;
   std::string documentPath;
   // pending results from SDL's async file dialogs (callbacks may run on another thread)
-  enum DialogKind { DlgOpen = 1, DlgImport = 2, DlgSave = 3, DlgExport = 4 };
+  enum DialogKind { DlgOpen = 1, DlgImport = 2, DlgSave = 3, DlgExport = 4, DlgBrushes = 5 };
   std::mutex dialogMutex;
   std::vector<std::pair<int, std::string>> dialogResults;
   void showDialog(int kind);

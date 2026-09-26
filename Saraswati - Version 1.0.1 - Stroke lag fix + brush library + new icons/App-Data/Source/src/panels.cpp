@@ -192,7 +192,8 @@ static float grainAt(float x, float y, float scale) {
   return t * t * (3 - 2 * t);
 }
 
-static void renderStrokePreview(const BrushSettings& src, int W, int H, uint8_t* rgba, int stride, float grey) {
+static void renderStrokePreview(const BrushSettings& src, int W, int H, uint8_t* rgba, int stride, float grey,
+                                const std::vector<const TipImageData*>& tips, const TipImageData* pattern) {
   BrushSettings b = src;
   float d = H * 0.42f;  // every preview uses the same stroke width
   float k = d / std::max(1.0f, src.size);
@@ -200,6 +201,7 @@ static void renderStrokePreview(const BrushSettings& src, int W, int H, uint8_t*
   b.particleSize = std::max(0.6f, src.particleSize * k);
   b.texScale = std::max(1.0f, src.texScale * std::min(1.0f, k * 4));
   BrushEngine e;
+  for (size_t i = 0; i < tips.size(); ++i) e.tipSlots.push_back(int(i));  // index into `tips` here
   const int N = 48;
   float pad = d * 0.7f;
   auto sample = [&](int i) {
@@ -224,12 +226,31 @@ static void renderStrokePreview(const BrushSettings& src, int W, int H, uint8_t*
         float rx = dab.cosA * vx + dab.sinA * vy, ry = (-dab.sinA * vx + dab.cosA * vy) * dab.invRound;
         float dist = std::sqrt(rx * rx + ry * ry);
         float cov = std::clamp(dab.radius - dist + 0.5f, 0.0f, 1.0f);
-        if (b.hardness < 0.999f) {
+        if (dab.pad >= 0 && size_t(dab.pad) < tips.size() && tips[size_t(dab.pad)]) {  // sampled tip (nearest texel)
+          const TipImageData& t = *tips[size_t(dab.pad)];
+          float fl = dab.pad - std::floor(dab.pad);
+          float ux = rx / (dab.radius * 0.70710678f), uy = ry / (dab.radius * 0.70710678f);
+          if ((fl >= 0.2f && fl < 0.3f) || fl >= 0.7f) ux = -ux;
+          if (fl >= 0.45f) uy = -uy;
+          float m = float(std::max(t.w, t.h));
+          ux *= m / t.w;
+          uy *= m / t.h;
+          int tx = int((ux * 0.5f + 0.5f) * t.w), ty = int((uy * 0.5f + 0.5f) * t.h);
+          cov = (tx >= 0 && ty >= 0 && tx < int(t.w) && ty < int(t.h)) ? t.a[size_t(ty) * t.w + size_t(tx)] / 255.0f : 0.0f;
+        } else if (b.hardness < 0.999f) {
           float inner = b.hardness * dab.radius;
           float t = std::clamp((dist - inner) / std::max(1e-3f, dab.radius + 1e-3f - inner), 0.0f, 1.0f);
           cov = std::min(cov, 1.0f - t * t * (3 - 2 * t));
         }
-        float tex = b.texStrength > 0 ? 1.0f + (grainAt(x + 0.5f, y + 0.5f, b.texScale) - 1.0f) * b.texStrength : 1.0f;
+        float tex = 1.0f;
+        if (pattern && pattern->w && pattern->h) {
+          int px2 = int((x + 0.5f) / std::max(0.05f, b.patScale)) % int(pattern->w), py2 = int((y + 0.5f) / std::max(0.05f, b.patScale)) % int(pattern->h);
+          float pv = pattern->a[size_t(py2) * pattern->w + size_t(px2)] / 255.0f;
+          if (b.texInvert) pv = 1 - pv;
+          tex = 1.0f + (pv - 1.0f) * b.texStrength;
+        } else if (b.texStrength > 0) {
+          tex = 1.0f + (grainAt(x + 0.5f, y + 0.5f, b.texScale) - 1.0f) * b.texStrength;
+        }
         float a = cov * tex * dab.alpha;
         float& v = m[size_t(y) * W + x];
         v = b.buildUp ? v + a * (1 - v) : std::max(v, a);
@@ -255,15 +276,19 @@ void App::updateBrushPreviews() {
              b.spacing, b.hardness, b.roundness, b.angle, int(b.followStroke), b.texStrength, b.texScale, b.scatter,
              b.sizeJitter, b.flowJitter, int(b.buildUp), b.particles, b.particleSize, int(b.pressureSize), b.minSize,
              int(b.pressureOpacity), b.gamma);
-    key += buf;
+    key += buf + brushExtraToString(b);
   }
   if (key == previewKey && previewAtlas.imguiTex) return;
   uint64_t now = SDL_GetTicksNS();
   if (previewAtlas.imguiTex && now - previewBuiltNs < 250000000ull) return;  // a slider is moving: at most 4 per second
   if (engine.active() || R.busy()) return;
   std::vector<uint8_t> px(size_t(W) * H * 4 * brushes.size(), 0);
-  for (size_t i = 0; i < brushes.size(); ++i)
-    renderStrokePreview(brushes[i], W, H, px.data() + i * size_t(W) * H * 4, W * 4, 0.88f);
+  for (size_t i = 0; i < brushes.size(); ++i) {
+    std::vector<const TipImage*> tips;
+    for (const std::string& n : brushes[i].tips) if (const TipImage* t = tipImage(n)) tips.push_back(t);
+    renderStrokePreview(brushes[i], W, H, px.data() + i * size_t(W) * H * 4, W * 4, 0.88f, tips,
+                        brushes[i].texture.empty() ? nullptr : tipImage(brushes[i].texture));
+  }
   R.destroyFloating(previewAtlas);
   std::string err;
   if (!R.createFloating(uint32_t(W), uint32_t(H * brushes.size()), px.data(), previewAtlas, err)) return;
@@ -387,6 +412,8 @@ void App::drawToolGroup() {
   }
   ImGui::EndChild();
   drawBrushLibraryButtons();
+  if (ImGui::Button("Import brushes...", ImVec2(-FLT_MIN, 0))) showDialog(DlgBrushes);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Photoshop (.abr), Clip Studio Paint (.sut) or a .zip pack\n- or drop the files onto the window");
   ImGui::End();
 }
 

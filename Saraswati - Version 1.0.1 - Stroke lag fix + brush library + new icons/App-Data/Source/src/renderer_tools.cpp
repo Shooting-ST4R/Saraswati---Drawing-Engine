@@ -617,7 +617,53 @@ void Renderer::abortStroke() {
 // ---------------------------------------------------------------------------
 // Per-layer effects
 
+void Renderer::writeTipBinding(VkDescriptorSet set) {
+  if (!tipAtlas.view || !set) return;
+  VkDescriptorImageInfo ii{VK_NULL_HANDLE, tipAtlas.view, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set;
+  w.dstBinding = 7;
+  w.descriptorCount = 1;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  w.pImageInfo = &ii;
+  vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+}
+
+// Packs a tip / pattern into the atlas (shelf packing, 2 px gaps) and uploads it.
+int Renderer::tipAdd(uint32_t w, uint32_t h, const uint8_t* alpha, std::string& err) {
+  if (!w || !h || w > kTipAtlas || h > kTipAtlas) { err = "tip size"; return -1; }
+  if (tipRects.size() >= kMaxTips) { err = "Too many brush tips (" + std::to_string(kMaxTips) + ")"; return -1; }
+  if (shelfX + w > kTipAtlas) { shelfX = 0; shelfY += shelfH + 2; shelfH = 0; }
+  if (shelfY + h > kTipAtlas) { err = "The brush tip atlas is full"; return -1; }
+  TipRect r{shelfX, shelfY, w, h};
+  shelfX += w + 2;
+  shelfH = std::max(shelfH, h);
+  // upload through a staging buffer (only when brushes are imported / loaded)
+  GpuBuffer stage;
+  if (createBuffer(device, memProps, VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stage, true) != VK_SUCCESS) {
+    err = "out of memory";
+    return -1;
+  }
+  memcpy(stage.mapped, alpha, size_t(w) * h);
+  VkCommandBuffer cmd = beginOneShot();
+  VkBufferImageCopy c{};
+  c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  c.imageOffset = {int32_t(r.x), int32_t(r.y), 0};
+  c.imageExtent = {w, h, 1};
+  vkCmdCopyBufferToImage(cmd, stage.buffer, tipAtlas.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+  memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, kCS, VK_ACCESS_SHADER_READ_BIT);
+  endOneShot(cmd);
+  destroyBuffer(device, stage);
+  int slot = int(tipRects.size());
+  tipRects.push_back(r);
+  float* rect = reinterpret_cast<float*>(static_cast<uint8_t*>(fxBuf.mapped) + size_t(fxCapacity) * 96 + size_t(slot) * 16);
+  rect[0] = float(r.x); rect[1] = float(r.y); rect[2] = float(r.w); rect[3] = float(r.h);
+  return slot;
+}
+
 void Renderer::writeFxBinding(VkDescriptorSet set) {
+  writeTipBinding(set);
   if (!fxBuf.buffer || !set) return;
   VkDescriptorBufferInfo bi{fxBuf.buffer, 0, VK_WHOLE_SIZE};
   VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};

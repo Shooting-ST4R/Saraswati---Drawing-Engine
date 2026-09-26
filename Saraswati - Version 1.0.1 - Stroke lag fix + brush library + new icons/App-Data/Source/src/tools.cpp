@@ -145,6 +145,8 @@ StrokeStyle App::currentStyle(bool eraser) {
   st.color[0] = color[0]; st.color[1] = color[1]; st.color[2] = color[2];
   st.opacity = b.opacity;
   st.eraser = eraser;
+  BrushEngine tipsOnly;  // pattern texture / dual tip of imported brushes
+  applyBrushTips(b, st, tipsOnly);
   return st;
 }
 
@@ -652,6 +654,8 @@ void App::updateShapePreview() {
       R.previewClear();
       size_t n = poly.size() / 2;
       BrushEngine e;
+      StrokeStyle unused;
+      applyBrushTips(brushes[tipIndex], unused, e);
       e.begin({poly[0], poly[1], 1.0f}, brushes[tipIndex], previewSeed, false);
       size_t steps = tool == ToolId::Line ? 1 : n;
       for (size_t i = 1; i <= steps; ++i) e.add({poly[2 * (i % n)], poly[2 * (i % n) + 1], 1.0f});
