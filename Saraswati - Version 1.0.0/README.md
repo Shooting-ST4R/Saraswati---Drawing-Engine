@@ -140,3 +140,17 @@ a 24 GB card holds about 4–5 layers at that size — the app tells you the exa
   encoding and disk writes run on a worker thread. Fill / magic wand / transform read the layer
   back only the painted area and flood on a worker thread (the UI stays responsive; the status bar
   shows *Working…*).
+
+## Known issues (to fix before 1.0 final)
+
+- *Fill / magic wand with "Refer to all visible layers"* on huge documents flattens the whole
+  painted area in one GPU submission; on a 30k × 30k document this may briefly hitch the display
+  (the UI thread itself never waits). Planned: split it into a few tiles per frame.
+- The vertical size / opacity sliders on the tool strip are small at 720p (use the Tool Settings
+  sliders or `[` `]` for precise values).
+- Barrel buttons: Wacom's driver must leave the buttons on their *default* pen functions (not
+  "right click") for pan / eyedropper to work.
+- A fill or wand result is dropped (with a message) if anything changes while it is computed —
+  just click again.
+- Not yet verified on real hardware: MSVC build, Windows Ink pressure feel on the Cintiq,
+  performance on the RTX 3090 (run the benchmark above).
