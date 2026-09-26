@@ -16,7 +16,7 @@ void App::showToast(const std::string& msg) {
 // an internal paste at the same position, and offers them to other apps as PNG.
 
 void App::copySelection(bool cut, bool pasteAfter) {
-  if (!R.hasDocument() || R.busy() || clipping || xf.active) return;
+  if (!R.hasDocument() || R.busy() || clipping || xf.active || !needPixelLayer()) return;
   if (hoverPreviewOn || previewing) cancelPreviews();
   const Layer& L = R.layers[active];
   int x0 = L.bx0, y0 = L.by0, x1 = L.bx1, y1 = L.by1;
@@ -131,7 +131,7 @@ void App::pasteClipboard(bool internalOnly) {
 // Clear outside the selection: one undo step, erases where the selection is not.
 
 void App::clearOutsideSelection() {
-  if (!selActive || !R.hasDocument() || R.busy() || xf.active) return;
+  if (!selActive || !R.hasDocument() || R.busy() || xf.active || !needPixelLayer()) return;
   if (hoverPreviewOn || previewing) cancelPreviews();
   const Layer& L = R.layers[active];
   if (L.bx0 >= L.bx1) return;
@@ -155,7 +155,7 @@ void App::clearOutsideSelection() {
 enum { ADJ_BC = 1, ADJ_HSL = 2, ADJ_INVERT = 3, ADJ_POSTER = 4, ADJ_THRESH = 5, ADJ_B2A = 6, ADJ_TOCOLOR = 7 };
 
 void App::openAdjust(int type) {
-  if (!R.hasDocument() || R.busy() || R.stroking()) return;
+  if (!R.hasDocument() || R.busy() || R.stroking() || !needPixelLayer()) return;
   if (hoverPreviewOn || previewing) cancelPreviews();
   if (xf.active) applyTransform();
   const Layer& L = R.layers[active];
@@ -250,7 +250,7 @@ void App::drawAdjustDialog() {
 // Layer flip / rotate: through the transform (lifts the pixels, moves the corners, applies).
 
 void App::transformLayer(int kind) {
-  if (!R.hasDocument()) return;
+  if (!R.hasDocument() || (!xf.active && !needPixelLayer())) return;
   bool wasActive = xf.active;
   if (!wasActive) {
     if (hoverPreviewOn || previewing) cancelPreviews();

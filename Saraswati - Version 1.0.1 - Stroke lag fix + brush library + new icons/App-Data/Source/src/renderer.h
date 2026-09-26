@@ -64,6 +64,12 @@ struct Layer {
   bool lockAlpha = false;  // paint only where the layer already has pixels
   ToneFx tone;
   LayerColorFx lcolor;
+  // folders: an entry without pixels; its children are the layers with folderId == its id,
+  // stored directly below it. "Through" folders just group; other modes composite the children
+  // on their own first, then blend the result with the folder's mode and opacity.
+  bool folder = false, expanded = true, passThrough = true;
+  bool clip = false;  // clipped to the layer / folder below (shown only where it has pixels)
+  uint32_t folderId = 0;
   uint32_t parentId = 0;   // sublayer of this layer (e.g. a speech bubble under its text); moves with it
   // conservative bounds of painted pixels (empty when x0 >= x1)
   int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
@@ -83,6 +89,8 @@ struct LayerProps {
   bool lockAlpha = false;
   ToneFx tone;
   LayerColorFx lcolor;
+  bool passThrough = true, expanded = true;
+  bool clip = false;
 };
 
 struct View {
@@ -176,7 +184,8 @@ class Renderer {
   void deleteLayer(int index);
   void moveLayer(int index, int delta) { moveLayerTo(index, index + delta); }
   void moveLayerTo(int from, int to);  // one undo step
-  void reorderLayers(const std::vector<uint32_t>& idsBottomToTop);  // one undo step
+  // one undo step; folderIds (optional, same order) moves layers into / out of folders
+  void reorderLayers(const std::vector<uint32_t>& idsBottomToTop, const std::vector<uint32_t>& folderIds = {});
   int indexOf(uint32_t id) const { return findLayer(id); }
   void closeDocument() { destroyDocument(); runDeferred(true); }
   void recordLayerProps(int index);  // call before changing name/visibility/opacity/mode/lock (undo step)
@@ -257,7 +266,8 @@ class Renderer {
   // ---- state readable by the app ----
   std::vector<Layer> layers;
   uint32_t docW = 0, docH = 0;
-  bool whitePaper = true;
+  bool whitePaper = true;               // the paper is shown (else transparent)
+  float paperColor[3] = {1, 1, 1};     // paper colour (one value for the whole canvas, no pixels)
   float docDpi = 350;  // document resolution (tone frequency is in lines per inch)
   LayerLimit limit;
   std::string deviceName, driverInfo;
@@ -299,6 +309,7 @@ class Renderer {
     size_t bytes = 0;
     LayerProps props;             // Props
     std::vector<uint32_t> order;  // Order: layer ids bottom to top
+    std::vector<uint32_t> folders;  // Order: folder of each of those layers
     Layer held;                   // Deleted: the layer, kept alive for undo
     int index = 0;                // Deleted: where it was
     uint64_t revBefore = 0, revAfter = 0;
@@ -314,6 +325,8 @@ class Renderer {
   VkDescriptorSet navSet0 = VK_NULL_HANDLE, navTexSet = VK_NULL_HANDLE;
   uint64_t navKey = 0, lastNavNs = 0;
  public:
+  int addFolder(int index, std::string& err, bool undoable = true);
+  void eraseLayerNoUndo(int index);  // while building a document (open / restore)
   bool navWanted = false;  // set by the UI while the Navigator is visible
   VkDescriptorSet navTexture() const { return navTexSet; }
   uint32_t navW() const { return navImg.width; }
@@ -360,6 +373,37 @@ class Renderer {
   void readTimestamps(FrameSlot& s);
   void recordThumbnails(VkCommandBuffer cmd);
   void recordNavigator(VkCommandBuffer cmd);
+  // folders / isolated compositing (renderer_groups.cpp)
+  struct CompItem {
+    int layer = -1;          // layer index (for a folder: the folder entry)
+    bool group = false;      // folder composited on its own
+    bool hidden = false;
+    float opMul = 1;         // opacity of enclosing "Through" folders
+    bool clipGroup = false;  // base + clipped items: composited on their own, blended with the base's mode
+    bool clipped = false;    // drawn "atop" what is below it in the group (keeps its alpha)
+    bool asBase = false;     // the base inside a clip group: Normal, full opacity (the group applies them)
+    std::vector<CompItem> kids;
+  };
+  struct CompTarget { VkDescriptorSet set; VkImageView view; int flags; };
+  std::vector<CompItem> buildItems() const;
+  static bool itemContains(const CompItem& it, int layer);
+  void compositeItems(VkCommandBuffer cmd, const std::vector<CompItem>& items, size_t from, size_t to, const CompTarget& t,
+                      const View& v, VkExtent2D ext, int depth, bool offscreen, bool live);
+  static constexpr int kMaxGroupDepth = 6;
+  struct GroupStack { GpuImage img[kMaxGroupDepth]; VkDescriptorSet set[kMaxGroupDepth] = {}; uint32_t w = 0, h = 0; };
+  GroupStack gScreen, gOff;
+  std::vector<std::pair<std::pair<VkImageView, VkImageView>, VkDescriptorSet>> blendSets;
+  bool ensureGroupImage(GroupStack& g, int depth, uint32_t w, uint32_t h, VkCommandBuffer cmd);
+  VkDescriptorSet blendSet(VkImageView target, VkImageView src);
+  void refreshGroupSets();
+  void writeGroupSet(GroupStack& g, int depth);
+  void destroyGroups();
+  VkDescriptorSet anyLayerSet() const;
+  int liveFlags(const Layer& l) const;  // stroke / lock / adjust flags of the active layer
+  VkPipeline cacheStrokePipe = VK_NULL_HANDLE;
+  bool activeInGroup = false;
+  std::vector<CompItem> compItems;
+  size_t activeTop = 0;
  public:
   // Colour adjustment: previewed live on the active layer while adjType != 0 (screen pixels only),
   // applied to the layer with applyAdjust (one undo step).

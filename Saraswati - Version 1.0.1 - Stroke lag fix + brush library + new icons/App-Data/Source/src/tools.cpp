@@ -250,7 +250,7 @@ void App::invertSelection() {
 
 // Edit > Fill (colour) or Delete (erase) inside the selection, or the whole layer without one.
 void App::fillSelection(bool erase) {
-  if (!R.hasDocument() || R.busy()) return;
+  if (!R.hasDocument() || R.busy() || !needPixelLayer()) return;
   int x0 = 0, y0 = 0, x1 = int(R.docW), y1 = int(R.docH);
   if (selActive) { x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1; }
   std::vector<uint8_t> cov(size_t(x1 - x0) * (y1 - y0), 255);  // the commit clips to the selection
@@ -277,7 +277,10 @@ void App::startFlood(double dx, double dy, bool isFill, bool hover) {
   if (all) { for (auto& l : R.layers) if (l.visible) grow(l); }
   else grow(R.layers[active]);
   uint8_t outside[4] = {0, 0, 0, 0};
-  if (all && R.whitePaper) outside[0] = outside[1] = outside[2] = outside[3] = 255;
+  if (all && R.whitePaper) {
+    for (int k = 0; k < 3; ++k) outside[k] = uint8_t(std::clamp(R.paperColor[k], 0.0f, 1.0f) * 255 + 0.5f);
+    outside[3] = 255;
+  }
   // GPU copies the painted area into host memory; the worker waits for it (the UI never does)
   // the read-back is cached while the picture does not change (hovering re-floods instantly)
   std::shared_ptr<AsyncRead> rd;
@@ -420,6 +423,7 @@ void App::pollFlood() {
 
 void App::startTransform() {
   if (xf.active || !R.hasDocument() || R.busy()) return;
+  if (!needPixelLayer()) { tool = ToolId::Brush; return; }
   int W = int(R.docW), H = int(R.docH);
   std::string err;
   int x0, y0, x1, y1;
@@ -1367,6 +1371,44 @@ void App::buildToolTest() {
     const Layer& b = R.layers[size_t(active - 1)];
     fprintf(stderr, "bubbletest: '%s' over '%s' (sublayer %s)\n", t.name.c_str(), b.name.c_str(), b.parentId == t.id ? "yes" : "NO");
   });
+  // folders: a Multiply folder (its contents are blended on their own, then multiplied)
+  demo.push_back([this] {
+    commitText();
+    std::string err;
+    int fi = R.addFolder(int(R.layers.size()), err);
+    Layer& f = R.layers[size_t(fi)];
+    f.name = "Multiply folder";
+    f.passThrough = false;
+    f.mode = BlendMode::Multiply;
+    uint32_t fid = f.id;
+    for (int i = 0; i < int(R.layers.size()); ++i)
+      if (R.layers[size_t(i)].name == "Layer 2") { active = i; dropLayerBlock(i, R.indexOf(fid)); break; }
+    std::string st;
+    for (const Layer& l : R.layers) st += (l.folder ? "[" : "") + l.name + (l.folder ? "]" : "") + (l.folderId ? "<in" : "") + ", ";
+    fprintf(stderr, "foldertest: %s\n", st.c_str());
+    R.markCachesDirty();
+  });
+  demo.push_back([] {});
+  // clipping: magenta stripes clipped to the green rectangle; a warm paper colour
+  demo.push_back([this] {
+    int base = -1;
+    for (int i = 0; i < int(R.layers.size()); ++i) if (R.layers[size_t(i)].name == "Layer 1 copy") base = i;
+    if (base < 0) return;
+    std::string err;
+    int ci = R.addLayer(base + 1, err);
+    R.layers[size_t(ci)].name = "Clipped stripes";
+    R.layers[size_t(ci)].clip = true;
+    std::vector<uint8_t> cov(size_t(300) * 400);
+    for (int y = 0; y < 400; ++y)
+      for (int x = 0; x < 300; ++x) cov[size_t(y) * 300 + x] = ((x + y) / 20) % 2 ? 255 : 0;
+    StrokeStyle st;
+    st.color[0] = 0.9f; st.color[1] = 0.1f; st.color[2] = 0.7f;
+    R.paintCoverage(ci, 60, 60, 300, 400, cov.data(), st, err);
+    R.paperColor[0] = 1.0f; R.paperColor[1] = 0.96f; R.paperColor[2] = 0.86f;
+    R.markCachesDirty();
+    fprintf(stderr, "cliptest: clipped layer at %d over '%s'\n", ci, R.layers[size_t(base)].name.c_str());
+  });
+  demo.push_back([] {});
   // layer effects: tone on the bottom layer, layer colour on a text layer (non-destructive)
   demo.push_back([this] {
     commitText();

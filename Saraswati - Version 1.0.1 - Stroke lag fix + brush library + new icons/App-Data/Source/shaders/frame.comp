@@ -13,13 +13,13 @@ void main() {
   ivec2 size = imageSize(workImg);
   if (px.x >= size.x || px.y >= size.y) return;
   vec2 s = vec2(px) + 0.5;
-  vec4 c = imageLoad(belowImg, px);
-  if ((pc.flags & FLAG_LAYER) != 0) c = blendLayer(c, sampleLayer(s) * pc.layerOpacity, pc.mode);
-  if ((pc.flags & FLAG_ABOVE_CACHE) != 0) {
+  vec4 c = (pc.flags & FLAG_ANTS_ONLY) != 0 ? imageLoad(workImg, px) : imageLoad(belowImg, px);
+  if ((pc.flags & FLAG_ANTS_ONLY) == 0 && (pc.flags & FLAG_LAYER) != 0) c = blendLayer(c, sampleLayer(s) * pc.layerOpacity, pc.mode);
+  if ((pc.flags & FLAG_ANTS_ONLY) == 0 && (pc.flags & FLAG_ABOVE_CACHE) != 0) {
     vec4 a = imageLoad(aboveImg, px);
     c = a + c * (1.0 - a.a);
   }
-  if ((pc.flags & FLAG_SEL) != 0) {
+  if ((pc.flags & FLAG_ANTS) != 0) {
     // marching ants on the selection edge (in screen space, so they stay 1 px wide at any zoom)
     ivec2 d0 = ivec2(floor(screenToDoc(s)));
     ivec2 d1 = ivec2(floor(screenToDoc(s + vec2(1.0, 0.0))));

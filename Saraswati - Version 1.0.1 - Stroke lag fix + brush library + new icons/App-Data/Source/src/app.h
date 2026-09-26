@@ -186,7 +186,7 @@ class App {
   bool showNav = true, showToolGroup = true;
   void drawNavigator();
   void drawLayerProperties();
-  bool showLayerProps = true, propsEditing = false;
+  bool showLayerProps = true, propsEditing = false, paperSelected = false;
   std::pair<ToneFx, LayerColorFx> propsBefore;
   void drawToolGroup();
   void drawBrushLibraryButtons();
@@ -404,6 +404,11 @@ class App {
     int mode;
     bool lockAlpha;
     int x0, y0, x1, y1;
+    bool folder, passThrough, expanded, clip;
+    uint32_t folderId;
+    ToneFx tone;
+    LayerColorFx lcolor;
+    std::string meta;
   };
   std::vector<BackupInfo> backups;
   std::vector<BackupLayer> backupLayers;
@@ -431,10 +436,15 @@ class App {
   // sublayers (e.g. a bubble under its text): always directly below their parent, move with it
   bool isSublayer(const Layer& l) const { return l.parentId && R.indexOf(l.parentId) >= 0; }
   uint32_t topLevelId(int index) const;
-  void moveLayerBlock(int index, int dir);    // up (+1) / down (-1) past the neighbouring block
-  void dropLayerBlock(int from, int onto);    // drag and drop in the layer list
-  void deleteLayerBlock(int index);
-  void applyTopOrder(const std::vector<uint32_t>& top);
+  void moveLayerBlock(int index, int dir);    // up (+1) / down (-1); out of a folder at its edge
+  void dropLayerBlock(int from, int onto);    // drag and drop in the layer list (onto a folder = into it)
+  void deleteLayerBlock(int index);           // with folder contents and sublayers
+  void applyTree(const void* tree);
+  int layerDepth(int index) const;
+  bool layerShown(int index) const;
+  bool needPixelLayer();                      // false (with a message) when a folder is selected
+  std::string layerMeta(int index) const;     // Saraswati-only layer data (layer_meta.cpp)
+  void applyLayerMeta(int index, const std::string& meta);
   struct TextObject {
     TextBox box;
     TextStyle style;

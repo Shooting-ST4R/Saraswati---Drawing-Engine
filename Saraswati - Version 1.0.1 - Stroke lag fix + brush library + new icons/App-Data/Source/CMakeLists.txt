@@ -84,6 +84,8 @@ compile_shader(commit.comp      spv_commit_r16)
 compile_shader(commit.comp      spv_commit_r32f      MASK_R32F)
 compile_shader(cache.comp       spv_cache_r16)
 compile_shader(cache.comp       spv_cache_r32f       MASK_R32F)
+compile_shader(cache.comp       spv_cachestroke_r16  WITH_STROKE)
+compile_shader(cache.comp       spv_cachestroke_r32f WITH_STROKE MASK_R32F)
 compile_shader(gradient.comp    spv_gradient_r16)
 compile_shader(gradient.comp    spv_gradient_r32f    MASK_R32F)
 compile_shader(stamp.comp       spv_stamp)
@@ -109,6 +111,7 @@ add_executable(Saraswati WIN32
   src/app.cpp
   src/renderer.cpp
   src/renderer_tools.cpp
+  src/renderer_groups.cpp
   src/tools.cpp
   src/shortcuts.cpp
   src/app_shortcuts.cpp
@@ -119,6 +122,7 @@ add_executable(Saraswati WIN32
   src/bubble.cpp
   src/backup.cpp
   src/tone.cpp
+  src/layer_meta.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp

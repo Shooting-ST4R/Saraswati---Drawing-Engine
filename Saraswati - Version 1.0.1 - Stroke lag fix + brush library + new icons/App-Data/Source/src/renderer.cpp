@@ -18,6 +18,8 @@
 #include "spv_gradient_r16.h"
 #include "spv_gradient_r32f.h"
 #include "spv_adjust_r16.h"
+#include "spv_cachestroke_r16.h"
+#include "spv_cachestroke_r32f.h"
 #include "spv_adjust_r32f.h"
 #include "spv_stamp.h"
 #include "spv_commit_r16.h"
@@ -76,7 +78,7 @@ struct CommitPC {
 
 enum : int {
   FLAG_STROKE = 1, FLAG_ERASER = 2, FLAG_LAYER = 4, FLAG_ABOVE_CACHE = 8, FLAG_ABOVE = 16,
-  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512, FLAG_NOCLIP = 1024, FLAG_ADJ = 2048
+  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512, FLAG_NOCLIP = 1024, FLAG_ADJ = 2048, FLAG_ANTS = 4096, FLAG_ANTS_ONLY = 16384
 };
 
 static constexpr VkImageUsageFlags kLayerUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -433,6 +435,7 @@ void Renderer::createPipelines() {
     commitPipe = compute(spv_commit_r16, sizeof spv_commit_r16);
     framePipe = compute(spv_frame_r16, sizeof spv_frame_r16);
     cachePipe = compute(spv_cache_r16, sizeof spv_cache_r16);
+    cacheStrokePipe = compute(spv_cachestroke_r16, sizeof spv_cachestroke_r16);
     gradPipe = compute(spv_gradient_r16, sizeof spv_gradient_r16);
     adjPipe = compute(spv_adjust_r16, sizeof spv_adjust_r16);
   } else {
@@ -440,6 +443,7 @@ void Renderer::createPipelines() {
     commitPipe = compute(spv_commit_r32f, sizeof spv_commit_r32f);
     framePipe = compute(spv_frame_r32f, sizeof spv_frame_r32f);
     cachePipe = compute(spv_cache_r32f, sizeof spv_cache_r32f);
+    cacheStrokePipe = compute(spv_cachestroke_r32f, sizeof spv_cachestroke_r32f);
     gradPipe = compute(spv_gradient_r32f, sizeof spv_gradient_r32f);
     adjPipe = compute(spv_adjust_r32f, sizeof spv_adjust_r32f);
   }
@@ -703,7 +707,7 @@ void Renderer::shutdown() {
   }
   if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
   vkDestroyCommandPool(device, oneShotPool, nullptr);
-  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe, gradPipe, stampPipe, adjPipe}) vkDestroyPipeline(device, p, nullptr);
+  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe, gradPipe, stampPipe, adjPipe, cacheStrokePipe}) vkDestroyPipeline(device, p, nullptr);
   destroyBuffer(device, pickBuf);
   vkDestroyRenderPass(device, renderPass, nullptr);
   vkDestroyPipelineLayout(device, pipeLayout, nullptr);
@@ -852,6 +856,7 @@ void Renderer::destroyDocument() {
   for (auto& l : layers) destroyLayer(l);
   layers.clear();
   destroyNavigator();
+  destroyGroups();
   destroyImage(device, mask);
   destroyImage(device, sel);
   selectionActive = false;
@@ -935,7 +940,7 @@ void Renderer::recordLayerProps(int index) {
   UndoEntry e;
   e.kind = UndoKind::Props;
   e.layerId = l.id;
-  e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor};
+  e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor, l.passThrough, l.expanded, l.clip};
   pushUndo(std::move(e));
 }
 
@@ -946,25 +951,31 @@ bool Renderer::applyLayerUndo(UndoEntry& e) {
       int i = findLayer(e.layerId);
       if (i < 0) return false;
       Layer& l = layers[i];
-      LayerProps cur{l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor};
+      LayerProps cur{l.name, l.visible, l.opacity, l.mode, l.lockAlpha, l.tone, l.lcolor, l.passThrough, l.expanded, l.clip};
       l.name = e.props.name; l.visible = e.props.visible; l.opacity = e.props.opacity;
       l.mode = e.props.mode; l.lockAlpha = e.props.lockAlpha;
-      l.tone = e.props.tone; l.lcolor = e.props.lcolor;
+      l.tone = e.props.tone; l.lcolor = e.props.lcolor; l.passThrough = e.props.passThrough; l.clip = e.props.clip;
       cachesDirty = true;
       e.props = cur;
       return true;
     }
     case UndoKind::Order: {
-      std::vector<uint32_t> cur;
-      for (auto& l : layers) cur.push_back(l.id);
+      std::vector<uint32_t> cur, curF;
+      for (auto& l : layers) { cur.push_back(l.id); curF.push_back(l.folderId); }
+      if (e.order.size() != layers.size()) return false;
+      for (uint32_t id : e.order)
+        if (findLayer(id) < 0) return false;
       std::vector<Layer> re;
-      for (uint32_t id : e.order) {
-        int i = findLayer(id);
-        if (i >= 0) re.push_back(std::move(layers[i]));
+      for (size_t k = 0; k < e.order.size(); ++k) {
+        int i = findLayer(e.order[k]);
+        re.push_back(std::move(layers[size_t(i)]));
+        layers[size_t(i)].id = 0;
+        if (k < e.folders.size()) re.back().folderId = e.folders[k];
       }
-      if (re.size() != layers.size()) return false;
       layers = std::move(re);
       e.order = cur;
+      e.folders = curF;
+      cachesDirty = true;
       return true;
     }
     case UndoKind::Deleted: {  // bring the layer back
@@ -1011,6 +1022,7 @@ bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err)
   docW = w;
   docH = h;
   whitePaper = white;
+  paperColor[0] = paperColor[1] = paperColor[2] = 1.0f;
   limit = L;
   VkResult r = createImage(device, memProps, w, h, maskR16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT,
                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, mask);
@@ -1036,6 +1048,7 @@ bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err)
   }
   endOneShot(cmd);
   for (auto& s : slots) writeSet0(s);
+  refreshGroupSets();
   prewarmChunks();
   tilesX = (w + kTile - 1) / kTile;
   tilesY = (h + kTile - 1) / kTile;
@@ -1063,6 +1076,9 @@ int Renderer::addLayer(int index, std::string& err, bool undoable) {
   if (!createLayer(l, err)) return -1;
   l.name = "Layer " + std::to_string(l.id);
   index = std::clamp(index, 0, int(layers.size()));
+  // same container as the layer right above the new position (inside a folder when that is its entry)
+  if (index < int(layers.size())) l.folderId = layers[size_t(index)].folder ? layers[size_t(index)].id : layers[size_t(index)].folderId;
+  else if (index > 0 && !layers[size_t(index - 1)].folder) l.folderId = layers[size_t(index - 1)].folderId;
   uint32_t id = l.id;
   layers.insert(layers.begin() + index, std::move(l));
   cachesDirty = true;
@@ -1079,6 +1095,7 @@ int Renderer::addLayer(int index, std::string& err, bool undoable) {
 
 int Renderer::duplicateLayer(int index, std::string& err) {
   if (index < 0 || index >= int(layers.size())) return -1;
+  if (layers[index].folder) { err = "Folders cannot be duplicated yet - duplicate the layers inside."; return -1; }
   int ni = addLayer(index + 1, err);
   if (ni < 0) return -1;
   Layer& src = layers[index];
@@ -1119,7 +1136,7 @@ void Renderer::moveLayerTo(int index, int j) {
   if (index < 0 || j < 0 || index >= int(layers.size()) || j >= int(layers.size())) return;
   UndoEntry e;
   e.kind = UndoKind::Order;
-  for (auto& l : layers) e.order.push_back(l.id);
+  for (auto& l : layers) { e.order.push_back(l.id); e.folders.push_back(l.folderId); }
   pushUndo(std::move(e));
   Layer tmp = std::move(layers[index]);
   layers.erase(layers.begin() + index);
@@ -1127,14 +1144,17 @@ void Renderer::moveLayerTo(int index, int j) {
   cachesDirty = true;
 }
 
-void Renderer::reorderLayers(const std::vector<uint32_t>& ids) {
+void Renderer::reorderLayers(const std::vector<uint32_t>& ids, const std::vector<uint32_t>& folderIds) {
   if (ids.size() != layers.size()) return;
   bool same = true;
-  for (size_t i = 0; i < ids.size(); ++i) same &= layers[i].id == ids[i];
+  for (size_t i = 0; i < ids.size(); ++i) {
+    same &= layers[i].id == ids[i];
+    if (i < folderIds.size()) { int j = findLayer(ids[i]); same &= j >= 0 && layers[size_t(j)].folderId == folderIds[i]; }
+  }
   if (same) return;
   UndoEntry e;
   e.kind = UndoKind::Order;
-  for (auto& l : layers) e.order.push_back(l.id);
+  for (auto& l : layers) { e.order.push_back(l.id); e.folders.push_back(l.folderId); }
   std::vector<Layer> next;
   next.reserve(layers.size());
   for (uint32_t id : ids) {
@@ -1142,6 +1162,7 @@ void Renderer::reorderLayers(const std::vector<uint32_t>& ids) {
     if (i < 0) return;  // unknown id: leave everything as it is
     next.push_back(std::move(layers[size_t(i)]));
     layers[size_t(i)].id = 0;
+    if (next.size() <= folderIds.size()) next.back().folderId = folderIds[next.size() - 1];
   }
   pushUndo(std::move(e));
   layers = std::move(next);
@@ -1149,7 +1170,7 @@ void Renderer::reorderLayers(const std::vector<uint32_t>& ids) {
 }
 
 bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* rgba, std::string& err) {
-  if (index < 0 || index >= int(layers.size())) return false;
+  if (index < 0 || index >= int(layers.size()) || layers[index].folder) return false;
   // clip to the document
   int x0 = std::max(x, 0), y0 = std::max(y, 0);
   int x1 = std::min<int64_t>(int64_t(x) + w, docW), y1 = std::min<int64_t>(int64_t(y) + h, docH);
@@ -1260,17 +1281,13 @@ bool Renderer::readMergedRegion(int rx, int ry, uint32_t rw, uint32_t rh, std::v
       v.panY = ty + T / 2.0;
       v.zoom = 1;
       VkExtent2D ext{T, T};
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &layers[0].set, 0, nullptr);
+      VkDescriptorSet anySet = anyLayerSet();
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
       pushView(cmd, v, ext, FLAG_INIT | FLAG_ONLY_BELOW, 1, BlendMode::Normal);
       vkCmdDispatch(cmd, T / 16, T / 16, 1);
       memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-      for (auto& l : layers) {
-        if (!l.visible || l.opacity <= 0) continue;
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-        pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
-        vkCmdDispatch(cmd, T / 16, T / 16, 1);
-        memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-      }
+      std::vector<CompItem> items = buildItems();
+      compositeItems(cmd, items, 0, items.size(), CompTarget{set, tile.view, 0}, v, ext, 0, true, false);
       endOneShot(cmd);
       first = false;
       uint32_t w = std::min(T, uint32_t(rx) + rw - tx), h = std::min(T, uint32_t(ry) + rh - ty);
@@ -1290,7 +1307,7 @@ bool Renderer::readMergedRegion(int rx, int ry, uint32_t rw, uint32_t rh, std::v
 // Strokes
 
 void Renderer::beginStroke(int layerIndex, const StrokeStyle& st) {
-  if (layerIndex < 0 || layerIndex >= int(layers.size())) return;
+  if (layerIndex < 0 || layerIndex >= int(layers.size()) || layers[layerIndex].folder) return;
   strokeActive = true;
   strokeEnding = false;
   strokeLayerId = layers[layerIndex].id;
@@ -1384,8 +1401,9 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   pc.color[1] = style.color[1];
   pc.color[2] = style.color[2];
   pc.color[3] = style.opacity;
-  float p = (whitePaper && !forceTransparentPaper) ? 1.0f : 0.0f;
-  pc.paper[0] = pc.paper[1] = pc.paper[2] = pc.paper[3] = p;
+  bool on = whitePaper && !forceTransparentPaper;
+  for (int k = 0; k < 3; ++k) pc.paper[k] = on ? paperColor[k] : 0.0f;
+  pc.paper[3] = on ? 1.0f : 0.0f;
   pc.mode = int(mode);
   pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
   pc.flipX = v.flipX ? -1.0f : 1.0f;
@@ -1665,6 +1683,9 @@ void Renderer::recordUndoOps(VkCommandBuffer cmd) {
 // ---------------------------------------------------------------------------
 // Frame
 
+// The layer stack as a tree (folders); the "active unit" is the top-level item holding the active
+// layer. Below it: cached; the active unit: drawn every frame (live strokes); above it: cached when
+// it is only Normal layers, else drawn every frame.
 void Renderer::recordCaches(VkCommandBuffer cmd, const FrameParams& p) {
   bool need = cachesDirty || !(cacheView == p.view) || cacheActive != p.activeLayer ||
               cacheExtent.width != extent.width || cacheExtent.height != extent.height;
@@ -1674,25 +1695,31 @@ void Renderer::recordCaches(VkCommandBuffer cmd, const FrameParams& p) {
   cacheActive = p.activeLayer;
   cacheExtent = extent;
   FrameSlot& s = slots[frameCounter % kFrames];
+  VkDescriptorSet anySet = anyLayerSet();
+  if (!anySet) return;
+  compItems = buildItems();
+  activeTop = compItems.size();
+  for (size_t i = 0; i < compItems.size(); ++i)
+    if (Renderer::itemContains(compItems[i], p.activeLayer)) { activeTop = i; break; }
+  activeInGroup = activeTop < compItems.size() && (compItems[activeTop].group || compItems[activeTop].layer != p.activeLayer);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &s.set0, 0, nullptr);
   uint32_t gx = (extent.width + 15) / 16, gy = (extent.height + 15) / 16;
-  // the cache shader statically uses set 1, so bind some layer even for the init pass
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &layers[0].set, 0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
   pushView(cmd, p.view, extent, FLAG_INIT, 1, BlendMode::Normal);
   vkCmdDispatch(cmd, gx, gy, 1);
   memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-  aboveSimple = true;
-  for (int i = p.activeLayer + 1; i < int(layers.size()); ++i)
-    if (layers[i].visible && layers[i].opacity > 0 && layers[i].mode != BlendMode::Normal) aboveSimple = false;
-  for (int i = 0; i < int(layers.size()); ++i) {
-    const Layer& l = layers[i];
-    if (i == p.activeLayer || !l.visible || l.opacity <= 0) continue;
-    if (i > p.activeLayer && !aboveSimple) continue;  // blended per frame instead
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-    pushView(cmd, p.view, extent, i > p.activeLayer ? FLAG_ABOVE : 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
-    vkCmdDispatch(cmd, gx, gy, 1);
-    memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+  aboveSimple = !activeInGroup;
+  for (size_t i = activeTop + 1; i < compItems.size(); ++i) {
+    const CompItem& it = compItems[i];
+    if (it.hidden) continue;
+    if (it.group || layers[size_t(it.layer)].mode != BlendMode::Normal) aboveSimple = false;
+  }
+  CompTarget below{s.set0, this->below.view, 0};
+  compositeItems(cmd, compItems, 0, std::min(activeTop, compItems.size()), below, p.view, extent, 0, false, false);
+  if (aboveSimple && activeTop < compItems.size()) {
+    CompTarget above{s.set0, this->above.view, FLAG_ABOVE};
+    compositeItems(cmd, compItems, activeTop + 1, compItems.size(), above, p.view, extent, 0, false, false);
   }
 }
 
@@ -1701,29 +1728,40 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
   uint32_t gx = (extent.width + 15) / 16, gy = (extent.height + 15) / 16;
   int flags = aboveSimple ? FLAG_ABOVE_CACHE : 0;
   const Layer* act = (p.activeLayer >= 0 && p.activeLayer < int(layers.size())) ? &layers[p.activeLayer] : nullptr;
+  if (act && !act->set) act = nullptr;  // a folder is selected: nothing drawn live
+  bool direct = act && !activeInGroup;
+  float actOp = 1;
+  if (direct && activeTop < compItems.size()) actOp = compositeOpacity(*act) * compItems[activeTop].opMul;
+  bool actHidden = direct && activeTop < compItems.size() && compItems[activeTop].hidden;
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, framePipe);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &s.set0, 0, nullptr);
-  if (act) {
+  VkDescriptorSet anySet = anyLayerSet();
+  bool post = !aboveSimple;  // more gets blended into the work image after this pass
+  if (direct) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &act->set, 0, nullptr);
-    if (act->visible) flags |= FLAG_LAYER;
+    if (act->visible && !actHidden) flags |= FLAG_LAYER;
     if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0) | (style.overlay ? FLAG_NOCLIP : 0);
     if (act->lockAlpha) flags |= FLAG_LOCK;
     if (adjType && act->visible) flags |= FLAG_ADJ;
+  } else if (anySet) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
   }
-  if (selectionActive) flags |= FLAG_SEL;
-  pushView(cmd, p.view, extent, flags, act ? compositeOpacity(*act) : 1.0f, act ? act->mode : BlendMode::Normal, act ? p.activeLayer : -1);
+  if (selectionActive) flags |= FLAG_SEL | (post ? 0 : FLAG_ANTS);
+  pushView(cmd, p.view, extent, flags, direct ? actOp : 1.0f, direct ? act->mode : BlendMode::Normal, direct ? p.activeLayer : -1);
   vkCmdDispatch(cmd, gx, gy, 1);
   memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-  if (!aboveSimple) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
-    for (int i = p.activeLayer + 1; i < int(layers.size()); ++i) {
-      const Layer& l = layers[i];
-      if (!l.visible || l.opacity <= 0) continue;
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-      pushView(cmd, p.view, extent, FLAG_WORK, compositeOpacity(l), l.mode, int(&l - layers.data()));
-      vkCmdDispatch(cmd, gx, gy, 1);
-      memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-    }
+  CompTarget work{s.set0, this->work.view, FLAG_WORK};
+  if (activeInGroup && activeTop < compItems.size())  // the folder with the active layer: every frame, strokes included
+    compositeItems(cmd, compItems, activeTop, activeTop + 1, work, p.view, extent, 0, false, true);
+  if (!aboveSimple && activeTop < compItems.size())
+    compositeItems(cmd, compItems, activeTop + 1, compItems.size(), work, p.view, extent, 0, false, false);
+  if (post && selectionActive && anySet) {  // marching ants last, over everything
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, framePipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &s.set0, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
+    pushView(cmd, p.view, extent, FLAG_ANTS | FLAG_ANTS_ONLY, 1, BlendMode::Normal);
+    vkCmdDispatch(cmd, gx, gy, 1);
+    memoryBarrier(cmd, kCS, kRW, kCS, kRW);
   }
 }
 

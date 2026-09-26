@@ -29,6 +29,11 @@ const int FLAG_INIT   = 32;  // cache: init pass (paper / transparent)
 const int FLAG_WORK   = 64;  // cache: blend into this frame's work image
 const int FLAG_ONLY_BELOW = 128;
 const int FLAG_LOCK   = 512;  // live stroke on an alpha-locked layer
+const int FLAG_ANTS   = 4096;  // frame: draw the marching ants
+const int FLAG_GROUP_BLEND = 8192;   // cache: blend the finished folder image (binding 3) into binding 2
+const int FLAG_ANTS_ONLY = 16384;    // frame: only draw the ants over the finished work image
+const int FLAG_CLIP = 32768;         // cache: clipped layer - drawn atop, keeps the alpha below
+
 const int FLAG_ADJ    = 2048; // frame: preview a colour adjustment on the active layer
 const int FLAG_NOCLIP = 1024; // stroke is a preview overlay: ignore selection and lock
 const int FLAG_SEL    = 256;  // a selection is active: live stroke clipped to it, marching ants drawn  // cache init: leave "above" alone (flatten for saving)
@@ -260,4 +265,13 @@ vec4 blendLayer(vec4 b, vec4 s, int m) {
   vec3 cs = s.rgb / s.a;
   vec3 co = s.rgb * (1.0 - b.a) + b.rgb * (1.0 - s.a) + s.a * b.a * clamp(blendFn(m, cb, cs), 0.0, 1.0);
   return vec4(co, s.a + b.a * (1.0 - s.a));
+}
+
+// "Source atop" with a blend mode: the result keeps the alpha of what is below (clipping masks).
+vec4 blendClipped(vec4 d, vec4 s, int mode) {
+  if (mode == 0) return s * d.a + d * (1.0 - s.a);  // exact for Normal
+  vec4 r = blendLayer(d, s * d.a, mode);
+  r.a = d.a;
+  r.rgb = min(r.rgb, vec3(r.a));
+  return r;
 }

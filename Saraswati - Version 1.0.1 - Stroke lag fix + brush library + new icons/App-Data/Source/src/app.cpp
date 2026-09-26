@@ -199,6 +199,10 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   double dx, dy;
   screenToDoc(sx, sy, dx, dy);
   if (toolHold.active) toolHold.used = true;  // the held tool was used: going back on release
+  bool paints = tool == ToolId::Brush ? !altDown
+              : tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Line || tool == ToolId::Rect ||
+                    tool == ToolId::Ellipse || tool == ToolId::Transform;
+  if (paints && !needPixelLayer()) return;  // a folder is selected
   if (toolDown(dx, dy, sx, sy)) return;
   strokeFromPen = pen;
   if (shiftDown && haveLastStroke) {
@@ -738,11 +742,23 @@ void App::drawLayerPanel() {
   float fh = ImGui::GetFrameHeight();
   float wAvail = ImGui::GetContentRegionAvail().x;
   ImGui::SetNextItemWidth(wAvail * 0.48f);
-  if (ImGui::BeginCombo("##blend", blendModeName(L.mode), ImGuiComboFlags_HeightLarge)) {
+  bool through = L.folder && L.passThrough;
+  if (ImGui::BeginCombo("##blend", through ? "Through" : blendModeName(L.mode), ImGuiComboFlags_HeightLarge)) {
+    if (L.folder) {
+      if (ImGui::Selectable("Through", through) && !through) {
+        R.recordLayerProps(active);
+        L.passThrough = true;
+        R.markCachesDirty();
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("The layers in the folder blend with everything below, as if not in a folder");
+      ImGui::Separator();
+    }
     for (int m = 0; m < int(BlendMode::Count); ++m) {
-      if (ImGui::Selectable(blendModeName(BlendMode(m)), m == int(L.mode)) && m != int(L.mode)) {
+      bool cur = !through && m == int(L.mode);
+      if (ImGui::Selectable(blendModeName(BlendMode(m)), cur) && !cur) {
         R.recordLayerProps(active);
         L.mode = BlendMode(m);
+        L.passThrough = false;
         R.markCachesDirty();
       }
       if (m == 0 || m == 5 || m == 11 || m == 20 || m == 23) ImGui::Separator();
@@ -752,13 +768,21 @@ void App::drawLayerPanel() {
   ImGui::SameLine();
   float before = L.opacity;
   float op = L.opacity * 100;
-  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh - ImGui::GetStyle().ItemSpacing.x);
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 2 * (fh + ImGui::GetStyle().ItemSpacing.x));
   bool changed = ImGui::SliderFloat("##lop", &op, 0.0f, 100.0f, "%.0f %%");
   if (ImGui::IsItemActivated()) { L.opacity = before; R.recordLayerProps(active); }
   if (changed) { L.opacity = op / 100; R.markCachesDirty(); }
   ImGui::SameLine();
   {
-    if (iconButton("##lock", L.lockAlpha ? "lock" : "lock-open", fh, L.lockAlpha, nullptr)) {
+    if (iconButton("##clip", "corner-left-down", fh, L.clip, nullptr)) {
+      R.recordLayerProps(active);
+      L.clip = !L.clip;
+      R.markCachesDirty();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clip to layer below: show this %s only where the layer (or folder) below has pixels",
+                                                  L.folder ? "folder" : "layer");
+    ImGui::SameLine();
+    if (iconButton("##lock", L.lockAlpha ? "lock" : "lock-open", fh, L.lockAlpha, nullptr, !L.folder)) {
       R.recordLayerProps(active);
       L.lockAlpha = !L.lockAlpha;
     }
@@ -772,12 +796,14 @@ void App::drawLayerPanel() {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   for (int i = int(R.layers.size()) - 1; i >= 0; --i) {
     Layer& l = R.layers[i];
+    if (!layerShown(i)) continue;  // inside a collapsed folder
     ImGui::PushID(int(l.id));
     ImVec2 p = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Selectable("##row", i == active, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick,
+    if (ImGui::Selectable("##row", i == active && !paperSelected, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick,
                           ImVec2(w, rowH))) {
       active = i;
+      paperSelected = false;
       if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         renameIndex = i;
         snprintf(renameText, sizeof renameText, "%s", l.name.c_str());
@@ -797,12 +823,18 @@ void App::drawLayerPanel() {
       }
       ImGui::EndDragDropTarget();
     }
-    float ind = 0;
+    float ind = float(layerDepth(i)) * 14.0f;
     if (isSublayer(l)) {  // sublayer: thumbnail and name indented, with a connector to its parent above
-      ind = 18;
       ImU32 lc = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-      dl->AddLine(ImVec2(p.x + 36, p.y - 2), ImVec2(p.x + 36, p.y + rowH / 2), lc, 1.5f);
-      dl->AddLine(ImVec2(p.x + 36, p.y + rowH / 2), ImVec2(p.x + 30 + ind, p.y + rowH / 2), lc, 1.5f);
+      dl->AddLine(ImVec2(p.x + 36 + ind, p.y - 2), ImVec2(p.x + 36 + ind, p.y + rowH / 2), lc, 1.5f);
+      dl->AddLine(ImVec2(p.x + 36 + ind, p.y + rowH / 2), ImVec2(p.x + 48 + ind, p.y + rowH / 2), lc, 1.5f);
+      ind += 18;
+    }
+    if (l.clip) {  // clipped: a coloured bar and an arrow pointing at the base below
+      float bx = p.x + 26 + ind;
+      dl->AddRectFilled(ImVec2(bx, p.y + 2), ImVec2(bx + 3, p.y + rowH), IM_COL32(230, 90, 150, 255));
+      drawIcon(dl, "corner-left-down", ImVec2(bx - 7 + ind * 0, p.y + rowH - 9), 11, IM_COL32(230, 90, 150, 255));
+      ind += 6;
     }
     // eye (visibility)
     ImGui::SetCursorScreenPos(ImVec2(p.x + 2, p.y + (rowH - 22) / 2));
@@ -810,26 +842,57 @@ void App::drawLayerPanel() {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip(l.visible ? "Hide layer" : "Show layer");
     drawIcon(dl, l.visible ? "eye" : "eye-off", ImVec2(p.x + 13, p.y + rowH / 2), 17,
              ImGui::GetColorU32(l.visible ? ImGuiCol_Text : ImGuiCol_TextDisabled));
-    // thumbnail on a checkerboard
-    float tw = thumb, th = thumb;
-    if (l.thumb.width && l.thumb.height) {
-      float a = float(l.thumb.width) / float(l.thumb.height);
-      if (a >= 1) th = thumb / a; else tw = thumb * a;
+    if (l.folder) {  // folder: open / close arrow and a folder icon instead of a thumbnail
+      ImGui::SetCursorScreenPos(ImVec2(p.x + 30 + ind, p.y + (rowH - 20) / 2));
+      if (ImGui::InvisibleButton("##exp", ImVec2(16, 20))) l.expanded = !l.expanded;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(l.expanded ? "Close the folder" : "Open the folder");
+      drawIcon(dl, l.expanded ? "chevron-down" : "chevron-right", ImVec2(p.x + 38 + ind, p.y + rowH / 2), 14,
+               ImGui::GetColorU32(ImGuiCol_Text));
+      drawIcon(dl, l.expanded ? "folder-open" : "folder", ImVec2(p.x + 30 + ind + 16 + (thumb - 16) / 2, p.y + rowH / 2), thumb * 0.6f,
+               ImGui::GetColorU32(ImGuiCol_Text, 0.85f));
+    } else {
+      // thumbnail on a checkerboard
+      float tw = thumb, th = thumb;
+      if (l.thumb.width && l.thumb.height) {
+        float a = float(l.thumb.width) / float(l.thumb.height);
+        if (a >= 1) th = thumb / a; else tw = thumb * a;
+      }
+      ImVec2 t0(p.x + 30 + ind + (thumb - tw) / 2, p.y + 3 + (thumb - th) / 2), t1(t0.x + tw, t0.y + th);
+      dl->AddRectFilled(t0, t1, IM_COL32(205, 205, 205, 255));
+      for (float yy = 0; yy < th; yy += 6)
+        for (float xx = (int(yy / 6) % 2) * 6.0f; xx < tw; xx += 12)
+          dl->AddRectFilled(ImVec2(t0.x + xx, t0.y + yy), ImVec2(std::min(t0.x + xx + 6, t1.x), std::min(t0.y + yy + 6, t1.y)), IM_COL32(245, 245, 245, 255));
+      if (l.thumbTex) dl->AddImage(ImTextureRef(ImTextureID(uint64_t(l.thumbTex))), t0, t1);
+      dl->AddRect(t0, t1, ImGui::GetColorU32(ImGuiCol_Border));
     }
-    ImVec2 t0(p.x + 30 + ind + (thumb - tw) / 2, p.y + 3 + (thumb - th) / 2), t1(t0.x + tw, t0.y + th);
-    dl->AddRectFilled(t0, t1, IM_COL32(205, 205, 205, 255));
-    for (float yy = 0; yy < th; yy += 6)
-      for (float xx = (int(yy / 6) % 2) * 6.0f; xx < tw; xx += 12)
-        dl->AddRectFilled(ImVec2(t0.x + xx, t0.y + yy), ImVec2(std::min(t0.x + xx + 6, t1.x), std::min(t0.y + yy + 6, t1.y)), IM_COL32(245, 245, 245, 255));
-    if (l.thumbTex) dl->AddImage(ImTextureRef(ImTextureID(uint64_t(l.thumbTex))), t0, t1);
-    dl->AddRect(t0, t1, ImGui::GetColorU32(ImGuiCol_Border));
     // name + details
-    float tx = p.x + 38 + ind + thumb;
+    float tx = p.x + 38 + ind + thumb + (l.folder ? 10 : 0);
     dl->AddText(ImVec2(tx, p.y + rowH / 2 - ImGui::GetTextLineHeight() - 1), ImGui::GetColorU32(ImGuiCol_Text), l.name.c_str());
     char info[96];
-    snprintf(info, sizeof info, "%s  %.0f%%%s%s%s", blendModeName(l.mode), l.opacity * 100, l.lockAlpha ? "  locked" : "",
+    snprintf(info, sizeof info, "%s  %.0f%%%s%s%s", l.folder && l.passThrough ? "Through" : blendModeName(l.mode), l.opacity * 100,
+             l.lockAlpha ? "  locked" : "",
              l.tone.on ? "  tone" : "", l.lcolor.on ? "  colour" : "");
     dl->AddText(ImVec2(tx, p.y + rowH / 2 + 1), ImGui::GetColorU32(ImGuiCol_TextDisabled), info);
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 2));
+    ImGui::Dummy(ImVec2(0, 0));
+    ImGui::PopID();
+  }
+  {  // the paper: always at the bottom; one colour for the whole canvas (no pixels, no blend mode)
+    ImGui::PushID("paper");
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    if (ImGui::Selectable("##row", paperSelected, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, rowH))) paperSelected = true;
+    ImGui::SetCursorScreenPos(ImVec2(p.x + 2, p.y + (rowH - 22) / 2));
+    if (ImGui::InvisibleButton("##eye", ImVec2(22, 22))) { R.whitePaper = !R.whitePaper; R.markCachesDirty(); R.bumpRevision(); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(R.whitePaper ? "Hide the paper (transparent background)" : "Show the paper");
+    drawIcon(dl, R.whitePaper ? "eye" : "eye-off", ImVec2(p.x + 13, p.y + rowH / 2), 17,
+             ImGui::GetColorU32(R.whitePaper ? ImGuiCol_Text : ImGuiCol_TextDisabled));
+    ImVec2 t0(p.x + 30 + thumb * 0.15f, p.y + 3 + thumb * 0.1f), t1(p.x + 30 + thumb * 0.85f, p.y + 3 + thumb * 0.9f);
+    dl->AddRectFilled(t0, t1, ImGui::ColorConvertFloat4ToU32(ImVec4(R.paperColor[0], R.paperColor[1], R.paperColor[2], 1)));
+    dl->AddRect(t0, t1, ImGui::GetColorU32(ImGuiCol_Border));
+    float tx = p.x + 38 + thumb;
+    dl->AddText(ImVec2(tx, p.y + rowH / 2 - ImGui::GetTextLineHeight() - 1), ImGui::GetColorU32(ImGuiCol_Text), "Paper");
+    dl->AddText(ImVec2(tx, p.y + rowH / 2 + 1), ImGui::GetColorU32(ImGuiCol_TextDisabled), "Paper colour - Layer Properties");
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + rowH + 2));
     ImGui::Dummy(ImVec2(0, 0));
     ImGui::PopID();
@@ -855,10 +918,16 @@ void App::drawLayerPanel() {
   {
     float fh2 = ImGui::GetFrameHeight();
     auto iconBtn = [&](const char* id, const char* tip, bool enabled, int icon) {
-      static const char* names[5] = {"plus", "copy", "trash", "arrow-up", "arrow-down"};
+      static const char* names[6] = {"plus", "copy", "trash", "arrow-up", "arrow-down", "folder-plus"};
       return iconButton(id, names[icon], fh2 * 1.25f, false, tip, enabled);
     };
     if (iconBtn("##new", "New layer", true, 0)) addLayer();
+    ImGui::SameLine();
+    if (iconBtn("##newf", "New folder (drag layers onto it to put them inside)", true, 5)) {
+      std::string err;
+      int fi = R.addFolder(active + 1, err);
+      if (fi >= 0) active = fi;
+    }
     ImGui::SameLine();
     if (iconBtn("##dup", "Duplicate layer", true, 1)) {
       std::string err;
@@ -1983,28 +2052,64 @@ void App::openFile(const std::string& path) {
     DocFile doc;
     if (!loadPsd(path, doc, err)) { error("Could not open " + name + ":\n" + err); return; }
     if (!newDocument(doc.w, doc.h, false)) return;
+    if (doc.hasPaper) {  // saved by Saraswati: the paper colour comes back
+      R.whitePaper = doc.paperVisible;
+      for (int k = 0; k < 3; ++k) R.paperColor[k] = doc.paper[k] / 255.0f;
+      R.docDpi = doc.dpi;
+    }
+    std::vector<std::pair<uint32_t, std::string>> metas;  // applied once every layer exists
     int maxL = R.limit.maxLayers;
     if (int(doc.layers.size()) > maxL) {
       doc.warnings.push_back("Only the bottom " + std::to_string(maxL) + " of " + std::to_string(doc.layers.size()) +
                              " layers fit in GPU memory at this size; the rest were not loaded.");
       doc.layers.resize(size_t(maxL));
     }
+    // folders: an end marker opens a list of contents, the folder entry closes it
+    std::vector<std::vector<int>> groups;
+    bool first = true;
     for (size_t i = 0; i < doc.layers.size(); ++i) {
       DocLayer& L = doc.layers[i];
-      int idx = 0;
-      if (i > 0) {
-        idx = R.addLayer(int(i), err, false);
-        if (idx < 0) { doc.warnings.push_back(err); break; }
+      if (L.section == 3) { groups.emplace_back(); continue; }
+      if (L.section == 1 || L.section == 2) {
+        int fi = R.addFolder(int(R.layers.size()), err, false);
+        Layer& f = R.layers[size_t(fi)];
+        f.folderId = 0;
+        f.name = L.name.empty() ? f.name : L.name;
+        f.visible = L.visible;
+        f.opacity = L.opacity;
+        f.mode = L.mode;
+        f.passThrough = L.passThrough;
+        f.expanded = L.section == 1;
+        f.clip = L.clip;
+        if (!L.meta.empty()) metas.push_back({f.id, L.meta});
+        if (!groups.empty()) {
+          for (int c : groups.back()) R.layers[size_t(c)].folderId = f.id;
+          groups.pop_back();
+        }
+        if (!groups.empty()) groups.back().push_back(fi);
+        continue;
       }
+      int idx = R.addLayer(int(R.layers.size()), err, false);
+      if (idx < 0) { doc.warnings.push_back(err); break; }
+      first = false;
+      R.layers[size_t(idx)].folderId = 0;
+      if (!groups.empty()) groups.back().push_back(idx);
       if (!uploadStraight(R, idx, L.x, L.y, L.w, L.h, L.rgba, err)) { doc.warnings.push_back(err); }
       L.rgba = {};
       Layer& dst = R.layers[size_t(idx)];
+      dst.clip = L.clip;
+      if (!L.meta.empty()) metas.push_back({dst.id, L.meta});
       dst.name = L.name.empty() ? dst.name : L.name;
       dst.visible = L.visible;
       dst.opacity = L.opacity;
       dst.mode = L.mode;
     }
+    if (!first && R.layers.size() > 1) R.eraseLayerNoUndo(0);  // the empty starting layer of the new document
+    std::sort(metas.begin(), metas.end(), [&](auto& a, auto& b) { return R.indexOf(a.first) < R.indexOf(b.first); });
+    for (auto& [id, m] : metas) applyLayerMeta(R.indexOf(id), m);
+    R.markCachesDirty();
     active = int(R.layers.size()) - 1;
+    while (active > 0 && R.layers[size_t(active)].folder) --active;
     documentPath = path;
     R.markCachesDirty();
     savedRevision = R.revision;
@@ -2047,6 +2152,7 @@ void App::importAsLayer(const std::string& path) {
     layers.push_back(std::move(L));
   }
   for (auto& L : layers) {
+    if (L.section) continue;  // importing into a document: folders are not recreated
     int idx = R.addLayer(active + 1, err);
     if (idx < 0) { error(err); return; }
     active = idx;
@@ -2073,17 +2179,54 @@ void App::saveFile(const std::string& path) {
   auto merged = std::make_shared<ImageRGBA>();
   doc->w = R.docW;
   doc->h = R.docH;
+  doc->hasPaper = true;
+  doc->paperVisible = R.whitePaper;
+  for (int k = 0; k < 3; ++k) doc->paper[k] = uint8_t(std::clamp(R.paperColor[k], 0.0f, 1.0f) * 255 + 0.5f);
+  doc->dpi = R.docDpi;
   std::string err;
   try {
     // GPU readback of only the painted area of each layer; encoding, checking and disk I/O run on a worker thread
     R.waitIdle();
+    // folders: an end-of-folder marker goes before a folder's first (bottom) layer, the folder entry after its last
+    std::vector<uint32_t> open;
+    auto ancestors = [&](const Layer& l) {
+      std::vector<uint32_t> a;
+      uint32_t f = l.folderId;
+      for (int guard = 0; f && guard < 32; ++guard) {
+        int k = R.indexOf(f);
+        if (k < 0 || !R.layers[size_t(k)].folder) break;
+        a.insert(a.begin(), f);
+        f = R.layers[size_t(k)].folderId;
+      }
+      return a;
+    };
+    auto marker = [&] {
+      DocLayer d;
+      d.name = "</Layer group>";
+      d.section = 3;
+      doc->layers.push_back(std::move(d));
+    };
     for (size_t i = 0; i < R.layers.size(); ++i) {
-      DocLayer L;
       const Layer& src = R.layers[i];
+      std::vector<uint32_t> req = ancestors(src);
+      if (src.folder) req.push_back(src.id);  // a folder entry closes its own contents
+      for (size_t k = 0; k < open.size() && k < req.size(); ++k)
+        if (open[k] != req[k]) { open.resize(k); break; }  // (cannot happen: contents are contiguous)
+      for (size_t k = open.size(); k < req.size(); ++k) { marker(); open.push_back(req[k]); }
+      DocLayer L;
       L.name = src.name;
       L.visible = src.visible;
       L.opacity = src.opacity;
       L.mode = src.mode;
+      L.clip = src.clip;
+      L.meta = layerMeta(int(i));
+      if (src.folder) {
+        open.pop_back();  // (an empty folder got its marker just above)
+        L.section = src.expanded ? 1 : 2;
+        L.passThrough = src.passThrough;
+        doc->layers.push_back(std::move(L));
+        continue;
+      }
       int x0 = std::max(src.bx0, 0), y0 = std::max(src.by0, 0);
       int x1 = std::min(src.bx1, int(R.docW)), y1 = std::min(src.by1, int(R.docH));
       if (x0 < x1 && y0 < y1) {

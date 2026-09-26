@@ -320,7 +320,31 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
   if (colorMode != 3 && colorMode != 1) { err = "Only RGB and grayscale PSD/PSB files are supported."; return false; }
   bool gray = colorMode == 1;
   r.skip(r.u32());  // colour mode data
-  r.skip(r.u32());  // image resources
+  {  // image resources: only our paper block is read
+    uint32_t len = r.u32();
+    int64_t end = r.pos() + int64_t(len);
+    while (r.ok() && r.pos() + 12 <= end) {
+      char sig[4];
+      r.bytes(sig, 4);
+      uint16_t id = r.u16();
+      uint8_t nl = r.u8();
+      r.skip(nl + ((nl + 1) % 2));  // pascal name, padded to even
+      uint32_t sz = r.u32();
+      int64_t dataEnd = r.pos() + int64_t(sz);
+      if (!memcmp(sig, "8BIM", 4) && id == 4000 && sz >= 8) {
+        char tag[4];
+        r.bytes(tag, 4);
+        if (!memcmp(tag, "SARP", 4)) {
+          doc.hasPaper = true;
+          doc.paperVisible = r.u8() != 0;
+          for (int k = 0; k < 3; ++k) doc.paper[k] = r.u8();
+          if (sz >= 12) { uint32_t bits = r.u32(); float d; memcpy(&d, &bits, 4); if (d >= 1 && d <= 10000) doc.dpi = d; }
+        }
+      }
+      r.seek(dataEnd + (sz % 2));
+    }
+    r.seek(end);
+  }
   uint64_t lmLen = r.len(psb);
   int64_t lmEnd = r.pos() + int64_t(lmLen);
 
@@ -355,10 +379,11 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
         r.bytes(key, 4);
         if (!modeFor(key, rec.layer.mode)) {
           rec.layer.mode = BlendMode::Normal;
-          if (memcmp(key, "pass", 4)) doc.warnings.push_back(std::string("Unsupported blend mode '") + std::string(key, 4) + "' shown as Normal");
+          if (!memcmp(key, "pass", 4)) rec.layer.passThrough = true;
+          else doc.warnings.push_back(std::string("Unsupported blend mode '") + std::string(key, 4) + "' shown as Normal");
         }
         rec.layer.opacity = r.u8() / 255.0f;
-        if (r.u8() != 0) rec.clipped = true;  // clipping mask
+        if (r.u8() != 0) { rec.clipped = true; rec.layer.clip = true; }  // clipping mask
         uint8_t flags = r.u8();
         rec.layer.visible = !(flags & 2);
         r.u8();
@@ -396,8 +421,18 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
               else { u8 += char(0xF0 | c >> 18); u8 += char(0x80 | (c >> 12 & 63)); u8 += char(0x80 | (c >> 6 & 63)); u8 += char(0x80 | (c & 63)); }
             }
             rec.layer.name = u8;
+          } else if (!memcmp(k2, "SaRa", 4) && l < (64u << 20)) {
+            uint32_t n = r.u32();
+            if (n <= l - 4) { rec.layer.meta.resize(n); r.bytes(rec.layer.meta.data(), n); }
           } else if ((!memcmp(k2, "lsct", 4) || !memcmp(k2, "lsdk", 4)) && l >= 4) {
             rec.section = int(r.u32());
+            if (l >= 12) {  // folder blend mode: '8BIM' + key
+              char sig[4], k3[4];
+              r.bytes(sig, 4);
+              r.bytes(k3, 4);
+              if (!memcmp(k3, "pass", 4)) rec.layer.passThrough = true;
+              else if (modeFor(k3, rec.layer.mode)) rec.layer.passThrough = false;
+            }
           }
           r.seek(start + int64_t(l));
           if (l % 2) r.skip(1);
@@ -436,27 +471,23 @@ bool loadPsd(const std::string& path, DocFile& doc, std::string& err) {
   }
   if (!r.ok()) { err = "The file is truncated or damaged."; return false; }
 
-  // Groups: apply hidden folders to their children, then flatten the tree.
-  bool anyGroup = false;
-  std::vector<bool> stack{true};
-  for (int i = int(recs.size()) - 1; i >= 0; --i) {  // top to bottom
-    Rec& rec = recs[size_t(i)];
-    if (rec.section == 1 || rec.section == 2) { anyGroup = true; stack.push_back(stack.back() && rec.layer.visible); continue; }
-    if (rec.section == 3) { if (stack.size() > 1) stack.pop_back(); continue; }
-    rec.layer.visible = rec.layer.visible && stack.back();
-  }
   bool anyMask = false, anyClip = false;
   for (auto& rec : recs) {
     for (auto& c : rec.ch) anyMask |= c.first <= -2;
     anyClip |= rec.clipped && rec.section == 0;
   }
   if (anyMask) doc.warnings.push_back("Layer masks are not supported yet and were ignored (the unmasked pixels are shown).");
-  if (anyClip) doc.warnings.push_back("Clipping masks are not supported yet; clipped layers are shown unclipped.");
-  if (anyGroup) doc.warnings.push_back("Layer folders were flattened (1.0.0 has no groups); hidden folders keep their layers hidden.");
-  for (auto& rec : recs)
-    if (rec.section == 0) doc.layers.push_back(std::move(rec.layer));
+  (void)anyClip;
+  bool anyPixels = false;
+  for (auto& rec : recs) {  // folders are kept: section records stay in the list (in file order)
+    rec.layer.section = rec.section >= 1 && rec.section <= 3 ? rec.section : 0;
+    if (rec.layer.section) { rec.layer.w = rec.layer.h = 0; rec.layer.rgba.clear(); }
+    anyPixels |= rec.layer.section == 0;
+    doc.layers.push_back(std::move(rec.layer));
+  }
 
-  if (doc.layers.empty()) {
+  if (!anyPixels) {
+    doc.layers.clear();
     // flat file: use the merged image
     r.seek(lmEnd);
     uint16_t comp = r.u16();
@@ -631,7 +662,15 @@ bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& m
   w.u16(8);
   w.u16(3);  // RGB
   w.u32(0);  // colour mode data
-  w.u32(0);  // image resources
+  w.u32(24);  // image resources: paper + resolution (id 4000, a plug-in range id other apps ignore)
+  w.bytes("8BIM", 4);
+  w.u16(4000);
+  w.u16(0);    // empty name, padded
+  w.u32(12);
+  w.bytes("SARP", 4);
+  w.u8(doc.paperVisible ? 1 : 0);
+  w.u8(doc.paper[0]); w.u8(doc.paper[1]); w.u8(doc.paper[2]);
+  { uint32_t bits; float d = doc.dpi; memcpy(&bits, &d, 4); w.u32(bits); }
 
   int64_t lmAt = w.pos();
   w.len(psb, 0);
@@ -657,9 +696,9 @@ bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& m
       w.len(psb, 2);
     }
     w.bytes("8BIM", 4);
-    w.bytes(keyFor(L.mode), 4);
+    w.bytes(L.section == 3 ? "norm" : (L.section && L.passThrough) ? "pass" : keyFor(L.mode), 4);
     w.u8(uint8_t(std::lround(std::clamp(L.opacity, 0.0f, 1.0f) * 255)));
-    w.u8(0);
+    w.u8(L.clip && L.section != 3 ? 1 : 0);  // clipping
     w.u8(L.visible ? 0 : 2);
     w.u8(0);
     // extra data: mask (0), blending ranges (0), pascal name, luni
@@ -690,6 +729,26 @@ bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& m
     e32(uint32_t(u16.size()));
     for (uint16_t c : u16) { extra.push_back(uint8_t(c >> 8)); extra.push_back(uint8_t(c)); }
     for (uint32_t k = ul; k < ulPadded; ++k) extra.push_back(0);
+    if (!L.meta.empty()) {  // private: other apps skip unknown blocks
+      extra.insert(extra.end(), {'8', 'B', 'I', 'M', 'S', 'a', 'R', 'a'});
+      uint32_t n = uint32_t(L.meta.size());
+      uint32_t len = (4 + n + 3) & ~3u;
+      e32(len);
+      e32(n);
+      extra.insert(extra.end(), L.meta.begin(), L.meta.end());
+      for (uint32_t k = 4 + n; k < len; ++k) extra.push_back(0);
+    }
+    if (L.section) {  // folder entry / end-of-folder marker
+      extra.insert(extra.end(), {'8', 'B', 'I', 'M', 'l', 's', 'c', 't'});
+      if (L.section == 3) { e32(4); e32(3); }
+      else {
+        e32(12);
+        e32(uint32_t(L.section));
+        extra.insert(extra.end(), {'8', 'B', 'I', 'M'});
+        const char* k = L.passThrough ? "pass" : keyFor(L.mode);
+        extra.insert(extra.end(), k, k + 4);
+      }
+    }
     w.u32(uint32_t(extra.size()));
     w.bytes(extra.data(), extra.size());
   }
@@ -762,6 +821,10 @@ std::vector<PsdCheck> psdChecks(const DocFile& doc) {
     c.visible = L.visible;
     c.opacity = uint8_t(std::lround(std::clamp(L.opacity, 0.0f, 1.0f) * 255));
     c.mode = L.mode;
+    c.section = L.section;
+    c.clip = L.clip && L.section != 3;
+    c.meta = L.meta;
+    c.passThrough = L.section == 1 || L.section == 2 ? L.passThrough : false;
     out.push_back(c);
   }
   return out;
@@ -781,7 +844,12 @@ bool verifyPsd(const std::string& file, uint32_t w, uint32_t h, const std::vecto
     const PsdCheck& c = expect[i];
     const DocLayer& L = d.layers[i];
     std::string which = "layer " + std::to_string(i + 1);
-    if (L.visible != c.visible || uint8_t(std::lround(L.opacity * 255)) != c.opacity || L.mode != c.mode) {
+    bool passNow = (L.section == 1 || L.section == 2) && L.passThrough;
+    if (L.section != c.section || passNow != c.passThrough) { err = which + ": folder structure differs after saving"; return false; }
+    if (c.section != 3 && L.clip != c.clip) { err = which + ": clipping differs after saving"; return false; }
+    if (L.meta != c.meta) { err = which + ": layer settings differ after saving"; return false; }
+    if (c.section == 3) continue;
+    if (L.visible != c.visible || uint8_t(std::lround(L.opacity * 255)) != c.opacity || (!passNow && L.mode != c.mode)) {
       err = which + ": properties differ after saving";
       return false;
     }

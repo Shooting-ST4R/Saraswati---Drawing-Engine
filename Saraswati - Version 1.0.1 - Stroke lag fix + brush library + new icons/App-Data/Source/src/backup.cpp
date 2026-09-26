@@ -17,7 +17,7 @@
 
 namespace fs = std::filesystem;
 
-static const char kMagic[8] = {'S', 'A', 'R', 'B', 'A', 'K', '0', '1'};
+static const char kMagic[8] = {'S', 'A', 'R', 'B', 'A', 'K', '0', '3'};
 
 namespace {
 template <class T> void put(std::string& s, T v) { s.append(reinterpret_cast<const char*>(&v), sizeof v); }
@@ -135,7 +135,12 @@ void App::tickBackup() {
     put<float>(head, L.opacity);
     put<int32_t>(head, L.mode);
     put<uint8_t>(head, L.lockAlpha);
-    bool empty = li < 0 || L.x1 <= L.x0 || L.y1 <= L.y0;
+    put<uint8_t>(head, uint8_t(L.folder | L.passThrough << 1 | L.expanded << 2 | L.clip << 3));
+    put<uint32_t>(head, L.folderId);
+    put<ToneFx>(head, L.tone);
+    put<LayerColorFx>(head, L.lcolor);
+    putStr(head, L.meta);
+    bool empty = li < 0 || L.folder || L.x1 <= L.x0 || L.y1 <= L.y0;
     put<int32_t>(head, empty ? 0 : L.x0);
     put<int32_t>(head, empty ? 0 : L.y0);
     put<uint32_t>(head, empty ? 0 : uint32_t(L.x1 - L.x0));
@@ -202,11 +207,14 @@ void App::startBackup() {
   backupTmp = reinterpret_cast<const char*>(tmp.u8string().c_str());
   backupLayers.clear();
   for (const Layer& l : R.layers)
-    backupLayers.push_back({l.id, l.parentId, l.name, l.visible, l.opacity, int(l.mode), l.lockAlpha, l.bx0, l.by0, l.bx1, l.by1});
+    backupLayers.push_back({l.id, l.parentId, l.name, l.visible, l.opacity, int(l.mode), l.lockAlpha, l.bx0, l.by0, l.bx1, l.by1,
+                            l.folder, l.passThrough, l.expanded, l.clip, l.folderId, l.tone, l.lcolor, layerMeta(R.indexOf(l.id))});
   std::string head(kMagic, 8);
   put<uint32_t>(head, R.docW);
   put<uint32_t>(head, R.docH);
   put<uint8_t>(head, R.whitePaper);
+  for (int k = 0; k < 3; ++k) put<float>(head, R.paperColor[k]);
+  put<float>(head, R.docDpi);
   putStr(head, documentPath);
   put<uint32_t>(head, uint32_t(backupLayers.size()));
   backupFile.write(head.data(), std::streamsize(head.size()));
@@ -235,27 +243,45 @@ bool App::restoreBackup(const std::string& path) {
   if (!f.read(magic, 8) || memcmp(magic, kMagic, 8) != 0) return fail("not a Saraswati backup");
   uint32_t w, h, n;
   uint8_t white;
+  float paper[3], dpi = 350;
   std::string docPath;
-  if (!get(f, w) || !get(f, h) || !get(f, white) || !getStr(f, docPath) || !get(f, n)) return fail("damaged header");
+  if (!get(f, w) || !get(f, h) || !get(f, white) || !get(f, paper[0]) || !get(f, paper[1]) || !get(f, paper[2]) || !get(f, dpi) ||
+      !getStr(f, docPath) || !get(f, n))
+    return fail("damaged header");
   if (!newDocument(w, h, white != 0)) return false;
+  for (int k = 0; k < 3; ++k) R.paperColor[k] = paper[k];
+  R.docDpi = dpi;
   std::map<uint32_t, uint32_t> idMap;
-  std::vector<std::pair<int, uint32_t>> parents;  // layer index, old parent id
+  std::vector<std::pair<int, uint32_t>> parents, folders;  // layer index, old parent / folder id
+  std::vector<std::pair<uint32_t, std::string>> metas;
+  bool first = true;
   std::string err;
   for (uint32_t i = 0; i < n; ++i) {
     uint32_t id, parent, lw, lh;
     int32_t mode, x0, y0;
-    uint8_t vis, lock;
+    uint8_t vis, lock, bits;
+    std::string meta;
+    uint32_t folderId;
+    ToneFx tone;
+    LayerColorFx lcolor;
     float op;
     std::string name;
     if (!get(f, id) || !get(f, parent) || !getStr(f, name) || !get(f, vis) || !get(f, op) || !get(f, mode) || !get(f, lock) ||
-        !get(f, x0) || !get(f, y0) || !get(f, lw) || !get(f, lh))
+        !get(f, bits) || !get(f, folderId) || !get(f, tone) || !get(f, lcolor) || !getStr(f, meta) || !get(f, x0) || !get(f, y0) ||
+        !get(f, lw) || !get(f, lh))
       return fail("damaged layer " + std::to_string(i));
-    int idx = 0;
-    if (i > 0) {
-      idx = R.addLayer(int(i), err, false);
-      if (idx < 0) return fail(err);
-    }
+    int idx = (bits & 1) ? R.addFolder(int(R.layers.size()), err, false) : R.addLayer(int(R.layers.size()), err, false);
+    if (idx < 0) return fail(err);
+    if (!(bits & 1)) first = false;
     Layer& L = R.layers[size_t(idx)];
+    L.folderId = 0;
+    L.passThrough = (bits & 2) != 0;
+    L.expanded = (bits & 4) != 0;
+    L.clip = (bits & 8) != 0;
+    L.tone = tone;
+    L.lcolor = lcolor;
+    if (folderId) folders.push_back({idx, folderId});
+    if (!meta.empty()) metas.push_back({L.id, meta});
     L.name = name;
     L.visible = vis != 0;
     L.opacity = op;
@@ -279,7 +305,12 @@ bool App::restoreBackup(const std::string& path) {
   }
   for (auto& [idx, parent] : parents)
     if (idMap.count(parent)) R.layers[size_t(idx)].parentId = idMap[parent];
+  for (auto& [idx, folder] : folders)
+    if (idMap.count(folder)) R.layers[size_t(idx)].folderId = idMap[folder];
+  if (!first && R.layers.size() > 1) R.eraseLayerNoUndo(0);  // the empty starting layer of the new document
+  for (auto& [id, m] : metas) applyLayerMeta(R.indexOf(id), m);
   active = int(R.layers.size()) - 1;
+  while (active > 0 && R.layers[size_t(active)].folder) --active;
   documentPath = docPath;
   R.markCachesDirty();
   savedRevision = ~0ull;  // restored work is not saved yet

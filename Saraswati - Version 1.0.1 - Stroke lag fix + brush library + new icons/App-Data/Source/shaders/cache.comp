@@ -18,8 +18,15 @@ void main() {
     if ((pc.flags & FLAG_ONLY_BELOW) == 0) imageStore(aboveImg, px, vec4(0.0));
     return;
   }
+  if ((pc.flags & FLAG_GROUP_BLEND) != 0) {  // folder: its children were composited into binding 3
+    vec4 g = imageLoad(aboveImg, px) * pc.layerOpacity;
+    vec4 d = imageLoad(belowImg, px);
+    imageStore(belowImg, px, (pc.flags & FLAG_CLIP) != 0 ? blendClipped(d, g, pc.mode) : blendLayer(d, g, pc.mode));
+    return;
+  }
   vec4 c = sampleLayer(s) * pc.layerOpacity;
   if ((pc.flags & FLAG_WORK) != 0) imageStore(workImg, px, blendLayer(imageLoad(workImg, px), c, pc.mode));
   else if ((pc.flags & FLAG_ABOVE) != 0) imageStore(aboveImg, px, c + imageLoad(aboveImg, px) * (1.0 - c.a));
+  else if ((pc.flags & FLAG_CLIP) != 0) imageStore(belowImg, px, blendClipped(imageLoad(belowImg, px), c, pc.mode));
   else imageStore(belowImg, px, blendLayer(imageLoad(belowImg, px), c, pc.mode));
 }

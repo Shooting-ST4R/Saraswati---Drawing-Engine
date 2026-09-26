@@ -67,7 +67,7 @@ bool Renderer::uploadRegion(VkImage img, int x, int y, uint32_t w, uint32_t h, u
 
 bool Renderer::paintCoverage(int layer, int x, int y, uint32_t w, uint32_t h, const uint8_t* cov,
                              const StrokeStyle& st, std::string& err) {
-  if (strokeActive || layer < 0 || layer >= int(layers.size())) return false;
+  if (strokeActive || layer < 0 || layer >= int(layers.size()) || layers[size_t(layer)].folder) return false;
   // clip to the document
   int x0 = std::max(x, 0), y0 = std::max(y, 0);
   int x1 = std::min<int64_t>(int64_t(x) + w, docW), y1 = std::min<int64_t>(int64_t(y) + h, docH);
@@ -124,7 +124,7 @@ bool Renderer::uploadSelection(const uint8_t* s, int x, int y, uint32_t w, uint3
 }
 
 bool Renderer::readLayerRegion(int index, int x, int y, uint32_t w, uint32_t h, std::vector<uint8_t>& out, std::string& err) {
-  if (index < 0 || index >= int(layers.size()) || !w || !h) return false;
+  if (index < 0 || index >= int(layers.size()) || !w || !h || layers[size_t(index)].folder) return false;
   out.resize(size_t(w) * h * 4);
   const VkDeviceSize maxStage = 64ull << 20;
   uint32_t rows = uint32_t(std::clamp<VkDeviceSize>(maxStage / (VkDeviceSize(w) * 4), 1, h));
@@ -190,7 +190,7 @@ void Renderer::destroyFloating(Floating& f) {
 }
 
 bool Renderer::stamp(int layer, const Floating& f, const double inv[9], int rx0, int ry0, int rx1, int ry1, std::string& err) {
-  if (layer < 0 || layer >= int(layers.size()) || strokeActive) return false;
+  if (layer < 0 || layer >= int(layers.size()) || strokeActive || layers[size_t(layer)].folder) return false;
   rx0 = std::max(rx0, 0); ry0 = std::max(ry0, 0);
   rx1 = std::min(rx1, int(docW)); ry1 = std::min(ry1, int(docH));
   if (rx0 >= rx1 || ry0 >= ry1) return true;
@@ -230,7 +230,7 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
   if (strokeActive || now - lastThumbNs < 150000000ull) return;
   const uint32_t T = 64;
   for (auto& l : layers) {
-    if (!l.thumbDirty) continue;
+    if (!l.thumbDirty || l.folder) continue;
     uint64_t t0 = SDL_GetTicksNS();
     l.thumbDirty = false;
     lastThumbNs = now;
@@ -288,7 +288,7 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
 }
 
 bool Renderer::applyAdjust(int layer, int type, const float p[4], std::string& err) {
-  if (layer < 0 || layer >= int(layers.size()) || strokeActive) return false;
+  if (layer < 0 || layer >= int(layers.size()) || strokeActive || layers[size_t(layer)].folder) return false;
   Layer& L = layers[layer];
   int rx0 = std::max(L.bx0, 0), ry0 = std::max(L.by0, 0), rx1 = std::min(L.bx1, int(docW)), ry1 = std::min(L.by1, int(docH));
   if (rx0 >= rx1 || ry0 >= ry1) return true;  // empty layer: nothing to change
@@ -338,7 +338,8 @@ void Renderer::destroyNavigator() {
 void Renderer::recordNavigator(VkCommandBuffer cmd) {
   if (!navWanted || !docW || strokeActive) return;
   uint64_t now = SDL_GetTicksNS();
-  uint64_t key = revision * 1000003ull + docSerial * 7919ull + (whitePaper ? 1 : 2);
+  uint64_t key = revision * 1000003ull + docSerial * 7919ull + (whitePaper ? 1 : 2) +
+                 uint64_t(paperColor[0] * 255) * 3 + uint64_t(paperColor[1] * 255) * 1031 + uint64_t(paperColor[2] * 255) * 65537;
   for (auto& l : layers)
     key = key * 1099511628211ull ^ (uint64_t(l.id) << 20 ^ uint64_t(l.visible) << 1 ^ uint64_t(l.opacity * 1000) << 8 ^
                                      uint64_t(l.mode) << 40 ^ uint64_t(l.thumbDirty));
@@ -389,19 +390,14 @@ void Renderer::recordNavigator(VkCommandBuffer cmd) {
   v.zoom = double(tw) / docW;
   VkExtent2D ext{tw, th};
   uint32_t gx = (tw + 15) / 16, gy = (th + 15) / 16;
-  bool first = true;
-  for (auto& l : layers) {
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-    if (first) {  // paper (white or transparent)
-      pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
-      vkCmdDispatch(cmd, gx, gy, 1);
-      memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-      first = false;
-    }
-    if (!l.visible) continue;
-    pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
+  VkDescriptorSet anySet = anyLayerSet();
+  if (anySet) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
+    pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);  // paper (white or transparent)
     vkCmdDispatch(cmd, gx, gy, 1);
     memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+    std::vector<CompItem> items = buildItems();
+    compositeItems(cmd, items, 0, items.size(), CompTarget{navSet0, navImg.view, 0}, v, ext, 0, false, false);
   }
   memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
   lastCpu.thumbMs += (SDL_GetTicksNS() - t0) * 1e-6;
@@ -411,7 +407,7 @@ std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int
   auto r = std::make_shared<AsyncRead>();
   r->device = device;
   r->x = x; r->y = y; r->w = w; r->h = h;
-  if (!w || !h || (!merged && (layer < 0 || layer >= int(layers.size())))) return nullptr;
+  if (!w || !h || (!merged && (layer < 0 || layer >= int(layers.size()) || layers[size_t(layer)].folder))) return nullptr;
   const uint32_t T = 2048;
   // bands of rows, <= ~256 MB each; merged bands are whole flatten-tile rows
   r->bandRows = merged ? T : uint32_t(std::clamp<VkDeviceSize>((256ull << 20) / (VkDeviceSize(w) * 4), 1, h));
@@ -485,17 +481,15 @@ std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int
         v.panY = y + ty + T / 2.0;
         v.zoom = 1;
         memoryBarrier(cmd, all, mem, kCS, kRW);  // previous tile's copy must finish before reuse
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &layers[0].set, 0, nullptr);
+        VkDescriptorSet anySet = anyLayerSet();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &r->tileSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &anySet, 0, nullptr);
         pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
         vkCmdDispatch(cmd, T / 16, T / 16, 1);
         memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-        for (auto& l : layers) {
-          if (!l.visible || l.opacity <= 0) continue;
-          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
-          pushView(cmd, v, ext, 0, compositeOpacity(l), l.mode, int(&l - layers.data()));
-          vkCmdDispatch(cmd, T / 16, T / 16, 1);
-          memoryBarrier(cmd, kCS, kRW, kCS, kRW);
-        }
+        std::vector<CompItem> items = buildItems();
+        compositeItems(cmd, items, 0, items.size(), CompTarget{r->tileSet, r->tile.view, 0}, v, ext, 0, true, false);
         memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy c{};
         c.bufferOffset = VkDeviceSize(tx) * 4;

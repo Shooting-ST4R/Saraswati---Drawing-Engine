@@ -77,7 +77,7 @@ void App::drawNavigator() {
     float w = float(dw * s), h = float(dh * s);
     ImVec2 o(p0.x + (avail.x - w) * 0.5f, p0.y + (ph - h) * 0.5f);
     dl->PushClipRect(p0, p1, true);
-    if (!R.whitePaper) {  // transparent paper: checkerboard behind
+    if (!R.whitePaper || R.paperColor[0] < 1 || R.paperColor[1] < 1 || R.paperColor[2] < 1) {  // checkerboard behind
       float cs = 6;
       dl->AddRectFilled(o, ImVec2(o.x + w, o.y + h), IM_COL32(200, 200, 200, 255));
       for (float y = 0; y < h; y += cs)
@@ -391,64 +391,188 @@ void App::drawToolGroup() {
 }
 
 // ---------------------------------------------------------------------------
-// Sublayers
+// Layer tree: folders (contents stored directly below the folder entry) and attached sublayers
+// (a speech bubble right below its text layer). Every move / delete works on whole nodes and is
+// written back as one reorder (one undo step, folder membership included).
 
 uint32_t App::topLevelId(int index) const {
   const Layer& l = R.layers[size_t(index)];
   return isSublayer(l) ? l.parentId : l.id;
 }
 
-// top-level order (bottom to top) -> full order with every sublayer right below its parent
-void App::applyTopOrder(const std::vector<uint32_t>& top) {
-  std::vector<uint32_t> ids;
-  for (uint32_t t : top) {
-    for (const Layer& l : R.layers)
-      if (isSublayer(l) && l.parentId == t) ids.push_back(l.id);
-    ids.push_back(t);
+namespace {
+struct TNode {
+  uint32_t id = 0;
+  bool folder = false;
+  std::vector<uint32_t> attached;  // sublayers kept right below
+  std::vector<TNode> kids;         // folder contents, bottom to top
+};
+
+std::vector<TNode> buildTree(const Renderer& R) {
+  auto isSub = [&](const Layer& l) { return l.parentId && R.indexOf(l.parentId) >= 0; };
+  std::map<uint32_t, std::vector<int>> byFolder;
+  for (int i = 0; i < int(R.layers.size()); ++i) {
+    const Layer& l = R.layers[size_t(i)];
+    if (isSub(l)) continue;
+    uint32_t f = l.folderId && R.indexOf(l.folderId) >= 0 && R.layers[size_t(R.indexOf(l.folderId))].folder ? l.folderId : 0;
+    byFolder[f].push_back(i);
   }
+  std::function<std::vector<TNode>(uint32_t, int)> build = [&](uint32_t f, int depth) {
+    std::vector<TNode> out;
+    if (depth > 32) return out;
+    for (int i : byFolder[f]) {
+      const Layer& l = R.layers[size_t(i)];
+      TNode n;
+      n.id = l.id;
+      n.folder = l.folder;
+      for (const Layer& s : R.layers)
+        if (isSub(s) && s.parentId == l.id) n.attached.push_back(s.id);
+      if (l.folder) n.kids = build(l.id, depth + 1);
+      out.push_back(std::move(n));
+    }
+    return out;
+  };
+  return build(0, 0);
+}
+
+void flattenTree(const std::vector<TNode>& nodes, uint32_t folder, std::vector<uint32_t>& ids, std::vector<uint32_t>& fids) {
+  for (const TNode& n : nodes) {
+    if (n.folder) flattenTree(n.kids, n.id, ids, fids);
+    for (uint32_t a : n.attached) { ids.push_back(a); fids.push_back(folder); }
+    ids.push_back(n.id);
+    fids.push_back(folder);
+  }
+}
+
+// finds the list holding node `id` and its position there
+bool findNode(std::vector<TNode>& list, uint32_t id, std::vector<TNode>*& owner, size_t& pos, TNode*& parent, TNode* up = nullptr) {
+  for (size_t i = 0; i < list.size(); ++i) {
+    if (list[i].id == id) { owner = &list; pos = i; parent = up; return true; }
+    if (findNode(list[i].kids, id, owner, pos, parent, &list[i])) return true;
+  }
+  return false;
+}
+
+bool subtreeHas(const TNode& n, uint32_t id) {
+  if (n.id == id) return true;
+  for (const TNode& k : n.kids)
+    if (subtreeHas(k, id)) return true;
+  return false;
+}
+}  // namespace
+
+void App::applyTree(const void* treePtr) {
+  const auto& tree = *static_cast<const std::vector<TNode>*>(treePtr);
+  std::vector<uint32_t> ids, fids;
+  flattenTree(tree, 0, ids, fids);
+  if (ids.size() != R.layers.size()) return;  // never lose a layer
   uint32_t act = R.layers[size_t(active)].id;
-  R.reorderLayers(ids);
+  R.reorderLayers(ids, fids);
   active = std::max(0, R.indexOf(act));
 }
 
-static std::vector<uint32_t> topOrder(const Renderer& R) {
-  std::vector<uint32_t> top;
-  for (const Layer& l : R.layers)
-    if (!(l.parentId && R.indexOf(l.parentId) >= 0)) top.push_back(l.id);
-  return top;
-}
-
 void App::moveLayerBlock(int index, int dir) {
-  std::vector<uint32_t> top = topOrder(R);
-  auto it = std::find(top.begin(), top.end(), topLevelId(index));
-  if (it == top.end()) return;
-  size_t i = size_t(it - top.begin());
-  if (dir > 0 && i + 1 < top.size()) std::swap(top[i], top[i + 1]);
-  else if (dir < 0 && i > 0) std::swap(top[i], top[i - 1]);
-  else return;
-  applyTopOrder(top);
+  std::vector<TNode> tree = buildTree(R);
+  std::vector<TNode>* owner = nullptr;
+  size_t pos = 0;
+  TNode* parent = nullptr;
+  if (!findNode(tree, topLevelId(index), owner, pos, parent)) return;
+  if (dir > 0 && pos + 1 < owner->size()) std::swap((*owner)[pos], (*owner)[pos + 1]);
+  else if (dir < 0 && pos > 0) std::swap((*owner)[pos], (*owner)[pos - 1]);
+  else if (parent) {  // at the edge of a folder: move out of it, next to the folder
+    TNode n = std::move((*owner)[pos]);
+    owner->erase(owner->begin() + long(pos));
+    std::vector<TNode>* powner = nullptr;
+    size_t ppos = 0;
+    TNode* pp = nullptr;
+    if (!findNode(tree, parent->id, powner, ppos, pp)) return;
+    powner->insert(powner->begin() + long(dir > 0 ? ppos + 1 : ppos), std::move(n));
+  } else {
+    return;
+  }
+  applyTree(&tree);
 }
 
 void App::dropLayerBlock(int from, int onto) {
   if (from == onto) return;
-  std::vector<uint32_t> top = topOrder(R);
   uint32_t a = topLevelId(from), b = topLevelId(onto);
   if (a == b) return;
-  top.erase(std::find(top.begin(), top.end(), a));
-  auto pos = std::find(top.begin(), top.end(), b);
-  top.insert(from < onto ? pos + 1 : pos, a);  // dragged up: above the target, down: below it
-  applyTopOrder(top);
+  std::vector<TNode> tree = buildTree(R);
+  std::vector<TNode>* owner = nullptr;
+  size_t pos = 0;
+  TNode* parent = nullptr;
+  if (!findNode(tree, a, owner, pos, parent)) return;
+  if (subtreeHas((*owner)[pos], b)) return;  // not into itself
+  TNode n = std::move((*owner)[pos]);
+  owner->erase(owner->begin() + long(pos));
+  std::vector<TNode>* towner = nullptr;
+  size_t tpos = 0;
+  TNode* tparent = nullptr;
+  if (!findNode(tree, b, towner, tpos, tparent)) return;
+  TNode& target = (*towner)[tpos];
+  if (target.folder) target.kids.push_back(std::move(n));  // onto a folder: inside, on top
+  else towner->insert(towner->begin() + long(from < onto ? tpos + 1 : tpos), std::move(n));
+  applyTree(&tree);
 }
 
 void App::deleteLayerBlock(int index) {
-  uint32_t id = R.layers[size_t(index)].id;
-  std::vector<uint32_t> kids;
+  std::vector<TNode> tree = buildTree(R);
+  std::vector<TNode>* owner = nullptr;
+  size_t pos = 0;
+  TNode* parent = nullptr;
+  if (!findNode(tree, topLevelId(index), owner, pos, parent)) return;
+  std::vector<uint32_t> ids, fids;
+  flattenTree(std::vector<TNode>{(*owner)[pos]}, 0, ids, fids);
+  int imageLayersLeft = 0;
   for (const Layer& l : R.layers)
-    if (l.parentId == id) kids.push_back(l.id);
-  if (R.layers.size() <= 1 + kids.size()) return;
-  for (uint32_t k : kids) R.deleteLayer(R.indexOf(k));
-  R.deleteLayer(R.indexOf(id));
+    if (!l.folder && std::find(ids.begin(), ids.end(), l.id) == ids.end()) ++imageLayersLeft;
+  if (imageLayersLeft == 0) { showToast("The last layer cannot be deleted"); return; }
+  for (auto it = ids.rbegin(); it != ids.rend(); ++it) R.deleteLayer(R.indexOf(*it));
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
+  if (R.layers[size_t(active)].folder) {  // prefer a drawable layer
+    for (int i = active; i >= 0; --i) if (!R.layers[size_t(i)].folder) { active = i; break; }
+  }
+}
+
+int App::layerDepth(int index) const {
+  int d = 0;
+  uint32_t f = R.layers[size_t(index)].folderId;
+  while (f && d < 32) {
+    int i = R.indexOf(f);
+    if (i < 0) break;
+    ++d;
+    f = R.layers[size_t(i)].folderId;
+  }
+  return d;
+}
+
+bool App::layerShown(int index) const {  // false when an enclosing folder is collapsed
+  uint32_t f = R.layers[size_t(index)].folderId;
+  int guard = 0;
+  while (f && guard++ < 32) {
+    int i = R.indexOf(f);
+    if (i < 0) break;
+    if (!R.layers[size_t(i)].expanded) return false;
+    f = R.layers[size_t(i)].folderId;
+  }
+  if (isSublayer(R.layers[size_t(index)])) {
+    int p = R.indexOf(R.layers[size_t(index)].parentId);
+    if (p >= 0) return layerShown(p);
+  }
+  return true;
+}
+
+bool App::needPixelLayer() {
+  if (!R.hasDocument()) return false;
+  if (paperSelected) {
+    showToast("The paper is selected - pick a layer to draw on");
+    return false;
+  }
+  if (R.layers[size_t(active)].folder) {
+    showToast("A folder is selected - pick a layer inside it to draw or edit");
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +582,17 @@ void App::drawLayerProperties() {
   if (!ImGui::Begin("Layer Properties", &showLayerProps)) { ImGui::End(); return; }
   if (!R.hasDocument()) { ImGui::TextDisabled("No document"); ImGui::End(); return; }
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
+  if (paperSelected) {  // the paper has one option: its colour
+    ImGui::TextDisabled("Paper");
+    ImGui::SeparatorText("Paper colour");
+    if (ImGui::ColorEdit3("##paper", R.paperColor, ImGuiColorEditFlags_NoAlpha)) { R.markCachesDirty(); R.bumpRevision(); }
+    if (ImGui::Button("White")) { R.paperColor[0] = R.paperColor[1] = R.paperColor[2] = 1; R.markCachesDirty(); R.bumpRevision(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Use drawing colour")) { for (int k = 0; k < 3; ++k) R.paperColor[k] = color[k]; R.markCachesDirty(); R.bumpRevision(); }
+    ImGui::TextDisabled("The paper is not pixels: one colour under the whole\npicture. It is always the bottom of the stack.");
+    ImGui::End();
+    return;
+  }
   Layer& L = R.layers[size_t(active)];
   ImGui::TextDisabled("%s", L.name.c_str());
   bool changed = false;

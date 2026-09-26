@@ -19,12 +19,20 @@ struct DocLayer {
   bool visible = true;
   float opacity = 1.0f;
   BlendMode mode = BlendMode::Normal;
+  int section = 0;          // 0 layer, 1 folder (open), 2 folder (closed), 3 end of a folder's contents
+  bool passThrough = false; // folder blend "Through" (PSD 'pass')
+  bool clip = false;        // clipped to the layer below
+  std::string meta;         // Saraswati-only layer data (effects, editable text, ...), private PSD block
 };
 
 struct DocFile {
   uint32_t w = 0, h = 0;
   std::vector<DocLayer> layers;  // bottom to top
   std::vector<std::string> warnings;
+  // paper (a colour under all layers, not pixels); stored in a private PSD resource
+  bool hasPaper = false, paperVisible = true;
+  uint8_t paper[3] = {255, 255, 255};
+  float dpi = 350;
 };
 
 bool isPsdPath(const std::string& path);
@@ -40,7 +48,7 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
 bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err);
 
 // Safe saving: write to a temporary file (flushed to disk), read it back and compare, then replace.
-struct PsdCheck { int32_t x = 0, y = 0; uint32_t w = 0, h = 0; uint64_t hash = 0; bool visible = true; uint8_t opacity = 255; BlendMode mode = BlendMode::Normal; };
+struct PsdCheck { int32_t x = 0, y = 0; uint32_t w = 0, h = 0; uint64_t hash = 0; bool visible = true; uint8_t opacity = 255; BlendMode mode = BlendMode::Normal; int section = 0; bool passThrough = false; bool clip = false; std::string meta; };
 bool writePsdFile(const std::string& tmp, const DocFile& doc, const ImageRGBA& merged, std::string& err, float* progress = nullptr);
 std::vector<PsdCheck> psdChecks(const DocFile& doc);
 bool verifyPsd(const std::string& file, uint32_t w, uint32_t h, const std::vector<PsdCheck>& expect, std::string& err);
