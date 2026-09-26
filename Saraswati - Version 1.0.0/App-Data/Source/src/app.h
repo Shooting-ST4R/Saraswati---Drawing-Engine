@@ -98,7 +98,10 @@ class App {
 
   // pointer state
   float penPressure = 1;
-  bool penDownPending = false;  // pen touched; stroke starts on the first pressure/motion sample
+  bool penDownPending = false;  // pen touched; stroke starts on the first real pressure sample
+  bool penHasPressure = false;  // this pen has reported pressure at least once
+  std::vector<std::pair<float, float>> penDownMoves;  // motion received before the first pressure
+  bool dragFromPen = false;     // the current pan/rotate drag was started by the pen
   float penDownX = 0, penDownY = 0;
   bool penDownEraser = false;
   uint64_t penDownNs = 0;
@@ -149,6 +152,8 @@ class App {
     std::vector<uint8_t> cov;
   };
   std::future<FloodResult> floodJob;
+  std::shared_ptr<AsyncRead> floodRead;
+  uint64_t floodRevision = 0, floodDoc = 0;
   bool flooding = false;
   void startFlood(double dx, double dy, bool isFill);
   void pollFlood();

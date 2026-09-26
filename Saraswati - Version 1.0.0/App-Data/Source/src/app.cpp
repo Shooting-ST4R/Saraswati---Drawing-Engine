@@ -163,6 +163,7 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   }
   if (spaceDown) {
     drag = shiftDown ? Drag::Rotate : Drag::Pan;
+    dragFromPen = pen;
     dragX = sx;
     dragY = sy;
     dragStartAngle = std::atan2(sy - R.extent.height * 0.5, sx - R.extent.width * 0.5);
@@ -223,7 +224,10 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
 
 void App::pointerUp(bool pen) {
   if (sizeDrag) { sizeDrag = false; return; }
-  if (drag != Drag::None) { drag = Drag::None; return; }
+  if (drag != Drag::None) {
+    if (dragFromPen == pen) drag = Drag::None;  // the pen leaving range must not end a mouse drag
+    return;
+  }
   if (toolDrag) {
     double dx, dy;
     screenToDoc(lastX, lastY, dx, dy);
@@ -239,6 +243,8 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
   ctrlDown = (k.mod & SDL_KMOD_CTRL) != 0;
   altDown = (k.mod & SDL_KMOD_ALT) != 0;
   if (!down || ImGui::GetIO().WantTextInput) return;
+  // while a panel widget has the keyboard, only Tab reaches the canvas shortcuts
+  if (ImGui::GetIO().WantCaptureKeyboard && k.key != SDLK_TAB) return;
   bool ctrl = ctrlDown, shift = shiftDown;
   switch (k.key) {
     case SDLK_1: if (ctrl) { view.zoom = 1; } else tipIndex = 0; break;
@@ -295,18 +301,23 @@ void App::handleEvent(const SDL_Event& e) {
     case SDL_EVENT_PEN_AXIS:
       if (e.paxis.axis == SDL_PEN_AXIS_PRESSURE) {
         penPressure = e.paxis.value;
+        penHasPressure = true;
         if (penDownPending) {
+          // first real pressure of this touch: start the stroke, replaying any buffered motion
           penDownPending = false;
           pointerDown(penDownX, penDownY, penPressure, penDownEraser, true, penDownNs);
+          for (auto& m : penDownMoves) pointerMove(m.first, m.second, penPressure, true, e.paxis.timestamp);
+          penDownMoves.clear();
         } else if (engine.active() && strokeFromPen) {
           pointerMove(e.paxis.x, e.paxis.y, penPressure, true, e.paxis.timestamp);
         }
       }
       break;
     case SDL_EVENT_PEN_DOWN:
-      // Windows Ink may deliver PEN_DOWN before the first pressure value of the new touch;
-      // start the stroke on the next pressure/motion sample so the first dab gets real pressure.
+      // Windows Ink may deliver PEN_DOWN (and even motion) before the first pressure value of the
+      // new touch: wait for it so the first dab never uses the hover / previous-stroke pressure.
       penDownPending = true;
+      penDownMoves.clear();
       penDownX = e.ptouch.x;
       penDownY = e.ptouch.y;
       penDownEraser = e.ptouch.eraser;
@@ -314,20 +325,45 @@ void App::handleEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_PEN_MOTION:
       if (penDownPending) {
+        penDownMoves.push_back({e.pmotion.x, e.pmotion.y});
+        if (penDownMoves.size() < 4) break;
+        // no pressure after several samples: a pen without pressure support (use full pressure)
         penDownPending = false;
-        pointerDown(penDownX, penDownY, penPressure, penDownEraser, true, penDownNs);
+        float p = penHasPressure ? penPressure : 1.0f;
+        pointerDown(penDownX, penDownY, p, penDownEraser, true, penDownNs);
+        for (auto& m : penDownMoves) pointerMove(m.first, m.second, p, true, e.pmotion.timestamp);
+        penDownMoves.clear();
+        break;
       }
-      pointerMove(e.pmotion.x, e.pmotion.y, penPressure, true, e.pmotion.timestamp);
+      pointerMove(e.pmotion.x, e.pmotion.y, penHasPressure ? penPressure : 1.0f, true, e.pmotion.timestamp);
       break;
     case SDL_EVENT_PEN_UP:
       if (penDownPending) {  // a tap: draw a single dab
         penDownPending = false;
-        pointerDown(penDownX, penDownY, penPressure, penDownEraser, true, penDownNs);
+        pointerDown(penDownX, penDownY, penHasPressure ? std::max(penPressure, 0.3f) : 1.0f, penDownEraser, true, penDownNs);
+        penDownMoves.clear();
       }
       pointerUp(true);
       break;
+    case SDL_EVENT_PEN_BUTTON_DOWN:
+      // barrel buttons: lower (1) = hold to pan, upper (2) = pick colour
+      if (ImGui::GetIO().WantCaptureMouse) break;
+      if (e.pbutton.button == 1) {
+        drag = Drag::Pan;
+        dragFromPen = true;
+        dragX = e.pbutton.x * density;
+        dragY = e.pbutton.y * density;
+      } else if (e.pbutton.button == 2) {
+        for (int k = 0; k < 3; ++k) pickPrev[k] = color[k];
+        R.requestPick(int(e.pbutton.x * density), int(e.pbutton.y * density));
+      }
+      break;
+    case SDL_EVENT_PEN_BUTTON_UP:
+      if (e.pbutton.button == 1 && drag == Drag::Pan && dragFromPen) drag = Drag::None;
+      break;
     case SDL_EVENT_PEN_PROXIMITY_OUT:
       penDownPending = false;
+      penDownMoves.clear();
       pointerUp(true);
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -336,6 +372,7 @@ void App::handleEvent(const SDL_Event& e) {
         pointerDown(e.button.x, e.button.y, 1.0f, false, false, e.button.timestamp);
       } else if (e.button.button == SDL_BUTTON_MIDDLE && !ImGui::GetIO().WantCaptureMouse) {
         drag = Drag::Pan;
+        dragFromPen = false;
         dragX = e.button.x * density;
         dragY = e.button.y * density;
       }
@@ -785,9 +822,14 @@ void App::drawLayerPanel() {
     ImGui::SameLine();
     if (iconBtn("##down", "Move layer down", active > 0, 4)) { R.moveLayer(active, -1); --active; }
     ImGui::SameLine();
-    ImGui::TextDisabled("%d / %d%s", int(R.layers.size()), R.limit.maxLayers, R.cpuEmulation ? " est." : "");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Layers / maximum that fit in GPU memory at this size (%s each)",
-                                                 fmtBytes(double(R.limit.layerBytes)).c_str());
+    char cnt[32];
+    snprintf(cnt, sizeof cnt, "%d / %d", int(R.layers.size()), R.limit.maxLayers);
+    if (ImGui::CalcTextSize(cnt).x <= ImGui::GetContentRegionAvail().x) {
+      ImGui::TextDisabled("%s", cnt);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Layers / maximum that fit in GPU memory at this size (%s each)%s",
+                          fmtBytes(double(R.limit.layerBytes)).c_str(), R.cpuEmulation ? "\nEstimate: CPU emulation" : "");
+    }
   }
   ImGui::EndDisabled();
   ImGui::End();
@@ -1270,6 +1312,7 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
   if (flooding) floodJob.wait();
+  R.finishAsyncRead(floodRead);
   if (xf.active) R.destroyFloating(xf.fl);
   saveSettings();
 }

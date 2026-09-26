@@ -279,3 +279,123 @@ void Renderer::updateThumbnails(int maxCount) {
     endOneShot(cmd);
   }
 }
+
+std::shared_ptr<AsyncRead> Renderer::readRegionAsync(bool merged, int layer, int x, int y, uint32_t w, uint32_t h, std::string& err) {
+  auto r = std::make_shared<AsyncRead>();
+  r->device = device;
+  r->x = x; r->y = y; r->w = w; r->h = h;
+  if (!w || !h || (!merged && (layer < 0 || layer >= int(layers.size())))) return nullptr;
+  const uint32_t T = 2048;
+  // bands of rows, <= ~256 MB each; merged bands are whole flatten-tile rows
+  r->bandRows = merged ? T : uint32_t(std::clamp<VkDeviceSize>((256ull << 20) / (VkDeviceSize(w) * 4), 1, h));
+  auto fail = [&](const std::string& m) { err = m; finishAsyncRead(r); return nullptr; };
+  for (uint32_t y0 = 0; y0 < h; y0 += r->bandRows) {
+    GpuBuffer b;
+    uint32_t n = std::min(r->bandRows, h - y0);
+    if (createBuffer(device, memProps, VkDeviceSize(w) * n * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b, true) != VK_SUCCESS)
+      return fail("Not enough memory for the read-back.");
+    r->bands.push_back(b);
+  }
+  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  pci.queueFamilyIndex = queueFamily;
+  VK_CHECK(vkCreateCommandPool(device, &pci, nullptr, &r->pool));
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = r->pool;
+  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cmd;
+  VK_CHECK(vkAllocateCommandBuffers(device, &ai, &cmd));
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+  const VkPipelineStageFlags all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  const VkAccessFlags mem = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  memoryBarrier(cmd, all, mem, all, mem);
+  if (!merged) {
+    for (size_t i = 0; i < r->bands.size(); ++i) {
+      uint32_t y0 = uint32_t(i) * r->bandRows, n = std::min(r->bandRows, h - y0);
+      VkBufferImageCopy c{};
+      c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      c.imageOffset = {x, y + int32_t(y0), 0};
+      c.imageExtent = {w, n, 1};
+      vkCmdCopyImageToBuffer(cmd, layers[layer].image.image, VK_IMAGE_LAYOUT_GENERAL, r->bands[i].buffer, 1, &c);
+    }
+  } else {
+    // flatten 2048 x 2048 tiles with the cache shader (same maths as the screen), copy each out
+    if (createImage(device, memProps, T, T, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    r->tile) != VK_SUCCESS) {
+      vkEndCommandBuffer(cmd);
+      return fail("Not enough GPU memory for the read-back.");
+    }
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = descPool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &set0Layout;
+    VK_CHECK(vkAllocateDescriptorSets(device, &dai, &r->tileSet));
+    VkDescriptorImageInfo ii{VK_NULL_HANDLE, r->tile.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[3] = {};
+    for (int k = 0; k < 3; ++k) {
+      wr[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      wr[k].dstSet = r->tileSet;
+      wr[k].dstBinding = uint32_t(2 + k);
+      wr[k].descriptorCount = 1;
+      wr[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      wr[k].pImageInfo = &ii;
+    }
+    vkUpdateDescriptorSets(device, 3, wr, 0, nullptr);
+    imageBarrier(cmd, r->tile.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, all, 0, all, mem);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &r->tileSet, 0, nullptr);
+    VkExtent2D ext{T, T};
+    for (uint32_t ty = 0; ty < h; ty += T)
+      for (uint32_t tx = 0; tx < w; tx += T) {
+        View v;
+        v.panX = x + tx + T / 2.0;
+        v.panY = y + ty + T / 2.0;
+        v.zoom = 1;
+        memoryBarrier(cmd, all, mem, kCS, kRW);  // previous tile's copy must finish before reuse
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &layers[0].set, 0, nullptr);
+        pushView(cmd, v, ext, 32 /*INIT*/ | 128 /*ONLY_BELOW*/, 1, BlendMode::Normal);
+        vkCmdDispatch(cmd, T / 16, T / 16, 1);
+        memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+        for (auto& l : layers) {
+          if (!l.visible || l.opacity <= 0) continue;
+          vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &l.set, 0, nullptr);
+          pushView(cmd, v, ext, 0, l.opacity, l.mode);
+          vkCmdDispatch(cmd, T / 16, T / 16, 1);
+          memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+        }
+        memoryBarrier(cmd, kCS, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy c{};
+        c.bufferOffset = VkDeviceSize(tx) * 4;
+        c.bufferRowLength = w;
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {std::min(T, w - tx), std::min(T, h - ty), 1};
+        vkCmdCopyImageToBuffer(cmd, r->tile.image, VK_IMAGE_LAYOUT_GENERAL, r->bands[ty / T].buffer, 1, &c);
+      }
+  }
+  memoryBarrier(cmd, all, mem, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+  VK_CHECK(vkEndCommandBuffer(cmd));
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VK_CHECK(vkCreateFence(device, &fci, nullptr, &r->fence));
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  VK_CHECK(vkQueueSubmit(queue, 1, &si, r->fence));  // no wait: frames keep flowing
+  return r;
+}
+
+void Renderer::finishAsyncRead(std::shared_ptr<AsyncRead>& r) {
+  if (!r) return;
+  if (r->fence) {
+    vkWaitForFences(device, 1, &r->fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(device, r->fence, nullptr);
+  }
+  if (r->pool) vkDestroyCommandPool(device, r->pool, nullptr);
+  for (auto& b : r->bands) destroyBuffer(device, b);
+  if (r->tileSet) vkFreeDescriptorSets(device, descPool, 1, &r->tileSet);
+  destroyImage(device, r->tile);
+  r.reset();
+}

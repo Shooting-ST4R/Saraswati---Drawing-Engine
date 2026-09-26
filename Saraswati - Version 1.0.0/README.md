@@ -76,7 +76,8 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 | Brush size | [ and ], or Ctrl+Alt+drag on the canvas |
 | Swap colour / background colour | X |
 | Straight line from the last stroke | Shift+click |
-| Eyedropper | I, or Alt+click while painting |
+| Eyedropper | I, or Alt+click while painting, or the pen's upper barrel button |
+| Pan with the pen | hold the lower barrel button |
 | Fill / gradient | G / Shift+G |
 | Line → rectangle → ellipse | U (press again to cycle) |
 | Rectangle / ellipse select | M (press again to switch) |

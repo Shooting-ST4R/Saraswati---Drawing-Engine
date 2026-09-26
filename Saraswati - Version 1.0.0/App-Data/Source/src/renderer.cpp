@@ -984,6 +984,7 @@ bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err)
   LayerLimit L = computeLayerLimit(w, h);
   if (!L.ok) { err = L.reason; return false; }
   destroyDocument();
+  ++docSerial;
   docW = w;
   docH = h;
   whitePaper = white;

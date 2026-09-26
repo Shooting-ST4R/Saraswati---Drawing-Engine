@@ -269,13 +269,12 @@ void App::startFlood(double dx, double dy, bool isFill) {
   else grow(R.layers[active]);
   uint8_t outside[4] = {0, 0, 0, 0};
   if (all && R.whitePaper) outside[0] = outside[1] = outside[2] = outside[3] = 255;
-  auto px = std::make_shared<std::vector<uint8_t>>();
+  // GPU copies the painted area into host memory; the worker waits for it (the UI never does)
+  std::shared_ptr<AsyncRead> rd;
   std::string err;
-  R.waitIdle();
   if (bx0 < bx1) {
-    bool ok = all ? R.readMergedRegion(bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), *px, err)
-                  : R.readLayerRegion(active, bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), *px, err);
-    if (!ok) { error(err); return; }
+    rd = R.readRegionAsync(all, active, bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), err);
+    if (!rd) { error(err.empty() ? "Read-back failed" : err); return; }
   }
   float tol = isFill ? fillTol : wandTol;
   bool contiguous = isFill ? fillContiguous : wandContiguous;
@@ -284,14 +283,17 @@ void App::startFlood(double dx, double dy, bool isFill) {
   uint32_t layerId = R.layers[active].id;
   std::array<uint8_t, 4> out{outside[0], outside[1], outside[2], outside[3]};
   flooding = true;
+  floodRead = rd;
+  floodRevision = R.revision;
+  floodDoc = R.docSerial;
   floodJob = std::async(std::launch::async, [=]() {
     FloodResult res;
     res.isFill = isFill;
     res.op = op;
     res.layerId = layerId;
-    int bw = bx1 - bx0;
+    if (rd && !rd->wait()) return res;
     auto pix = [&](int x, int y) -> const uint8_t* {
-      if (x >= bx0 && x < bx1 && y >= by0 && y < by1) return &(*px)[(size_t(y - by0) * bw + (x - bx0)) * 4];
+      if (x >= bx0 && x < bx1 && y >= by0 && y < by1) return rd->pixel(x, y);
       return out.data();
     };
     const uint8_t* s0 = pix(sx, sy);
@@ -366,7 +368,14 @@ void App::pollFlood() {
   if (!flooding || floodJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
   flooding = false;
   FloodResult r = floodJob.get();
+  R.finishAsyncRead(floodRead);
   if (!r.ok || !r.w) return;
+  // the canvas changed (or another document was opened) while computing: the result is stale
+  if (R.docSerial != floodDoc || R.revision != floodRevision) {
+    toast = r.isFill ? "Fill cancelled - the picture changed meanwhile" : "Selection cancelled - the picture changed meanwhile";
+    toastUntil = SDL_GetTicksNS() + 3000000000ull;
+    return;
+  }
   if (r.isFill) {
     int li = R.indexOf(r.layerId);
     if (li < 0) return;
@@ -814,6 +823,18 @@ void App::drawToolbar() {
   ImGui::Dummy(ImVec2(0, 4));
   ImGui::ColorButton("##cur", ImVec4(color[0], color[1], color[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(bs, bs));
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Current colour");
+  // brush size and opacity always at hand (vertical sliders, like CSP / Procreate)
+  float left = ImGui::GetContentRegionAvail().y - 8;
+  if (left > 120) {
+    float vh = std::min(180.0f, (left - 8) / 2);
+    float vw = std::max(8.0f, (bs - ImGui::GetStyle().ItemSpacing.x) / 2);
+    BrushSettings& b = brushes[tipIndex];
+    ImGui::VSliderFloat("##vsize", ImVec2(vw, vh), &b.size, 1.0f, 5000.0f, "", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetTooltip("Brush size %.1f px  ([ ])", b.size);
+    ImGui::SameLine();
+    ImGui::VSliderFloat("##vop", ImVec2(vw, vh), &b.opacity, 0.0f, 1.0f, "");
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetTooltip("Brush opacity %.0f %%", b.opacity * 100);
+  }
   ImGui::End();
   ImGui::PopStyleVar(2);
 }
@@ -1039,6 +1060,10 @@ void App::buildToolTest() {
   demo.push_back([this] { R.recordLayerProps(1); R.layers[1].opacity = 0.2f; R.markCachesDirty(); });
   demo.push_back([this] { R.undo(); });  // opacity back to 100 %
   demo.push_back([this] { brushes[0].size = 8; });
+  // fill on the (empty) top layer, referring to all visible layers: fills the hole in the green rectangle
+  demo.push_back([this] { active = int(R.layers.size()) - 1; fillSampleAll = true; color[0] = 1.0f; color[1] = 0.55f; color[2] = 0.1f; });
+  demo.push_back([this] { tool = ToolId::Fill; toolDown(1300, 250, 0, 0); });
+  demo.push_back([this] { fillSampleAll = false; });
   // lasso selection left active: marching ants
   demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
   demo.push_back([this] { tool = ToolId::Brush; });

@@ -76,6 +76,26 @@ struct RendererOptions {
   bool validation = false;
 };
 
+// Non-blocking readback: GPU copies into host buffers (bands of rows), signalled by a fence.
+// A worker thread calls wait() and reads the mapped bands; the main thread calls
+// Renderer::finishAsyncRead() afterwards to release everything.
+struct AsyncRead {
+  VkDevice device = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  std::vector<GpuBuffer> bands;
+  uint32_t bandRows = 0;
+  int x = 0, y = 0;
+  uint32_t w = 0, h = 0;
+  GpuImage tile;                          // merged: flatten target
+  VkDescriptorSet tileSet = VK_NULL_HANDLE;
+  bool wait() const { return vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS; }
+  const uint8_t* pixel(int px, int py) const {  // premultiplied RGBA, document coordinates
+    uint32_t r = uint32_t(py - y);
+    return (const uint8_t*)bands[r / bandRows].mapped + (size_t(r % bandRows) * w + uint32_t(px - x)) * 4;
+  }
+};
+
 // Transform tool: a floating copy of pixels (straight alpha) + its descriptor sets.
 struct Floating {
   GpuImage image;
@@ -151,6 +171,9 @@ class Renderer {
   bool uploadSelection(const uint8_t* docSizeSel, int x, int y, uint32_t w, uint32_t h, std::string& err);
   void setSelectionActive(bool on) { if (selectionActive != on) { selectionActive = on; } }
   bool selectionActive = false;
+  std::shared_ptr<AsyncRead> readRegionAsync(bool merged, int layer, int x, int y, uint32_t w, uint32_t h, std::string& err);
+  void finishAsyncRead(std::shared_ptr<AsyncRead>& r);
+  uint64_t docSerial = 0;  // increases with every new/opened document
   bool readLayerRegion(int index, int x, int y, uint32_t w, uint32_t h, std::vector<uint8_t>& premulRgba, std::string& err);
   bool createFloating(uint32_t w, uint32_t h, const uint8_t* straightRgba, Floating& f, std::string& err);
   void destroyFloating(Floating& f);
