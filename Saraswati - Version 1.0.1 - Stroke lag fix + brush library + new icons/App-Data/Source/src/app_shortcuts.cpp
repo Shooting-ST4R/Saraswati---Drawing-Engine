@@ -151,6 +151,10 @@ void App::runAction(Act a, SDL_Keycode key, bool repeat) {
       else if (a == Act::InvertSel) invertSelection();
       else if (!xf.active) fillSelection(a == Act::ClearSel);
       break;
+    case Act::Cut: if (!repeat && !busyStroke) copySelection(true); break;
+    case Act::Copy: if (!repeat && !busyStroke) copySelection(false); break;
+    case Act::Paste: if (!repeat && !busyStroke) pasteClipboard(); break;
+    case Act::ClearOutside: if (!repeat && !busyStroke) clearOutsideSelection(); break;
     case Act::SwapColors: if (!repeat) for (int c = 0; c < 3; ++c) std::swap(color[c], bgColor[c]); break;
     case Act::BrushSmaller: brushes[tipIndex].size = std::max(1.0f, brushes[tipIndex].size / 1.15f); break;
     case Act::BrushBigger: brushes[tipIndex].size = std::min(5000.0f, brushes[tipIndex].size * 1.15f); break;

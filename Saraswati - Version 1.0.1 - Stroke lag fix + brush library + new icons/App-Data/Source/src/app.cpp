@@ -179,7 +179,7 @@ void App::pointerDown(float x, float y, float pressure, bool eraser, bool pen, u
   float sx = x * density, sy = y * density;
   lastX = sx;
   lastY = sy;
-  if (ImGui::GetIO().WantCaptureMouse) return;
+  if (ImGui::GetIO().WantCaptureMouse || adj.open) return;
   if (ctrlDown && altDown && !spaceDown && !rotateDown) {  // Ctrl+Alt+drag: brush size
     sizeDrag = true;
     sizeDragX = sx;
@@ -306,6 +306,9 @@ void App::handleEvent(const SDL_Event& e) {
     case SDL_EVENT_QUIT:
       if (opt.exitAfter) running = false;
       else requestAction(PA_Quit);
+      break;
+    case SDL_EVENT_CLIPBOARD_UPDATE:
+      if (!e.clipboard.owner) clipExternal = true;  // another app copied something after us
       break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
       releaseAllKeys();  // key-ups are not delivered while another window has focus
@@ -1298,13 +1301,36 @@ void App::drawUI() {
       if (ImGui::MenuItem("Undo", sk(Act::Undo), false, R.canUndo() && canEdit)) R.undo();
       if (ImGui::MenuItem("Redo", sk(Act::Redo), false, R.canRedo() && canEdit)) R.redo();
       ImGui::Separator();
-      if (ImGui::MenuItem("Fill", sk(Act::FillSel), false, !R.busy() && !xf.active)) fillSelection(false);
-      if (ImGui::MenuItem("Clear", sk(Act::ClearSel), false, !R.busy() && !xf.active)) fillSelection(true);
-      if (ImGui::MenuItem("Transform", sk(Act::ToolTransform), false, !R.busy())) setTool(ToolId::Transform);
+      bool ready = R.hasDocument() && !R.busy() && !xf.active && !clipping;
+      if (ImGui::MenuItem("Cut", sk(Act::Cut), false, ready)) copySelection(true);
+      if (ImGui::MenuItem("Copy", sk(Act::Copy), false, ready)) copySelection(false);
+      if (ImGui::MenuItem("Paste", sk(Act::Paste), false, ready)) pasteClipboard();
       ImGui::Separator();
-      if (ImGui::MenuItem("Select all", sk(Act::SelectAll))) selectAll();
-      if (ImGui::MenuItem("Deselect", sk(Act::Deselect), false, selActive)) deselect();
-      if (ImGui::MenuItem("Invert selection", sk(Act::InvertSel))) invertSelection();
+      if (ImGui::MenuItem("Clear", sk(Act::ClearSel), false, ready)) fillSelection(true);
+      if (ImGui::MenuItem("Clear outside the selection", sk(Act::ClearOutside), false, ready && selActive)) clearOutsideSelection();
+      if (ImGui::MenuItem("Fill", sk(Act::FillSel), false, ready)) fillSelection(false);
+      ImGui::Separator();
+      if (ImGui::BeginMenu("Tonal correction", ready)) {
+        if (ImGui::MenuItem("Brightness / Contrast...")) openAdjust(1);
+        if (ImGui::MenuItem("Hue / Saturation / Luminosity...")) openAdjust(2);
+        if (ImGui::MenuItem("Posterize...")) openAdjust(4);
+        if (ImGui::MenuItem("Threshold (black and white)...")) openAdjust(5);
+        if (ImGui::MenuItem("Invert colours")) openAdjust(3);
+        ImGui::EndMenu();
+      }
+      if (ImGui::MenuItem("Convert brightness to opacity", nullptr, false, ready)) openAdjust(6);
+      if (ImGui::MenuItem("Change colour to drawing colour", nullptr, false, ready)) openAdjust(7);
+      ImGui::Separator();
+      if (ImGui::BeginMenu("Transform", R.hasDocument() && !R.busy())) {
+        if (ImGui::MenuItem("Free transform", sk(Act::ToolTransform))) setTool(ToolId::Transform);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Flip horizontally")) transformLayer(0);
+        if (ImGui::MenuItem("Flip vertically")) transformLayer(1);
+        if (ImGui::MenuItem("Rotate 90 deg clockwise")) transformLayer(2);
+        if (ImGui::MenuItem("Rotate 90 deg counter-clockwise")) transformLayer(3);
+        if (ImGui::MenuItem("Rotate 180 deg")) transformLayer(4);
+        ImGui::EndMenu();
+      }
       ImGui::Separator();
       if (ImGui::MenuItem("Preferences...", sk(Act::Prefs))) showPrefs = true;
       ImGui::EndMenu();
@@ -1320,6 +1346,16 @@ void App::drawUI() {
       if (ImGui::MenuItem("Flip horizontally", sk(Act::FlipView), view.flipX)) flipView();
       ImGui::Separator();
       ImGui::MenuItem("Hide panels", sk(Act::HidePanels), &hideUI);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Selection")) {
+      bool ok = R.hasDocument() && !R.busy() && !xf.active;
+      if (ImGui::MenuItem("Select all", sk(Act::SelectAll), false, ok)) selectAll();
+      if (ImGui::MenuItem("Deselect", sk(Act::Deselect), false, ok && selActive)) deselect();
+      if (ImGui::MenuItem("Invert selection", sk(Act::InvertSel), false, ok)) invertSelection();
+      ImGui::Separator();
+      if (ImGui::MenuItem("Grow selection...", nullptr, false, ok && selActive)) { selGrowShrink = 1; growPopup = true; }
+      if (ImGui::MenuItem("Shrink selection...", nullptr, false, ok && selActive)) { selGrowShrink = -1; growPopup = true; }
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
@@ -1371,6 +1407,17 @@ void App::drawUI() {
     ImGui::EndPopup();
   }
   drawToolOverlay();
+  drawSelectionBar();
+  drawAdjustDialog();
+  if (growPopup) { ImGui::OpenPopup("Grow / shrink selection"); growPopup = false; }
+  if (ImGui::BeginPopupModal("Grow / shrink selection", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::TextUnformatted(selGrowShrink > 0 ? "Grow the selection by" : "Shrink the selection by");
+    ImGui::SliderInt("##gpx", &selGrowPx, 1, 200, "%d px", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::Button("OK", ImVec2(100, 0))) { growSelection(selGrowShrink * selGrowPx); ImGui::CloseCurrentPopup(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
   drawSizePreview();
   {
     float rgba[4];
@@ -1656,7 +1703,7 @@ void App::buildBrushTest() {
 void App::tickDemo() {
   if (demoDone || demo.empty()) return;
   // wait for the GPU to finish the previous step (the last step leaves a stroke open on purpose)
-  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn) || flooding || hoverDirty) && !(demoStep == demo.size())) return;
+  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn) || flooding || clipping || hoverDirty) && !(demoStep == demo.size())) return;
   if (demoStep < demo.size()) {
     demo[demoStep++]();
     framesToRender = std::max(framesToRender, 3);
@@ -1679,6 +1726,8 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
   if (flooding) floodJob.wait();
+  if (clipping) clipJob.wait();
+  R.finishAsyncRead(clipRead);
   if (floodRead == floodCache) floodRead.reset();  // same read-back: release it once
   R.finishAsyncRead(floodRead);
   R.finishAsyncRead(floodCache);
@@ -2100,6 +2149,7 @@ int App::run() {
     if (!running) break;
     processDialogResults();
     pollFlood();
+    pollClipboard();
     if (previewing && previewDirty) updateShapePreview();
     if (hoverDirty && !flooding && hoverX >= 0) {
       hoverDirty = false;

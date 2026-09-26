@@ -39,5 +39,8 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
 // Flattened PNG (with alpha) or JPEG (over white), chosen by the file extension.
 bool exportImage(const std::string& path, const ImageRGBA& img, std::string& err);
 
+// In-memory PNG (system clipboard): encode straight RGBA, decode any stb-supported image.
+bool encodePngMemory(const ImageRGBA& img, std::vector<uint8_t>& out);
+bool decodeImageMemory(const void* data, size_t size, ImageRGBA& out, std::string& err);
 void premultiply(std::vector<uint8_t>& rgba);
 void unpremultiply(std::vector<uint8_t>& rgba);

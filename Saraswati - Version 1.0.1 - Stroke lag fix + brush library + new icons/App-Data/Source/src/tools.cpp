@@ -1288,6 +1288,25 @@ void App::buildToolTest() {
   // lasso selection left active: marching ants
   demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
   demo.push_back([this] { tool = ToolId::Brush; });
+  // edit operations: select the red rectangle, copy it to a new layer, hue-shift and flip it
+  demo.push_back([this] {
+    active = 0;
+    std::vector<uint8_t> cov(size_t(220) * 320, 255);
+    combineSelection(90, 90, 220, 320, cov, 0);
+    copySelection(false, true);
+  });
+  demo.push_back([] {});
+  demo.push_back([this] {
+    float p[4] = {0.33f, 0, 0, 0};
+    std::string err;
+    R.applyAdjust(active, 2, p, err);  // red -> green-ish on the pasted layer
+    std::vector<uint8_t> cov(size_t(220) * 320, 255);
+    combineSelection(90, 90, 220, 320, cov, 0);
+    growSelection(12);  // -> 244 x 344
+    fprintf(stderr, "edittest: layers %zu, pasted '%s', selection %dx%d\n", R.layers.size(), R.layers[active].name.c_str(),
+            selX1 - selX0, selY1 - selY0);
+  });
+  demo.push_back([this] { deselect(); transformLayer(0); });
   // keyboard: tap switches tools, hold (used on the canvas) returns to the previous tool
   demo.push_back([this] {
     auto key = [&](SDL_Keycode k, bool down, SDL_Keymod mod = 0) {

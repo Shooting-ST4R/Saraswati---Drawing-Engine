@@ -70,6 +70,7 @@ struct StrokeStyle {
   float opacity = 1.0f;
   bool eraser = false;
   bool overlay = false;  // preview highlight only (magic wand): never clipped by selection / lock
+  bool ignoreSelection = false;  // commit everywhere the mask says (e.g. "clear outside the selection")
 };
 
 struct RendererOptions {
@@ -326,6 +327,13 @@ class Renderer {
   void readTimestamps(FrameSlot& s);
   void recordThumbnails(VkCommandBuffer cmd);
   void recordNavigator(VkCommandBuffer cmd);
+ public:
+  // Colour adjustment: previewed live on the active layer while adjType != 0 (screen pixels only),
+  // applied to the layer with applyAdjust (one undo step).
+  int adjType = 0;
+  float adjP[4] = {0, 0, 0, 0};
+  bool applyAdjust(int layer, int type, const float p[4], std::string& err);
+ private:
   void destroyNavigator();
   uint64_t lastThumbNs = 0;
   // recycled host buffers for undo tiles (size classes of 4, 16 and 64 tiles)
@@ -365,7 +373,7 @@ class Renderer {
   VkDescriptorPool descPool = VK_NULL_HANDLE;
   VkPipeline dabPipe = VK_NULL_HANDLE, commitPipe = VK_NULL_HANDLE, cachePipe = VK_NULL_HANDLE,
              framePipe = VK_NULL_HANDLE, presentPipe = VK_NULL_HANDLE, gradPipe = VK_NULL_HANDLE,
-             stampPipe = VK_NULL_HANDLE;
+             stampPipe = VK_NULL_HANDLE, adjPipe = VK_NULL_HANDLE;
   VkQueryPool queryPool = VK_NULL_HANDLE;
   VkCommandPool oneShotPool = VK_NULL_HANDLE;
 

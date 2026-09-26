@@ -17,6 +17,8 @@
 #include "spv_cache_r32f.h"
 #include "spv_gradient_r16.h"
 #include "spv_gradient_r32f.h"
+#include "spv_adjust_r16.h"
+#include "spv_adjust_r32f.h"
 #include "spv_stamp.h"
 #include "spv_commit_r16.h"
 #include "spv_commit_r32f.h"
@@ -53,9 +55,10 @@ struct ViewPC {
   int32_t mode;
   int32_t antsPhase;
   float flipX;  // -1 = view mirrored horizontally
-  int32_t pad;
+  int32_t adjType;
+  float adjP[4];
 };
-static_assert(sizeof(ViewPC) == 96);
+static_assert(sizeof(ViewPC) == 112);
 struct DabPC {
   int32_t origin[2], size[2];
   int32_t first, count, flags;  // flags: 1 = build-up
@@ -71,7 +74,7 @@ struct CommitPC {
 
 enum : int {
   FLAG_STROKE = 1, FLAG_ERASER = 2, FLAG_LAYER = 4, FLAG_ABOVE_CACHE = 8, FLAG_ABOVE = 16,
-  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512, FLAG_NOCLIP = 1024
+  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512, FLAG_NOCLIP = 1024, FLAG_ADJ = 2048
 };
 
 static constexpr VkImageUsageFlags kLayerUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -422,12 +425,14 @@ void Renderer::createPipelines() {
     framePipe = compute(spv_frame_r16, sizeof spv_frame_r16);
     cachePipe = compute(spv_cache_r16, sizeof spv_cache_r16);
     gradPipe = compute(spv_gradient_r16, sizeof spv_gradient_r16);
+    adjPipe = compute(spv_adjust_r16, sizeof spv_adjust_r16);
   } else {
     dabPipe = compute(spv_dabs_r32f, sizeof spv_dabs_r32f);
     commitPipe = compute(spv_commit_r32f, sizeof spv_commit_r32f);
     framePipe = compute(spv_frame_r32f, sizeof spv_frame_r32f);
     cachePipe = compute(spv_cache_r32f, sizeof spv_cache_r32f);
     gradPipe = compute(spv_gradient_r32f, sizeof spv_gradient_r32f);
+    adjPipe = compute(spv_adjust_r32f, sizeof spv_adjust_r32f);
   }
   stampPipe = compute(spv_stamp, sizeof spv_stamp);
 
@@ -688,7 +693,7 @@ void Renderer::shutdown() {
   }
   if (queryPool) vkDestroyQueryPool(device, queryPool, nullptr);
   vkDestroyCommandPool(device, oneShotPool, nullptr);
-  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe, gradPipe, stampPipe}) vkDestroyPipeline(device, p, nullptr);
+  for (VkPipeline p : {dabPipe, commitPipe, cachePipe, framePipe, presentPipe, gradPipe, stampPipe, adjPipe}) vkDestroyPipeline(device, p, nullptr);
   destroyBuffer(device, pickBuf);
   vkDestroyRenderPass(device, renderPass, nullptr);
   vkDestroyPipelineLayout(device, pipeLayout, nullptr);
@@ -1349,6 +1354,8 @@ void Renderer::pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int 
   pc.mode = int(mode);
   pc.antsPhase = int(SDL_GetTicks() / 60) & 7;
   pc.flipX = v.flipX ? -1.0f : 1.0f;
+  pc.adjType = adjType;
+  for (int k = 0; k < 4; ++k) pc.adjP[k] = adjP[k];
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
 }
@@ -1543,7 +1550,7 @@ void Renderer::recordCommit(VkCommandBuffer cmd) {
   pc.color[0] = style.color[0]; pc.color[1] = style.color[1]; pc.color[2] = style.color[2];
   pc.color[3] = style.opacity;
   pc.eraser = style.eraser ? 1 : 0;
-  pc.useSel = selectionActive ? 1 : 0;
+  pc.useSel = selectionActive && !style.ignoreSelection ? 1 : 0;
   pc.lockAlpha = layer.lockAlpha ? 1 : 0;
   if (!style.eraser && !layer.lockAlpha) growBounds(layer, sx0, sy0, sx1, sy1);
   layer.thumbDirty = true;
@@ -1665,6 +1672,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
     if (act->visible) flags |= FLAG_LAYER;
     if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0) | (style.overlay ? FLAG_NOCLIP : 0);
     if (act->lockAlpha) flags |= FLAG_LOCK;
+    if (adjType && act->visible) flags |= FLAG_ADJ;
   }
   if (selectionActive) flags |= FLAG_SEL;
   pushView(cmd, p.view, extent, flags, act ? act->opacity : 1.0f, act ? act->mode : BlendMode::Normal);

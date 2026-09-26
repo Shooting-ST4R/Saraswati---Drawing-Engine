@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "adjust.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Applies a colour adjustment to the layer over a rect (optionally only inside the selection).
+layout(push_constant) uniform AdjustPC {
+  ivec2 origin;
+  ivec2 size;
+  int type;
+  int useSel;
+  vec4 p;
+} pc;
+
+void main() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= pc.size.x || local.y >= pc.size.y) return;
+  ivec2 px = pc.origin + local;
+  vec4 c = imageLoad(layerImg, px);
+  vec4 r = applyAdjust(c, pc.type, pc.p);
+  if (pc.useSel != 0) r = mix(c, r, imageLoad(selImg, px).r);
+  imageStore(layerImg, px, r);
+}

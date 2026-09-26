@@ -15,6 +15,8 @@ layout(push_constant) uniform ViewPC {
   int mode;           // blend mode of the sampled layer
   int antsPhase;      // marching-ants animation offset
   float flipX;        // -1 = view mirrored horizontally
+  int adjType;        // live colour-adjustment preview on the active layer (FLAG_ADJ)
+  vec4 adjP;
 } pc;
 
 const int FLAG_STROKE = 1;   // live stroke in the mask applies to the sampled layer
@@ -26,6 +28,7 @@ const int FLAG_INIT   = 32;  // cache: init pass (paper / transparent)
 const int FLAG_WORK   = 64;  // cache: blend into this frame's work image
 const int FLAG_ONLY_BELOW = 128;
 const int FLAG_LOCK   = 512;  // live stroke on an alpha-locked layer
+const int FLAG_ADJ    = 2048; // frame: preview a colour adjustment on the active layer
 const int FLAG_NOCLIP = 1024; // stroke is a preview overlay: ignore selection and lock
 const int FLAG_SEL    = 256;  // a selection is active: live stroke clipped to it, marching ants drawn  // cache init: leave "above" alone (flatten for saving)
 
@@ -39,10 +42,16 @@ bool insideDoc(vec2 d) {
   return all(greaterThanEqual(d, vec2(0.0))) && all(lessThan(d, pc.docSize));
 }
 
+#include "adjust.glsl"
+
 vec4 layerTexel(ivec2 p) {
   if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(pc.docSize)))) return vec4(0.0);
   vec4 c = imageLoad(layerImg, p);
 #ifdef WITH_STROKE
+  if ((pc.flags & FLAG_ADJ) != 0) {
+    vec4 r = applyAdjust(c, pc.adjType, pc.adjP);
+    c = (pc.flags & FLAG_SEL) != 0 ? mix(c, r, imageLoad(selImg, p).r) : r;
+  }
   if ((pc.flags & FLAG_STROKE) != 0) {
     float a = imageLoad(maskImg, p).r * pc.color.a;
     if ((pc.flags & (FLAG_SEL | FLAG_NOCLIP)) == FLAG_SEL) a *= imageLoad(selImg, p).r;

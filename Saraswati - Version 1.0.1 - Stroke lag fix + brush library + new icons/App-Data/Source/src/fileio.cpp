@@ -700,3 +700,23 @@ bool savePsd(const std::string& path, const DocFile& doc, const ImageRGBA& merge
   if (progress) *progress = 1.0f;
   return true;
 }
+
+bool encodePngMemory(const ImageRGBA& img, std::vector<uint8_t>& out) {
+  out.clear();
+  auto write = [](void* ctx, void* data, int size) {
+    auto* v = static_cast<std::vector<uint8_t>*>(ctx);
+    v->insert(v->end(), static_cast<uint8_t*>(data), static_cast<uint8_t*>(data) + size);
+  };
+  return stbi_write_png_to_func(write, &out, int(img.w), int(img.h), 4, img.rgba.data(), int(img.w) * 4) != 0;
+}
+
+bool decodeImageMemory(const void* data, size_t size, ImageRGBA& out, std::string& err) {
+  int w = 0, h = 0, n = 0;
+  stbi_uc* px = stbi_load_from_memory(static_cast<const stbi_uc*>(data), int(size), &w, &h, &n, 4);
+  if (!px) { err = std::string("Unsupported image: ") + (stbi_failure_reason() ? stbi_failure_reason() : "unknown"); return false; }
+  out.w = uint32_t(w);
+  out.h = uint32_t(h);
+  out.rgba.assign(px, px + size_t(w) * h * 4);
+  stbi_image_free(px);
+  return true;
+}

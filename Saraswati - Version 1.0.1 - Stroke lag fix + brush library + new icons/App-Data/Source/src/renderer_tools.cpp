@@ -286,6 +286,37 @@ void Renderer::recordThumbnails(VkCommandBuffer cmd) {
   }
 }
 
+bool Renderer::applyAdjust(int layer, int type, const float p[4], std::string& err) {
+  if (layer < 0 || layer >= int(layers.size()) || strokeActive) return false;
+  Layer& L = layers[layer];
+  int rx0 = std::max(L.bx0, 0), ry0 = std::max(L.by0, 0), rx1 = std::min(L.bx1, int(docW)), ry1 = std::min(L.by1, int(docH));
+  if (rx0 >= rx1 || ry0 >= ry1) return true;  // empty layer: nothing to change
+  UndoEntry e;
+  e.layerId = L.id;
+  e.tiles = tilesForRect(rx0, ry0, rx1, ry1);
+  VkCommandBuffer cmd = beginOneShot();
+  bool haveUndo = copyTiles(cmd, L, e.tiles, e.chunks, e.bytes, true);
+  memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, kCS, kRW);
+  struct { int32_t origin[2], size[2]; int32_t type, useSel; int32_t pad[2]; float p[4]; } pc{};
+  pc.origin[0] = rx0; pc.origin[1] = ry0;
+  pc.size[0] = rx1 - rx0; pc.size[1] = ry1 - ry0;
+  pc.type = type;
+  pc.useSel = selectionActive ? 1 : 0;
+  for (int k = 0; k < 4; ++k) pc.p[k] = p[k];
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, adjPipe);
+  VkDescriptorSet sets[2] = {slots[0].set0, L.set};
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 2, sets, 0, nullptr);
+  vkCmdPushConstants(cmd, pipeLayout, kPcStages, 0, sizeof pc, &pc);
+  vkCmdDispatch(cmd, uint32_t(pc.size[0] + 15) / 16, uint32_t(pc.size[1] + 15) / 16, 1);
+  endOneShot(cmd);
+  if (haveUndo) pushUndo(std::move(e));
+  else err = "Not enough memory to keep undo for this change.";
+  L.thumbDirty = true;
+  cachesDirty = true;
+  if (!haveUndo) bumpRevision();
+  return true;
+}
+
 void Renderer::destroyNavigator() {
   GpuImage img = navImg;
   VkDescriptorSet set = navSet0, tex = navTexSet;

@@ -325,6 +325,30 @@ class App {
   std::string toast;
   uint64_t toastUntil = 0;
   void drawStatusBar();
+  void showToast(const std::string& msg);
+  // Edit operations (edit_ops.cpp)
+  struct ClipImage {
+    bool ok = false;
+    int x = 0, y = 0;
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> rgba, png;  // straight RGBA; PNG for other apps
+    std::string name;
+  } clip;
+  bool clipping = false, clipPasteAfter = false, clipExternal = false;
+  std::future<ClipImage> clipJob;
+  std::shared_ptr<AsyncRead> clipRead;
+  void copySelection(bool cut, bool pasteAfter = false);
+  void pollClipboard();
+  void pasteClipboard(bool internalOnly = false);
+  void clearOutsideSelection();
+  struct AdjustDlg { int type = 0; float p[4] = {0, 0, 0, 0}; bool open = false, preview = true; } adj;
+  void openAdjust(int type);
+  void drawAdjustDialog();
+  void transformLayer(int kind);  // 0 flip H, 1 flip V, 2 rotate 90 cw, 3 rotate 90 ccw, 4 rotate 180
+  void growSelection(int px);     // negative = shrink
+  int selGrowShrink = 1, selGrowPx = 5;
+  bool growPopup = false;
+  void drawSelectionBar();
   void drawUnsavedDialog();
   // brush size drag (Ctrl+Alt+drag)
   bool sizeDrag = false;

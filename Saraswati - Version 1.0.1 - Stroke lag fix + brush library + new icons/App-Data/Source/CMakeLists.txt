@@ -87,6 +87,8 @@ compile_shader(cache.comp       spv_cache_r32f       MASK_R32F)
 compile_shader(gradient.comp    spv_gradient_r16)
 compile_shader(gradient.comp    spv_gradient_r32f    MASK_R32F)
 compile_shader(stamp.comp       spv_stamp)
+compile_shader(adjust.comp      spv_adjust_r16)
+compile_shader(adjust.comp      spv_adjust_r32f      MASK_R32F)
 add_custom_command(
   OUTPUT ${SHADER_OUT}/font_ui.h
   COMMAND ${CMAKE_COMMAND} -DIN=${TP}/imgui/misc/fonts/Roboto-Medium.ttf -DOUT=${SHADER_OUT}/font_ui.h -DNAME=kFontUi -P ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
@@ -111,6 +113,7 @@ add_executable(Saraswati WIN32
   src/shortcuts.cpp
   src/app_shortcuts.cpp
   src/panels.cpp
+  src/edit_ops.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp
