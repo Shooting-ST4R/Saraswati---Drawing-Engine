@@ -14,3 +14,4 @@
 *.user
 Thumbs.db
 .DS_Store
+**/User-Data/settings/

@@ -1,6 +1,8 @@
 #include "app.h"
+#include "fileio.h"
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
 
@@ -79,11 +81,14 @@ void App::zoomAt(double sx, double sy, double factor) {
 
 void App::fitView() {
   if (!R.hasDocument()) return;
-  double w = std::max(1u, R.extent.width), h = std::max(1u, R.extent.height);
-  view.zoom = std::min(w / R.docW, h / R.docH) * 0.9;
-  view.panX = R.docW * 0.5;
-  view.panY = R.docH * 0.5;
+  // fit into the free canvas area between the docked panels
+  double cw = canvasW > 50 ? canvasW : R.extent.width, ch = canvasH > 50 ? canvasH : R.extent.height;
+  double cx = canvasW > 50 ? canvasX + canvasW * 0.5 : R.extent.width * 0.5;
+  double cy = canvasH > 50 ? canvasY + canvasH * 0.5 : R.extent.height * 0.5;
+  view.zoom = std::min(std::max(1.0, cw) / R.docW, std::max(1.0, ch) / R.docH) * 0.94;
   view.rotation = 0;
+  view.panX = R.docW * 0.5 - (cx - R.extent.width * 0.5) / view.zoom;
+  view.panY = R.docH * 0.5 - (cy - R.extent.height * 0.5) / view.zoom;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +201,13 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
     case SDLK_Y: if (ctrl) R.redo(); break;
     case SDLK_R: if (!ctrl) view.rotation = 0; break;
     case SDLK_N: if (ctrl) showNewDoc = true; break;
+    case SDLK_O: if (ctrl && !saving) showDialog(DlgOpen); break;
+    case SDLK_I: if (ctrl && !saving && R.hasDocument()) showDialog(DlgImport); break;
+    case SDLK_S:
+      if (ctrl && !saving && R.hasDocument()) {
+        if (shift || documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
+      }
+      break;
     default: break;
   }
 }
@@ -278,6 +290,13 @@ void App::handleEvent(const SDL_Event& e) {
       if (!ImGui::GetIO().WantCaptureMouse && e.wheel.y != 0)
         zoomAt(e.wheel.mouse_x * density, e.wheel.mouse_y * density, std::pow(1.2, e.wheel.y));
       break;
+    case SDL_EVENT_DROP_FILE:
+      if (e.drop.data) {
+        // dropping onto an existing document imports as a layer; hold Ctrl to open instead
+        if (R.hasDocument() && !ctrlDown) importAsLayer(e.drop.data);
+        else openFile(e.drop.data);
+      }
+      break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
       handleKey(e.key, e.type == SDL_EVENT_KEY_DOWN);
@@ -319,8 +338,6 @@ void App::addLayer() {
 // UI
 
 void App::drawBrushPanel() {
-  ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(280, 640), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Brush", &showBrush)) { ImGui::End(); return; }
   for (int i = 0; i < 3; ++i) {
     if (i) ImGui::SameLine();
@@ -346,16 +363,36 @@ void App::drawBrushPanel() {
   }
   ImGui::Checkbox("Pressure -> opacity", &b.pressureOpacity);
   ImGui::SliderFloat("Curve (gamma)", &b.gamma, 0.2f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-  ImGui::SeparatorText("Colour");
-  ImGui::SetNextItemWidth(-1);
+  ImGui::End();
+}
+
+void App::drawColorPanel() {
+  if (!ImGui::Begin("Colour", &showColor)) { ImGui::End(); return; }
+  float w = ImGui::GetContentRegionAvail().x;
+  ImGui::SetNextItemWidth(std::min(w, std::max(120.0f, ImGui::GetContentRegionAvail().y - 60)));
   ImGui::ColorPicker3("##colour", color,
                       ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_NoSidePreview);
   ImGui::End();
 }
 
+void App::buildDefaultLayout(unsigned int dockId) {
+  ImGui::DockBuilderRemoveNode(dockId);
+  ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
+  ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->WorkSize);
+  ImGuiID centre = dockId, left, right;
+  left = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.19f, nullptr, &centre);
+  right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.23f, nullptr, &centre);
+  ImGuiID leftBottom, rightBottom;
+  leftBottom = ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.45f, nullptr, &left);
+  rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
+  ImGui::DockBuilderDockWindow("Brush", left);
+  ImGui::DockBuilderDockWindow("Colour", leftBottom);
+  ImGui::DockBuilderDockWindow("Layers", right);
+  ImGui::DockBuilderDockWindow("Performance", rightBottom);
+  ImGui::DockBuilderFinish(dockId);
+}
+
 void App::drawLayerPanel() {
-  ImGui::SetNextWindowPos(ImVec2(float(R.extent.width) / ImGui::GetIO().DisplayFramebufferScale.x - 300, 30), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(290, 420), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Layers", &showLayers)) { ImGui::End(); return; }
   if (!R.hasDocument()) { ImGui::TextUnformatted("No document"); ImGui::End(); return; }
   active = std::clamp(active, 0, int(R.layers.size()) - 1);
@@ -412,9 +449,6 @@ void App::drawLayerPanel() {
 }
 
 void App::drawPerfPanel() {
-  float sw = float(R.extent.width) / ImGui::GetIO().DisplayFramebufferScale.x;
-  ImGui::SetNextWindowPos(ImVec2(sw - 380, 460), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(370, 440), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Performance", &showPerf)) { ImGui::End(); return; }
   ImGui::Text("%s", R.deviceName.c_str());
   ImGui::TextWrapped("%s", R.driverInfo.c_str());
@@ -511,16 +545,30 @@ void App::drawUI() {
     }
     if (ImGui::BeginMenu("Window")) {
       ImGui::MenuItem("Brush", nullptr, &showBrush);
+      ImGui::MenuItem("Colour", nullptr, &showColor);
       ImGui::MenuItem("Layers", nullptr, &showLayers);
       ImGui::MenuItem("Performance", nullptr, &showPerf);
+      ImGui::Separator();
+      if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = showPerf = true; }
       ImGui::EndMenu();
     }
     ImGui::Separator();
+    if (saving) { ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Saving..."); ImGui::Separator(); }
     ImGui::Text("%u x %u   zoom %.1f %%   rot %.0f deg   %s%s", R.docW, R.docH, view.zoom * 100,
                 std::fmod(view.rotation * 180 / kPi + 360 * 100, 360.0), kTipNames[tipIndex], eraserToggle ? " (eraser)" : "");
     ImGui::EndMainMenuBar();
   }
+  // Dockspace: panels snap to the edges, resize, and combine into tab stacks; the central
+  // node is see-through and is the canvas.
+  ImGuiID dockId = ImGui::GetID("MainDock");
+  if (resetLayout || !ImGui::DockBuilderGetNode(dockId)) { buildDefaultLayout(dockId); resetLayout = false; }
+  ImGui::DockSpaceOverViewport(dockId, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
+  if (ImGuiDockNode* c = ImGui::DockBuilderGetCentralNode(dockId)) {
+    float s = ImGui::GetIO().DisplayFramebufferScale.x;
+    canvasX = c->Pos.x * s; canvasY = c->Pos.y * s; canvasW = c->Size.x * s; canvasH = c->Size.y * s;
+  }
   if (showBrush) drawBrushPanel();
+  if (showColor) drawColorPanel();
   if (showLayers) drawLayerPanel();
   if (showPerf) drawPerfPanel();
   drawNewDocDialog();
@@ -735,25 +783,236 @@ void App::tickDemo() {
 }
 
 // ---------------------------------------------------------------------------
-// Files (implemented in fileio.cpp from milestone 6)
+// Files
 
-void App::drawFileDialogs() {}
-void App::openFile(const std::string&) {}
-void App::importAsLayer(const std::string&) {}
-void App::saveFile(const std::string&) {}
+static const SDL_DialogFileFilter kOpenFilters[] = {
+    {"Documents and images", "psd;psb;png;jpg;jpeg;gif;webp;svg;bmp;tga"},
+    {"Photoshop (PSD, PSB)", "psd;psb"},
+    {"Images", "png;jpg;jpeg;gif;webp;svg;bmp;tga"}};
+static const SDL_DialogFileFilter kImageFilters[] = {
+    {"Images", "png;jpg;jpeg;gif;webp;svg;bmp;tga;psd;psb"}};
+static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;psb"}};
+
+App::~App() {
+  if (saveThread.joinable()) saveThread.join();
+}
+
+void App::showDialog(int kind) {
+  struct Ctx { App* app; int kind; };
+  auto* ctx = new Ctx{this, kind};
+  auto cb = [](void* ud, const char* const* list, int) {
+    Ctx* c = static_cast<Ctx*>(ud);
+    if (list && list[0]) {
+      std::lock_guard<std::mutex> lock(c->app->dialogMutex);
+      c->app->dialogResults.push_back({c->kind, list[0]});
+    } else if (!list) {
+      std::lock_guard<std::mutex> lock(c->app->dialogMutex);
+      c->app->dialogResults.push_back({-1, SDL_GetError()});
+    }
+    delete c;
+  };
+  if (kind == DlgSave) {
+    std::string def = documentPath.empty() ? (fs::path(userData) / "documents" / "Untitled.psd").string() : documentPath;
+    SDL_ShowSaveFileDialog(cb, ctx, window, kSaveFilters, 1, def.c_str());
+  } else if (kind == DlgOpen) {
+    std::string def = (fs::path(userData) / "documents").string();
+    SDL_ShowOpenFileDialog(cb, ctx, window, kOpenFilters, 3, def.c_str(), false);
+  } else {
+    SDL_ShowOpenFileDialog(cb, ctx, window, kImageFilters, 1, nullptr, false);
+  }
+}
+
+void App::processDialogResults() {
+  std::vector<std::pair<int, std::string>> res;
+  {
+    std::lock_guard<std::mutex> lock(dialogMutex);
+    res.swap(dialogResults);
+  }
+  for (auto& [kind, path] : res) {
+    if (kind == DlgOpen) openFile(path);
+    else if (kind == DlgImport) importAsLayer(path);
+    else if (kind == DlgSave) {
+      std::string p = path;
+      if (!isPsdPath(p)) p += ".psd";
+      saveFile(p);
+    } else error("File dialog failed: " + path);
+  }
+  std::lock_guard<std::mutex> lock(saveMutex);
+  if (saveDone) {
+    saveDone = false;
+    if (saveThread.joinable()) saveThread.join();
+    if (!saveMessage.empty()) error(saveMessage);
+  }
+}
+
+void App::drawFileDialogs() {
+  bool busy = R.stroking() || saving;
+  if (ImGui::MenuItem("Open...", "Ctrl+O", false, !busy)) showDialog(DlgOpen);
+  if (ImGui::MenuItem("Import image as layer...", "Ctrl+I", false, !busy && R.hasDocument())) showDialog(DlgImport);
+  ImGui::Separator();
+  if (ImGui::MenuItem("Save", "Ctrl+S", false, !busy && R.hasDocument())) {
+    if (documentPath.empty()) showDialog(DlgSave); else saveFile(documentPath);
+  }
+  if (ImGui::MenuItem("Save as PSD...", "Ctrl+Shift+S", false, !busy && R.hasDocument())) showDialog(DlgSave);
+}
+
+// Uploads straight-alpha pixels into layer `index` at (x, y).
+static bool uploadStraight(Renderer& R, int index, int x, int y, uint32_t w, uint32_t h, std::vector<uint8_t>& rgba,
+                           std::string& err) {
+  premultiply(rgba);
+  return R.uploadLayerPixels(index, x, y, w, h, rgba.data(), err);
+}
+
+void App::openFile(const std::string& path) {
+  if (R.stroking() || saving) return;
+  std::string err;
+  std::string name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).filename().string();
+  if (isPsdPath(path)) {
+    DocFile doc;
+    if (!loadPsd(path, doc, err)) { error("Could not open " + name + ":\n" + err); return; }
+    if (!newDocument(doc.w, doc.h, false)) return;
+    int maxL = R.limit.maxLayers;
+    if (int(doc.layers.size()) > maxL) {
+      doc.warnings.push_back("Only the bottom " + std::to_string(maxL) + " of " + std::to_string(doc.layers.size()) +
+                             " layers fit in GPU memory at this size; the rest were not loaded.");
+      doc.layers.resize(size_t(maxL));
+    }
+    for (size_t i = 0; i < doc.layers.size(); ++i) {
+      DocLayer& L = doc.layers[i];
+      int idx = 0;
+      if (i > 0) {
+        idx = R.addLayer(int(i), err);
+        if (idx < 0) { doc.warnings.push_back(err); break; }
+      }
+      if (!uploadStraight(R, idx, L.x, L.y, L.w, L.h, L.rgba, err)) { doc.warnings.push_back(err); }
+      L.rgba = {};
+      Layer& dst = R.layers[size_t(idx)];
+      dst.name = L.name.empty() ? dst.name : L.name;
+      dst.visible = L.visible;
+      dst.opacity = L.opacity;
+      dst.mode = L.mode;
+    }
+    active = int(R.layers.size()) - 1;
+    documentPath = path;
+    R.markCachesDirty();
+    if (!doc.warnings.empty()) {
+      std::string m = "Opened " + name + " with notes:";
+      for (auto& w : doc.warnings) m += "\n- " + w;
+      error(m);
+    }
+  } else {
+    ImageRGBA img;
+    if (!loadImageFile(path, img, err)) { error("Could not open " + name + ":\n" + err); return; }
+    if (!newDocument(img.w, img.h, true)) return;
+    if (!uploadStraight(R, 0, 0, 0, img.w, img.h, img.rgba, err)) error(err);
+    R.layers[0].name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).stem().string();
+    documentPath.clear();  // images are imported; saving asks for a .psd name
+  }
+  SDL_SetWindowTitle(window, ("Saraswati " SARASWATI_VERSION " - " + name).c_str());
+}
+
+void App::importAsLayer(const std::string& path) {
+  if (!R.hasDocument() || R.stroking() || saving) return;
+  std::string err;
+  std::string name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).stem().string();
+  std::vector<DocLayer> layers;
+  if (isPsdPath(path)) {
+    DocFile doc;
+    if (!loadPsd(path, doc, err)) { error("Could not import " + name + ":\n" + err); return; }
+    layers = std::move(doc.layers);
+  } else {
+    ImageRGBA img;
+    if (!loadImageFile(path, img, err)) { error("Could not import " + name + ":\n" + err); return; }
+    DocLayer L;
+    L.name = name;
+    L.w = img.w;
+    L.h = img.h;
+    L.x = (int32_t(R.docW) - int32_t(img.w)) / 2;  // centred
+    L.y = (int32_t(R.docH) - int32_t(img.h)) / 2;
+    L.rgba = std::move(img.rgba);
+    layers.push_back(std::move(L));
+  }
+  for (auto& L : layers) {
+    int idx = R.addLayer(active + 1, err);
+    if (idx < 0) { error(err); return; }
+    active = idx;
+    if (!uploadStraight(R, idx, L.x, L.y, L.w, L.h, L.rgba, err)) error(err);
+    Layer& dst = R.layers[size_t(idx)];
+    if (!L.name.empty()) dst.name = L.name;
+    dst.visible = L.visible;
+    dst.opacity = L.opacity;
+    dst.mode = L.mode;
+  }
+  R.markCachesDirty();
+}
+
+void App::saveFile(const std::string& path) {
+  if (!R.hasDocument() || R.stroking() || saving) return;
+  // GPU readback happens here (fast on a real GPU); encoding and disk I/O run on a worker thread.
+  R.waitIdle();
+  auto doc = std::make_shared<DocFile>();
+  auto merged = std::make_shared<ImageRGBA>();
+  doc->w = R.docW;
+  doc->h = R.docH;
+  std::string err;
+  for (size_t i = 0; i < R.layers.size(); ++i) {
+    DocLayer L;
+    const Layer& src = R.layers[i];
+    L.name = src.name;
+    L.visible = src.visible;
+    L.opacity = src.opacity;
+    L.mode = src.mode;
+    L.w = R.docW;
+    L.h = R.docH;
+    if (!R.readLayerPixels(int(i), L.rgba, err)) { error("Save failed: " + err); return; }
+    doc->layers.push_back(std::move(L));
+  }
+  merged->w = R.docW;
+  merged->h = R.docH;
+  if (!R.readMergedPixels(merged->rgba, err)) { error("Save failed: " + err); return; }
+  if (saveThread.joinable()) saveThread.join();
+  saving = true;
+  saveProgress = 0;
+  documentPath = path;
+  saveThread = std::thread([this, doc, merged, path] {
+    for (auto& L : doc->layers) unpremultiply(L.rgba);
+    unpremultiply(merged->rgba);
+    std::string e;
+    float prog = 0;
+    bool ok = savePsd(path, *doc, *merged, e, &prog);
+    std::lock_guard<std::mutex> lock(saveMutex);
+    saveMessage = ok ? std::string() : "Save failed: " + e;
+    if (ok) SDL_Log("saved %s", path.c_str());
+    saveDone = true;
+    saving = false;
+  });
+  std::string name = fs::path(reinterpret_cast<const char8_t*>(path.c_str())).filename().string();
+  SDL_SetWindowTitle(window, ("Saraswati " SARASWATI_VERSION " - " + name).c_str());
+}
 
 // ---------------------------------------------------------------------------
 // Main loop
 
 int App::run() {
   ImGuiIO& io = ImGui::GetIO();
-  io.IniFilename = nullptr;
+  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+  io.ConfigWindowsMoveFromTitleBarOnly = true;
+  bool testRun = opt.demo || opt.benchmark || !opt.screenshot.empty() || !opt.save.empty();
+  if (testRun) {
+    io.IniFilename = nullptr;  // tests always use the default layout
+  } else {
+    std::error_code ec;
+    fs::create_directories(fs::path(userData) / "settings", ec);
+    iniPath = (fs::path(userData) / "settings" / "layout.ini").string();
+    io.IniFilename = iniPath.c_str();
+  }
   R.onResize();
-  {
-    // first swapchain extent is needed by fitView
+  for (int i = 0; i < 2; ++i) {
+    // warm-up frames: swapchain extent and the docked canvas area are needed by fitView
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    drawUI();
     ImGui::Render();
     Renderer::FrameParams p;
     p.imgui = ImGui::GetDrawData();
@@ -768,11 +1027,12 @@ int App::run() {
     if (!newDocument(w, h, true)) newDocument(1000, 1000, true);
     if (opt.brushPx > 0) brushes[tipIndex].size = opt.brushPx;
     if (!opt.open.empty()) openFile(opt.open);
+    for (auto& f : opt.imports) importAsLayer(f);
   }
 
   bool wantShot = !opt.screenshot.empty();
   while (running) {
-    bool animating = bench.running || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
+    bool animating = bench.running || saving || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
                      (wantShot && !screenshotTaken);
     SDL_Event e;
     if (!animating) {
@@ -781,8 +1041,16 @@ int App::run() {
     }
     while (SDL_PollEvent(&e)) handleEvent(e);
     if (!running) break;
+    processDialogResults();
     tickBenchmark();
     tickDemo();
+    if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && engine.active() && (!wantShot || screenshotTaken))
+      strokeEnd();  // the demo leaves its last stroke open; finish it before saving
+    if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && !R.busy() && !bench.running &&
+        (!wantShot || screenshotTaken)) {
+      savedForTest = true;
+      saveFile(opt.save);
+    }
 
     uint64_t t = SDL_GetTicksNS();
     if (lastFrameNs) cpuFrameMs = (t - lastFrameNs) * 1e-6;
@@ -824,12 +1092,13 @@ int App::run() {
       }
       if (shotNow) {
         screenshotTaken = true;
-        if (opt.exitAfter) running = false;
+        if (opt.exitAfter && opt.save.empty()) running = false;
       }
     }
     if (framesToRender > 0) --framesToRender;
-    if (opt.exitAfter && !wantShot) {
-      if ((opt.benchmark && !bench.running && !bench.report.empty()) || (opt.demo && demoDone)) running = false;
+    if (opt.exitAfter && (!wantShot || screenshotTaken) && !saving && (opt.save.empty() || savedForTest)) {
+      if ((opt.benchmark && !bench.running && !bench.report.empty()) || (opt.demo && demoDone) || !opt.save.empty())
+        running = false;
     }
   }
   R.waitIdle();

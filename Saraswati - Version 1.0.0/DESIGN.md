@@ -41,7 +41,7 @@ Pinned dependency commits (fetched by `App-Data/Source/fetch-deps.sh` / `.ps1`):
 | Dir | Repo | Commit |
 |---|---|---|
 | SDL | libsdl-org/SDL | a19bac65218bf583e8e5cb8c52e1c9603fa8d94c |
-| imgui | ocornut/imgui | aa0181478b182f7170378a5d8629401b77ee326e |
+| imgui | ocornut/imgui | 3bae66c735670619baf51391eba7f3d90a25d125 |
 | Vulkan-Headers | KhronosGroup/Vulkan-Headers | 3c65a01745e4a1134d32b9c2c456472212dba16d |
 | volk | zeux/volk | 7f46f79751d7e3b3a6df20e38d3e3986585bcdf4 |
 | glslang | KhronosGroup/glslang | 2ff6f609379ce43c4291c732cf6a19dd2461a680 |

@@ -15,7 +15,7 @@ void main() {
     bool odd = ((px.x >> 3) + (px.y >> 3)) % 2 == 1;
     bg = odd ? vec3(0.80) : vec3(1.0);
   } else {
-    bg = vec3(0.19, 0.19, 0.20);
+    bg = vec3(0.20);  // neutral workspace grey (no colour cast around the canvas)
   }
   outColor = vec4(c.rgb + bg * (1.0 - c.a), 1.0);
 }

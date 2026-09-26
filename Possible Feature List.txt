@@ -1,0 +1,36 @@
+Saraswati - Possible Feature List
+=================================
+Ideas and requests for later versions (not part of the current build unless noted).
+Project-level notes, not tied to a version folder.
+
+1. Multi-GPU support (e.g. 2x RTX 3090)                       [requested 2026-09-26]
+   Question: can two GPUs be combined to get more VRAM and more speed?
+   Assessment:
+   - VRAM: yes, in principle. Two 3090s do not pool into one 48 GB space
+     automatically (no SLI/NVLink memory pooling in Vulkan for this use), but
+     the app can place different layers on different GPUs (Vulkan device groups
+     or two separate VkDevices). E.g. layers 1-5 on GPU 0, layers 6-10 on GPU 1
+     -> roughly double the layer limit.
+   - Performance: the pen/stroke path should stay on ONE GPU (the one driving
+     the monitor) for lowest latency. The second GPU can pre-merge the layers
+     it holds into a "below"/"above" screen cache and send only that small
+     screen-size image across PCIe (a few MB per view change), so display
+     cost stays bounded by screen pixels.
+   - NVLink bridge between two 3090s would speed up cross-GPU copies, but is
+     not required for the layer-split design.
+   - Cost: significant engine work (resource ownership per GPU, cross-device
+     copies, undo per GPU, saving/merging across GPUs). Realistic for a 2.x
+     version, after tiled/sparse layers (which reduce VRAM needs anyway).
+
+2. Native Clip Studio Paint (.clip) open and save             [requested 2026-09-26]
+   .clip is a proprietary SQLite + zlib chunk container. Reading is feasible
+   (community reverse-engineering exists); writing files that CSP accepts is
+   riskier. Until then PSD/PSB is the interchange format (CSP opens PSD with
+   layers, opacity and blend modes).
+
+3. Mesh warp / liquify ("morphing" beyond 4-corner distort)   [requested 2026-09-26]
+4. Text tool, rulers, perspective rulers, symmetry
+5. Layer folders/groups, clipping masks, layer masks
+6. Tiled / sparse layers (only store painted tiles) -> far more layers per GB
+7. Brush stabilisation (optional, off by default), more brush engines (watercolour, blending)
+8. Selection undo, save/load selections, copy/paste between layers and apps

@@ -25,6 +25,13 @@ set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(${TP}/SDL EXCLUDE_FROM_ALL)
 
+# ---- libwebp (decoder only, for WebP import) ----
+foreach(opt WEBP_BUILD_ANIM_UTILS WEBP_BUILD_CWEBP WEBP_BUILD_DWEBP WEBP_BUILD_GIF2WEBP WEBP_BUILD_IMG2WEBP
+            WEBP_BUILD_VWEBP WEBP_BUILD_WEBPINFO WEBP_BUILD_LIBWEBPMUX WEBP_BUILD_WEBPMUX WEBP_BUILD_EXTRAS)
+  set(${opt} OFF CACHE BOOL "" FORCE)
+endforeach()
+add_subdirectory(${TP}/libwebp EXCLUDE_FROM_ALL)
+
 # ---- glslang (build tool only: compiles our shaders to SPIR-V) ----
 set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
 set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
@@ -67,7 +74,12 @@ compile_shader(dabs.comp        spv_dabs_r32f        MASK_R32F)
 compile_shader(commit.comp      spv_commit_r16)
 compile_shader(commit.comp      spv_commit_r32f      MASK_R32F)
 compile_shader(cache.comp       spv_cache)
-add_custom_target(saraswati_shaders DEPENDS ${SHADER_HEADERS})
+add_custom_command(
+  OUTPUT ${SHADER_OUT}/font_ui.h
+  COMMAND ${CMAKE_COMMAND} -DIN=${TP}/imgui/misc/fonts/Roboto-Medium.ttf -DOUT=${SHADER_OUT}/font_ui.h -DNAME=kFontUi -P ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
+  DEPENDS ${TP}/imgui/misc/fonts/Roboto-Medium.ttf ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
+  COMMENT "embedding UI font")
+add_custom_target(saraswati_shaders DEPENDS ${SHADER_HEADERS} ${SHADER_OUT}/font_ui.h)
 
 # ---- the app ----
 set(IMGUI ${TP}/imgui)
@@ -78,6 +90,8 @@ add_executable(Saraswati WIN32
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp
+  src/fileio.cpp
+  src/image_impl.cpp
   src/volk_impl.c
   ${IMGUI}/imgui.cpp
   ${IMGUI}/imgui_draw.cpp
@@ -89,14 +103,15 @@ add_executable(Saraswati WIN32
 add_dependencies(Saraswati saraswati_shaders)
 set_target_properties(Saraswati PROPERTIES OUTPUT_NAME $<IF:$<PLATFORM_ID:Windows>,Saraswati,saraswati>)
 target_include_directories(Saraswati PRIVATE
-  src ${SHADER_OUT} ${IMGUI} ${IMGUI}/backends ${TP}/volk ${TP}/Vulkan-Headers/include)
+  src ${SHADER_OUT} ${IMGUI} ${IMGUI}/backends ${TP}/volk ${TP}/Vulkan-Headers/include
+  ${TP}/stb ${TP}/nanosvg/src ${TP}/libwebp/src)
 target_compile_definitions(Saraswati PRIVATE
   VK_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_VOLK IMGUI_DISABLE_OBSOLETE_FUNCTIONS
   SARASWATI_VERSION="${PROJECT_VERSION}")
 if(WIN32)
   target_compile_definitions(Saraswati PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
-target_link_libraries(Saraswati PRIVATE SDL3::SDL3-static ${CMAKE_DL_LIBS})
+target_link_libraries(Saraswati PRIVATE SDL3::SDL3-static webpdecoder ${CMAKE_DL_LIBS})
 if(MSVC)
   target_compile_options(Saraswati PRIVATE /W3 /utf-8)
 else()

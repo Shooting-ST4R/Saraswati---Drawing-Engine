@@ -2,7 +2,10 @@
 #pragma once
 #include "brush.h"
 #include "renderer.h"
+#include <atomic>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -19,6 +22,8 @@ struct Options {
   int frames = 5;
   bool demo = false;
   std::string open;             // file to open at startup
+  std::vector<std::string> imports;  // import as layers at startup (test helper)
+  std::string save;             // save as PSD when the demo / startup is done (test helper)
   int windowW = 1600, windowH = 1000;
 };
 
@@ -46,6 +51,8 @@ class App {
   // UI
   void drawUI();
   void drawBrushPanel();
+  void drawColorPanel();
+  void buildDefaultLayout(unsigned int dockId);
   void drawLayerPanel();
   void drawPerfPanel();
   void drawNewDocDialog();
@@ -101,6 +108,11 @@ class App {
   uint64_t lastFrameNs = 0;
 
   // UI state
+  bool showColor = true;
+  bool resetLayout = false;
+  std::string iniPath;
+  // free canvas area (the dockspace's central node), in framebuffer pixels
+  float canvasX = 0, canvasY = 0, canvasW = 0, canvasH = 0;
   bool showBrush = true, showLayers = true, showPerf = true, showNewDoc = false;
   int newW = 3000, newH = 2000;
   bool newWhite = true;
@@ -112,8 +124,23 @@ class App {
   int renameFor = -1;
   std::string userData;
   std::string documentPath;
-  // pending results from SDL's async file dialogs
+  // pending results from SDL's async file dialogs (callbacks may run on another thread)
+  enum DialogKind { DlgOpen = 1, DlgImport = 2, DlgSave = 3 };
+  std::mutex dialogMutex;
   std::vector<std::pair<int, std::string>> dialogResults;
+  void showDialog(int kind);
+  void processDialogResults();
+  // background PSD writer
+  std::thread saveThread;
+  std::atomic<bool> saving{false};
+  std::atomic<float> saveProgress{0};
+  std::mutex saveMutex;
+  std::string saveMessage;
+  bool saveDone = false;
+  bool savedForTest = false;
+public:
+  ~App();
+private:
 
   // benchmark
   struct Bench {
