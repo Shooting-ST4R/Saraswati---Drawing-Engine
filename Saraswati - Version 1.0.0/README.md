@@ -21,7 +21,7 @@ brushes. Architecture: [DESIGN.md](DESIGN.md).
   count is computed from your VRAM and the document size and shown in *New Document* and *Layers*.
 - **Undo / redo** (50 steps, kept in system RAM) for strokes, fills, transforms and layer
   operations (add, delete, duplicate, reorder, visibility, opacity, blend mode, rename, lock).
-  Selection changes are not undoable yet.
+  Selection changes are undoable too; undoing back to the last save clears the `*`.
 - **Safety:** unsaved changes are marked with `*` in the title; quitting, *New* and *Open* ask to
   save first. Saves are atomic (written to a temporary file, then swapped in).
 - **Files:** open and save **PSD** (and **PSB** for documents over 30,000 px or 4 GB) with layers,
@@ -82,6 +82,7 @@ Your drawings go in `User-Data/documents/` by default; benchmark reports in `Use
 | Rectangle / ellipse select | M (press again to switch) |
 | Lasso / magic wand | L / W |
 | Selection: add / subtract | hold Shift / Alt when starting |
+| Fill / magic wand across all layers | *Refer to all visible layers* in Tool Settings (fill flat colours under line art) |
 | Select all / deselect / invert | Ctrl+A / Ctrl+D (or Esc) / Ctrl+Shift+I |
 | Clear / fill selection (or layer) | Delete / Alt+Backspace |
 | Move / transform | V or Ctrl+T · corners scale (Shift keeps ratio) · Ctrl+corner distorts · outside rotates · Enter applies, Esc cancels |
@@ -123,8 +124,12 @@ a 24 GB card holds about 4–5 layers at that size — the app tells you the exa
 ## Notes for the Windows build / test step
 
 - Built and tested in a Linux cloud session (GCC 13, Mesa lavapipe under Xvfb, Vulkan validation
-  layers clean). The MSVC build has **not** been run yet — if it fails, the error is most likely a
-  small portability fix; the code avoids Linux-only APIs outside `#ifdef`s.
+  layers clean). The **Windows build was cross-compiled with MinGW-w64** (static, all `_WIN32`
+  code paths) and **ran correctly under Wine** (the full `--tooltest` scene matched Linux
+  pixel-for-pixel). The MSVC build itself has not been run yet — if `Build Saraswati.bat` fails,
+  expect a small compiler-specific fix. (Cross builds pass `-DSARASWATI_GLSLANG=<host glslang>`.)
+- Pen pressure could not be tested without a tablet: please try a few strokes with the Cintiq and
+  check the *Tool Settings › Pen pressure* curve preview — its dot follows the live pen pressure.
 - SwiftShader check on the VM: `"Run Saraswati (CPU Vulkan).bat"`, or for an automated check:
   `Saraswati.exe --cpu-vulkan --demo --screenshot demo.png --exit` and `--tooltest` likewise.
   The *Performance* panel should show "SwiftShader" and "CPU emulation".
@@ -132,4 +137,5 @@ a 24 GB card holds about 4–5 layers at that size — the app tells you the exa
   undo/redo, every tool) — compare the screenshot with what the README describes.
 - Saving: the GPU readback happens on the main thread (a short pause on big documents); PSD
   encoding and disk writes run on a worker thread. Fill / magic wand / transform read the layer
-  back to the CPU — instant on normal sizes, a few seconds on 30k documents in this beta.
+  back only the painted area and flood on a worker thread (the UI stays responsive; the status bar
+  shows *Working…*).

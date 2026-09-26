@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -137,7 +138,22 @@ class App {
   void deselect();
   void invertSelection();
   void fillSelection(bool erase);
-  bool floodMask(double dx, double dy, float tol, bool contiguous, std::vector<uint8_t>& mask, int& x0, int& y0, int& x1, int& y1);
+  // Fill / magic wand: the pixels are read back on the main thread (only the painted bounds),
+  // the flood runs on a worker thread, and the result is applied when it is ready.
+  struct FloodResult {
+    bool ok = false, isFill = false;
+    int op = 0;
+    uint32_t layerId = 0;
+    int x = 0, y = 0;
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> cov;
+  };
+  std::future<FloodResult> floodJob;
+  bool flooding = false;
+  void startFlood(double dx, double dy, bool isFill);
+  void pollFlood();
+  bool fillSampleAll = false, wandSampleAll = false;
+  void snapshotSelection(int x0, int y0, int x1, int y1);  // selection undo step for this area
   // transform session
   struct Xform {
     bool active = false;
@@ -166,6 +182,12 @@ class App {
 
   // UI state
   bool showColor = true;
+  bool showColorSliders = false, pickerWheel = false;
+  float pickPrev[3] = {};
+  struct Preset { std::string name; BrushSettings b; };
+  std::vector<Preset> presets;
+  char presetName[64] = {};
+  int presetSel = -1;
   bool hideUI = false;          // Tab: canvas only
   // unsaved-changes guard
   uint64_t savedRevision = 0;

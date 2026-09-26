@@ -916,7 +916,6 @@ void Renderer::recordLayerProps(int index) {
   e.layerId = l.id;
   e.props = {l.name, l.visible, l.opacity, l.mode, l.lockAlpha};
   pushUndo(std::move(e));
-  ++revision;
 }
 
 // Swaps a non-tile undo entry with the current document state (so the same entry redoes).
@@ -962,9 +961,23 @@ bool Renderer::applyLayerUndo(UndoEntry& e) {
       e.kind = UndoKind::Deleted;
       return true;
     }
+    case UndoKind::Selection:
+      if (!selectionSwap) return false;
+      selectionSwap(e.sel, e.rect[0], e.rect[1], e.rect[2], e.rect[3], e.selState);
+      return true;
     default:
       return false;
   }
+}
+
+void Renderer::pushSelectionUndo(std::vector<uint8_t>&& region, int x, int y, int w, int h, const int bbox[5]) {
+  UndoEntry e;
+  e.kind = UndoKind::Selection;
+  e.sel = std::move(region);
+  e.rect[0] = x; e.rect[1] = y; e.rect[2] = w; e.rect[3] = h;
+  for (int i = 0; i < 5; ++i) e.selState[i] = bbox[i];
+  e.bytes = e.sel.size();
+  pushUndo(std::move(e));
 }
 
 bool Renderer::newDocument(uint32_t w, uint32_t h, bool white, std::string& err) {
@@ -1033,8 +1046,9 @@ int Renderer::addLayer(int index, std::string& err, bool undoable) {
     e.kind = UndoKind::Added;
     e.layerId = id;
     pushUndo(std::move(e));
+  } else {
+    bumpRevision();
   }
-  ++revision;
   return index;
 }
 
@@ -1073,7 +1087,6 @@ void Renderer::deleteLayer(int index) {
   layers.erase(layers.begin() + index);
   pushUndo(std::move(e));
   cachesDirty = true;
-  ++revision;
 }
 
 void Renderer::moveLayerTo(int index, int j) {
@@ -1087,7 +1100,6 @@ void Renderer::moveLayerTo(int index, int j) {
   layers.erase(layers.begin() + index);
   layers.insert(layers.begin() + j, std::move(tmp));
   cachesDirty = true;
-  ++revision;
 }
 
 bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* rgba, std::string& err) {
@@ -1120,7 +1132,7 @@ bool Renderer::uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h
   destroyBuffer(device, stage);
   growBounds(layers[index], x0, y0, x1, y1);
   cachesDirty = true;
-  ++revision;
+  bumpRevision();
   return true;
 }
 
@@ -1157,7 +1169,7 @@ bool Renderer::readLayerPixels(int index, std::vector<uint8_t>& out, std::string
                         [this] { return beginOneShot(); }, [this](VkCommandBuffer c) { endOneShot(c); }, memProps);
 }
 
-bool Renderer::readMergedPixels(std::vector<uint8_t>& out, std::string& err) {
+bool Renderer::readMergedRegion(int rx, int ry, uint32_t rw, uint32_t rh, std::vector<uint8_t>& out, std::string& err) {
   // Flatten in 2048 x 2048 tiles with the same cache shader the screen uses (zoom 1, no rotation),
   // so saved composites match what is on screen, blend modes included.
   const uint32_t T = 2048;
@@ -1184,13 +1196,14 @@ bool Renderer::readMergedPixels(std::vector<uint8_t>& out, std::string& err) {
     }
     vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
   }
-  out.assign(size_t(docW) * docH * 4, 0);
+  out.assign(size_t(rw) * rh * 4, 0);
   std::vector<uint8_t> band;
   bool ok = true;
-  for (uint32_t ty = 0; ty < docH && ok; ty += T)
-    for (uint32_t tx = 0; tx < docW && ok; tx += T) {
+  bool first = true;
+  for (uint32_t ty = uint32_t(ry); ty < uint32_t(ry) + rh && ok; ty += T)
+    for (uint32_t tx = uint32_t(rx); tx < uint32_t(rx) + rw && ok; tx += T) {
       VkCommandBuffer cmd = beginOneShot();
-      if (tx == 0 && ty == 0)
+      if (first)
         imageBarrier(cmd, tile.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, kAllStages, 0, kAllStages, kAllAccess);
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cachePipe);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &set, 0, nullptr);
@@ -1211,13 +1224,14 @@ bool Renderer::readMergedPixels(std::vector<uint8_t>& out, std::string& err) {
         memoryBarrier(cmd, kCS, kRW, kCS, kRW);
       }
       endOneShot(cmd);
-      uint32_t w = std::min(T, docW - tx), h = std::min(T, docH - ty);
+      first = false;
+      uint32_t w = std::min(T, uint32_t(rx) + rw - tx), h = std::min(T, uint32_t(ry) + rh - ty);
       std::string e2;
       ok = readImageBands(*this, tile.image, T, h, band, e2, [this] { return beginOneShot(); },
                           [this](VkCommandBuffer c) { endOneShot(c); }, memProps);
       if (!ok) { err = e2; break; }
       for (uint32_t y = 0; y < h; ++y)
-        memcpy(out.data() + (size_t(ty + y) * docW + tx) * 4, band.data() + size_t(y) * T * 4, size_t(w) * 4);
+        memcpy(out.data() + (size_t(ty - ry + y) * rw + (tx - rx)) * 4, band.data() + size_t(y) * T * 4, size_t(w) * 4);
     }
   vkFreeDescriptorSets(device, descPool, 1, &set);
   destroyImage(device, tile);
@@ -1430,7 +1444,7 @@ void Renderer::recordCommit(VkCommandBuffer cmd) {
   pc.lockAlpha = layer.lockAlpha ? 1 : 0;
   if (!style.eraser && !layer.lockAlpha) growBounds(layer, sx0, sy0, sx1, sy1);
   layer.thumbDirty = true;
-  ++revision;
+  if (!haveUndo) bumpRevision();
   vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                      0, sizeof pc, &pc);
   vkCmdDispatch(cmd, (pc.size[0] + 15) / 16, (pc.size[1] + 15) / 16, 1);
@@ -1441,6 +1455,9 @@ void Renderer::recordCommit(VkCommandBuffer cmd) {
 }
 
 void Renderer::pushUndo(UndoEntry&& e) {
+  e.revBefore = revision;
+  bumpRevision();
+  e.revAfter = revision;
   for (auto& r : redoStack) dropUndo(r);
   redoStack.clear();
   undoStack.push_back(std::move(e));
@@ -1460,7 +1477,7 @@ void Renderer::recordUndoOps(VkCommandBuffer cmd) {
     if (from.empty()) continue;
     UndoEntry e = std::move(from.back());
     from.pop_back();
-    ++revision;
+    revision = isUndo ? e.revBefore : e.revAfter;  // back to the exact saved state -> no "*"
     cachesDirty = true;
     if (e.kind != UndoKind::Tiles) {
       if (applyLayerUndo(e)) {

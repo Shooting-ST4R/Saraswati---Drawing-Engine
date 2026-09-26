@@ -219,7 +219,7 @@ bool Renderer::stamp(int layer, const Floating& f, const double inv[9], int rx0,
   else err = "Not enough memory to keep undo for the transform.";
   growBounds(L, rx0, ry0, rx1, ry1);
   cachesDirty = true;
-  ++revision;
+  if (!haveUndo) bumpRevision();
   return true;
 }
 

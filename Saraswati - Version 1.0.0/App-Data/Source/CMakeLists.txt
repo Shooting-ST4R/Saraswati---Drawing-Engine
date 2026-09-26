@@ -41,7 +41,16 @@ set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
 set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
 set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(${TP}/glslang EXCLUDE_FROM_ALL)
+# A prebuilt glslang can be given for cross builds (the shader compiler must run on the host).
+set(SARASWATI_GLSLANG "" CACHE FILEPATH "Prebuilt glslang executable (optional, for cross compiling)")
+if(SARASWATI_GLSLANG)
+  set(GLSLANG_CMD ${SARASWATI_GLSLANG})
+  set(GLSLANG_DEP "")
+else()
+  add_subdirectory(${TP}/glslang EXCLUDE_FROM_ALL)
+  set(GLSLANG_CMD glslang-standalone)
+  set(GLSLANG_DEP glslang-standalone)
+endif()
 
 # ---- shaders -> embedded SPIR-V headers ----
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
@@ -58,8 +67,8 @@ function(compile_shader src name)
   endforeach()
   add_custom_command(
     OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.1 ${defs} -I${SHADER_DIR} --vn ${name} -o ${out} ${SHADER_DIR}/${src}
-    DEPENDS ${SHADER_DIR}/${src} ${SHADER_INCLUDES} glslang-standalone
+    COMMAND ${GLSLANG_CMD} -V --target-env vulkan1.1 ${defs} -I${SHADER_DIR} --vn ${name} -o ${out} ${SHADER_DIR}/${src}
+    DEPENDS ${SHADER_DIR}/${src} ${SHADER_INCLUDES} ${GLSLANG_DEP}
     COMMENT "glslang ${src} -> ${name}.h"
     VERBATIM)
   set(SHADER_HEADERS ${SHADER_HEADERS} ${out} PARENT_SCOPE)

@@ -57,6 +57,19 @@ App::App(SDL_Window* w, Renderer& r, const Options& o) : window(w), R(r), opt(o)
   brushes[2].spacing = 0.1f;
   brushes[2].pressureSize = false;
   brushes[2].pressureOpacity = true;
+  // selection undo: swap a stored region (and bbox state) with the current selection
+  R.selectionSwap = [this](std::vector<uint8_t>& data, int x, int y, int w, int h, int* st) {
+    int W = int(R.docW);
+    if (selCpu.size() != size_t(W) * R.docH) selCpu.assign(size_t(W) * R.docH, 0);
+    for (int yy = 0; yy < h; ++yy)
+      std::swap_ranges(data.begin() + size_t(yy) * w, data.begin() + size_t(yy + 1) * w, selCpu.begin() + size_t(y + yy) * W + x);
+    int cur[5] = {selX0, selY0, selX1, selY1, selActive ? 1 : 0};
+    selX0 = st[0]; selY0 = st[1]; selX1 = st[2]; selY1 = st[3]; selActive = st[4] != 0;
+    for (int i = 0; i < 5; ++i) st[i] = cur[i];
+    std::string err;
+    R.uploadSelection(selCpu.data(), x, y, uint32_t(w), uint32_t(h), err);
+    R.setSelectionActive(selActive);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -412,12 +425,56 @@ void App::drawBrushPanel() {
     ImGui::End();
     return;
   }
-  ImGui::SeparatorText("Brush");
-  // brush list (one row per tip, current one highlighted)
-  for (int i = 0; i < 3; ++i) {
-    char label[64];
-    snprintf(label, sizeof label, "%s  (%d)", kTipNames[i], i + 1);
-    if (ImGui::Selectable(label, tipIndex == i)) tipIndex = i;
+  // tips as one segmented row
+  {
+    static const char* shortNames[3] = {"Hard", "Textured", "Soft"};
+    float bw = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3;
+    for (int i = 0; i < 3; ++i) {
+      if (i) ImGui::SameLine();
+      ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(tipIndex == i ? ImGuiCol_ButtonActive : ImGuiCol_Button));
+      if (ImGui::Button(shortNames[i], ImVec2(bw, 0))) tipIndex = i;
+      ImGui::PopStyleColor();
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s (%d)", kTipNames[i], i + 1);
+    }
+  }
+  // presets: saved brush variants
+  {
+    float w = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(w - ImGui::GetFrameHeight() * 2 - 2 * ImGui::GetStyle().ItemSpacing.x);
+    const char* cur = (presetSel >= 0 && presetSel < int(presets.size())) ? presets[presetSel].name.c_str() : "Presets...";
+    if (ImGui::BeginCombo("##preset", cur)) {
+      for (int i = 0; i < int(presets.size()); ++i)
+        if (ImGui::Selectable(presets[i].name.c_str(), i == presetSel)) {
+          presetSel = i;
+          tipIndex = int(presets[i].b.tip);
+          brushes[tipIndex] = presets[i].b;
+        }
+      if (presets.empty()) ImGui::TextDisabled("No presets yet - use + to save the current brush");
+      ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+", ImVec2(ImGui::GetFrameHeight(), 0))) {
+      snprintf(presetName, sizeof presetName, "%s %d", kTipNames[tipIndex], int(brushes[tipIndex].size));
+      ImGui::OpenPopup("Save preset");
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save the current brush as a preset");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(presetSel < 0 || presetSel >= int(presets.size()));
+    if (ImGui::Button("-", ImVec2(ImGui::GetFrameHeight(), 0))) { presets.erase(presets.begin() + presetSel); presetSel = -1; }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Delete the selected preset");
+    if (ImGui::BeginPopup("Save preset")) {
+      if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+      bool ok = ImGui::InputText("##pname", presetName, sizeof presetName, ImGuiInputTextFlags_EnterReturnsTrue);
+      ImGui::SameLine();
+      ok |= ImGui::Button("Save");
+      if (ok && presetName[0]) {
+        presets.push_back({presetName, brushes[tipIndex]});
+        presetSel = int(presets.size()) - 1;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
   }
   ImGui::Checkbox("Eraser (E)", &eraserToggle);
   BrushSettings& b = brushes[tipIndex];
@@ -431,7 +488,7 @@ void App::drawBrushPanel() {
     sliderF("##tex", &b.texStrength, 0.0f, 1.0f, "Texture  %.2f");
     sliderF("##grain", &b.texScale, 1.0f, 64.0f, "Grain scale  %.1f px", ImGuiSliderFlags_Logarithmic);
   }
-  ImGui::SeparatorText("Pen pressure");
+  if (!ImGui::CollapsingHeader("Pen pressure", ImGuiTreeNodeFlags_DefaultOpen)) { ImGui::End(); return; }
   ImGui::Checkbox("Size", &b.pressureSize);
   ImGui::SameLine();
   ImGui::Checkbox("Opacity", &b.pressureOpacity);
@@ -460,52 +517,64 @@ void App::drawBrushPanel() {
 
 void App::drawColorPanel() {
   if (!ImGui::Begin("Colour", &showColor)) { ImGui::End(); return; }
+  float line = ImGui::GetFrameHeightWithSpacing();
+  float reserve = line * (showColorSliders ? 4.4f : 1.4f) + (recentColors.empty() ? 0 : line);
   ImVec2 avail = ImGui::GetContentRegionAvail();
-  float side = std::max(90.0f, std::min(avail.x, avail.y - 4 * ImGui::GetFrameHeightWithSpacing() - 30));
-  ImGui::SetNextItemWidth(side);
-  ImGui::ColorPicker3("##wheel", color,
-                      ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoSidePreview |
-                          ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoSmallPreview);
-  // foreground / background swatches (click the back one or press X to swap)
-  float sw = ImGui::GetFrameHeight() * 1.4f;
+  // square SV + hue bar (CSP style) by default, hue wheel optional; as large as the panel allows
+  float side = std::max(80.0f, std::min(avail.x - (pickerWheel ? 0 : ImGui::GetFrameHeight() * 1.2f), avail.y - reserve));
+  ImGui::SetNextItemWidth(side + (pickerWheel ? 0 : ImGui::GetFrameHeight() * 1.2f));
+  ImGui::ColorPicker3("##picker", color,
+                      (pickerWheel ? ImGuiColorEditFlags_PickerHueWheel : ImGuiColorEditFlags_PickerHueBar) |
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoLabel |
+                          ImGuiColorEditFlags_NoSmallPreview);
+  if (ImGui::BeginPopupContextItem("##pickmode")) {
+    if (ImGui::MenuItem("Square + hue bar", nullptr, !pickerWheel)) pickerWheel = false;
+    if (ImGui::MenuItem("Hue wheel", nullptr, pickerWheel)) pickerWheel = true;
+    ImGui::EndPopup();
+  }
+  // foreground / background swatches, hex, slider toggle - one row
+  float sw = ImGui::GetFrameHeight();
   ImVec2 c0 = ImGui::GetCursorScreenPos();
-  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 0.55f, c0.y + sw * 0.45f));
+  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 0.6f, c0.y + sw * 0.35f));
   if (ImGui::ColorButton("##bg", ImVec4(bgColor[0], bgColor[1], bgColor[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(sw, sw)))
     for (int k = 0; k < 3; ++k) std::swap(color[k], bgColor[k]);
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Background colour - click or X to swap");
   ImGui::SetCursorScreenPos(c0);
   ImGui::ColorButton("##fg", ImVec4(color[0], color[1], color[2], 1), ImGuiColorEditFlags_NoTooltip, ImVec2(sw, sw));
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Current colour");
-  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 1.75f, c0.y));
-  // hex
+  ImGui::SetCursorScreenPos(ImVec2(c0.x + sw * 1.9f, c0.y));
   char hex[8];
   snprintf(hex, sizeof hex, "%02X%02X%02X", int(color[0] * 255 + 0.5f), int(color[1] * 255 + 0.5f), int(color[2] * 255 + 0.5f));
-  ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x));
+  ImGui::SetNextItemWidth(std::max(60.0f, ImGui::GetContentRegionAvail().x - sw * 2.2f));
   if (ImGui::InputText("##hex", hex, sizeof hex, ImGuiInputTextFlags_CharsHexadecimal | ImGuiInputTextFlags_CharsUppercase)) {
     unsigned v = 0;
     if (strlen(hex) == 6 && sscanf(hex, "%x", &v) == 1)
       for (int k = 0; k < 3; ++k) color[k] = ((v >> (16 - 8 * k)) & 255) / 255.0f;
   }
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hex colour (RRGGBB)");
-  ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + sw * 1.55f));
-  // H in degrees, S and V in percent
-  float h, sat, val;
-  ImGui::ColorConvertRGBtoHSV(color[0], color[1], color[2], h, sat, val);
-  if (sat > 0.0f && val > 0.0f) lastHue = h;
-  float H = lastHue * 360, S = sat * 100, V = val * 100;
-  bool ch = sliderF("##h", &H, 0, 360, "H  %.0f deg");
-  ch |= sliderF("##s", &S, 0, 100, "S  %.0f %%");
-  ch |= sliderF("##v", &V, 0, 100, "V  %.0f %%");
-  if (ch) {
-    lastHue = std::clamp(H / 360.0f, 0.0f, 0.9999f);
-    ImGui::ColorConvertHSVtoRGB(lastHue, S / 100, V / 100, color[0], color[1], color[2]);
+  ImGui::SameLine();
+  if (ImGui::Button(showColorSliders ? "HSV -" : "HSV +", ImVec2(-FLT_MIN, 0))) showColorSliders = !showColorSliders;
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show / hide the H, S, V sliders (right-click the picker for the wheel)");
+  ImGui::SetCursorScreenPos(ImVec2(c0.x, c0.y + sw * 1.45f));
+  ImGui::Dummy(ImVec2(0, 0));
+  if (showColorSliders) {
+    float h, sat, val;
+    ImGui::ColorConvertRGBtoHSV(color[0], color[1], color[2], h, sat, val);
+    if (sat > 0.0f && val > 0.0f) lastHue = h;
+    float H = lastHue * 360, S = sat * 100, V = val * 100;
+    bool ch = sliderF("##h", &H, 0, 360, "H  %.0f deg");
+    ch |= sliderF("##s", &S, 0, 100, "S  %.0f %%");
+    ch |= sliderF("##v", &V, 0, 100, "V  %.0f %%");
+    if (ch) {
+      lastHue = std::clamp(H / 360.0f, 0.0f, 0.9999f);
+      ImGui::ColorConvertHSVtoRGB(lastHue, S / 100, V / 100, color[0], color[1], color[2]);
+    }
   }
-  // recently used colours
   if (!recentColors.empty()) {
     float bs = ImGui::GetFrameHeight() * 0.8f;
     int perRow = std::max(1, int(ImGui::GetContentRegionAvail().x / (bs + 3)));
-    for (size_t i = 0; i < recentColors.size(); ++i) {
-      if (i % size_t(perRow)) ImGui::SameLine(0, 3);
+    for (size_t i = 0; i < recentColors.size() && i < size_t(perRow); ++i) {
+      if (i) ImGui::SameLine(0, 3);
       ImGui::PushID(int(i));
       auto& c = recentColors[i];
       if (ImGui::ColorButton("##r", ImVec4(c[0], c[1], c[2], 1), 0, ImVec2(bs, bs)))
@@ -535,8 +604,8 @@ void App::buildDefaultLayout(unsigned int dockId) {
   ImGuiID tools = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.032f, nullptr, &centre);
   ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.21f, nullptr, &centre);
   ImGuiID rightMid, rightBottom;
-  ImGuiID rightTop = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.34f, nullptr, &rightMid);
-  rightBottom = ImGui::DockBuilderSplitNode(rightMid, ImGuiDir_Down, 0.50f, nullptr, &rightMid);
+  ImGuiID rightTop = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.38f, nullptr, &rightMid);
+  rightBottom = ImGui::DockBuilderSplitNode(rightMid, ImGuiDir_Down, 0.48f, nullptr, &rightMid);
   ImGui::DockBuilderDockWindow("Tools", tools);
   ImGui::DockBuilderDockWindow("Colour", rightTop);
   ImGui::DockBuilderDockWindow("Tool Settings", rightMid);
@@ -562,9 +631,10 @@ void App::drawLayerPanel() {
   bool locked = R.stroking() || xf.active;
   ImGui::BeginDisabled(locked);
   Layer& L = R.layers[active];
-  // blend mode + opacity + alpha lock of the active layer
+  // one row: blend mode | opacity | lock transparency
+  float fh = ImGui::GetFrameHeight();
   float wAvail = ImGui::GetContentRegionAvail().x;
-  ImGui::SetNextItemWidth(wAvail * 0.5f);
+  ImGui::SetNextItemWidth(wAvail * 0.48f);
   if (ImGui::BeginCombo("##blend", blendModeName(L.mode), ImGuiComboFlags_HeightLarge)) {
     for (int m = 0; m < int(BlendMode::Count); ++m) {
       if (ImGui::Selectable(blendModeName(BlendMode(m)), m == int(L.mode)) && m != int(L.mode)) {
@@ -579,35 +649,26 @@ void App::drawLayerPanel() {
   ImGui::SameLine();
   float before = L.opacity;
   float op = L.opacity * 100;
-  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - fh - ImGui::GetStyle().ItemSpacing.x);
   bool changed = ImGui::SliderFloat("##lop", &op, 0.0f, 100.0f, "%.0f %%");
   if (ImGui::IsItemActivated()) { L.opacity = before; R.recordLayerProps(active); }
   if (changed) { L.opacity = op / 100; R.markCachesDirty(); }
-  bool lock = L.lockAlpha;
-  if (ImGui::Checkbox("Lock transparency", &lock)) { R.recordLayerProps(active); L.lockAlpha = lock; }
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Paint only where the layer already has pixels");
-  // layer buttons
-  float bw = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5;
-  if (ImGui::Button("New", ImVec2(bw, 0))) addLayer();
   ImGui::SameLine();
-  if (ImGui::Button("Copy", ImVec2(bw, 0))) {
-    std::string err;
-    int i = R.duplicateLayer(active, err);
-    if (i < 0) error(err); else active = i;
+  {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(L.lockAlpha ? ImGuiCol_ButtonActive : ImGuiCol_Button));
+    if (ImGui::Button("##lock", ImVec2(fh, fh))) { R.recordLayerProps(active); L.lockAlpha = !L.lockAlpha; }
+    ImGui::PopStyleColor();
+    ImVec2 mn = ImGui::GetItemRectMin();
+    ImDrawList* d = ImGui::GetWindowDrawList();
+    ImU32 col = ImGui::GetColorU32(L.lockAlpha ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+    d->AddRect(ImVec2(mn.x + fh * 0.25f, mn.y + fh * 0.45f), ImVec2(mn.x + fh * 0.75f, mn.y + fh * 0.8f), col, 2, 1.5f);
+    d->PathArcTo(ImVec2(mn.x + fh * 0.5f, mn.y + fh * 0.45f), fh * 0.16f, float(kPi), float(2 * kPi), 10);
+    d->PathStroke(col, 1.5f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lock transparency: paint only where the layer has pixels");
   }
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Duplicate layer");
-  ImGui::SameLine();
-  ImGui::BeginDisabled(R.layers.size() <= 1);
-  if (ImGui::Button("Delete", ImVec2(bw, 0))) { R.deleteLayer(active); active = std::min(active, int(R.layers.size()) - 1); }
-  ImGui::EndDisabled();
-  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Delete layer (undoable)");
-  ImGui::SameLine();
-  if (ImGui::ArrowButton("##up", ImGuiDir_Up) && active + 1 < int(R.layers.size())) { R.moveLayer(active, 1); ++active; }
-  ImGui::SameLine();
-  if (ImGui::ArrowButton("##down", ImGuiDir_Down) && active > 0) { R.moveLayer(active, -1); --active; }
-  ImGui::Separator();
   // layer list, top layer first: eye | thumbnail | name + mode/opacity
-  ImGui::BeginChild("list");
+  float footer = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2;
+  ImGui::BeginChild("list", ImVec2(0, -footer));
   float rowH = std::max(40.0f, ImGui::GetTextLineHeight() * 2.6f);
   float thumb = rowH - 6;
   ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -683,6 +744,51 @@ void App::drawLayerPanel() {
     renameIndex = -1;
   }
   ImGui::EndChild();
+  // footer: new, duplicate, delete, move up, move down (drawn icons)
+  {
+    float fh2 = ImGui::GetFrameHeight();
+    ImDrawList* d = ImGui::GetWindowDrawList();
+    auto iconBtn = [&](const char* id, const char* tip, bool enabled, int icon) {
+      ImGui::BeginDisabled(!enabled);
+      bool r = ImGui::Button(id, ImVec2(fh2 * 1.4f, fh2));
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", tip);
+      ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+      ImVec2 c((mn.x + mx.x) / 2, (mn.y + mx.y) / 2);
+      float r2 = fh2 * 0.28f;
+      ImU32 col = ImGui::GetColorU32(enabled ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+      switch (icon) {
+        case 0: d->AddLine(ImVec2(c.x - r2, c.y), ImVec2(c.x + r2, c.y), col, 2); d->AddLine(ImVec2(c.x, c.y - r2), ImVec2(c.x, c.y + r2), col, 2); break;
+        case 1: d->AddRect(ImVec2(c.x - r2, c.y - r2 * 0.4f), ImVec2(c.x + r2 * 0.4f, c.y + r2), col, 1, 1.5f);
+                d->AddRect(ImVec2(c.x - r2 * 0.4f, c.y - r2), ImVec2(c.x + r2, c.y + r2 * 0.4f), col, 1, 1.5f); break;
+        case 2: d->AddLine(ImVec2(c.x - r2 * 0.8f, c.y - r2 * 0.8f), ImVec2(c.x + r2 * 0.8f, c.y + r2 * 0.8f), col, 2);
+                d->AddLine(ImVec2(c.x + r2 * 0.8f, c.y - r2 * 0.8f), ImVec2(c.x - r2 * 0.8f, c.y + r2 * 0.8f), col, 2); break;
+        case 3: d->AddTriangleFilled(ImVec2(c.x, c.y - r2), ImVec2(c.x - r2, c.y + r2 * 0.6f), ImVec2(c.x + r2, c.y + r2 * 0.6f), col); break;
+        case 4: d->AddTriangleFilled(ImVec2(c.x, c.y + r2), ImVec2(c.x + r2, c.y - r2 * 0.6f), ImVec2(c.x - r2, c.y - r2 * 0.6f), col); break;
+      }
+      return r;
+    };
+    if (iconBtn("##new", "New layer", true, 0)) addLayer();
+    ImGui::SameLine();
+    if (iconBtn("##dup", "Duplicate layer", true, 1)) {
+      std::string err;
+      int i = R.duplicateLayer(active, err);
+      if (i < 0) error(err); else active = i;
+    }
+    ImGui::SameLine();
+    if (iconBtn("##del", "Delete layer (undoable)", R.layers.size() > 1, 2)) {
+      R.deleteLayer(active);
+      active = std::min(active, int(R.layers.size()) - 1);
+    }
+    ImGui::SameLine();
+    if (iconBtn("##up", "Move layer up", active + 1 < int(R.layers.size()), 3)) { R.moveLayer(active, 1); ++active; }
+    ImGui::SameLine();
+    if (iconBtn("##down", "Move layer down", active > 0, 4)) { R.moveLayer(active, -1); --active; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d / %d%s", int(R.layers.size()), R.limit.maxLayers, R.cpuEmulation ? " est." : "");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Layers / maximum that fit in GPU memory at this size (%s each)",
+                                                 fmtBytes(double(R.limit.layerBytes)).c_str());
+  }
   ImGui::EndDisabled();
   ImGui::End();
 }
@@ -852,6 +958,7 @@ void App::drawStatusBar() {
       if (xf.active) { ImGui::Separator(); ImGui::TextUnformatted("Transforming - Enter applies, Esc cancels"); }
       ImGui::Separator();
       if (saving) ImGui::TextUnformatted("Saving...");
+      else if (flooding) ImGui::TextUnformatted("Working...");
       else if (SDL_GetTicksNS() < toastUntil) ImGui::TextUnformatted(toast.c_str());
       else if (R.cpuEmulation) ImGui::TextDisabled("CPU emulation");
       ImGui::EndMenuBar();
@@ -1140,7 +1247,7 @@ void App::buildDemo() {
 void App::tickDemo() {
   if (demoDone || demo.empty()) return;
   // wait for the GPU to finish the previous step (the last step leaves a stroke open on purpose)
-  if (demoStep > 0 && R.busy() && !(demoStep == demo.size())) return;
+  if (demoStep > 0 && (R.busy() || flooding) && !(demoStep == demo.size())) return;
   if (demoStep < demo.size()) {
     demo[demoStep++]();
     framesToRender = std::max(framesToRender, 3);
@@ -1162,6 +1269,7 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
+  if (flooding) floodJob.wait();
   if (xf.active) R.destroyFloating(xf.fl);
   saveSettings();
 }
@@ -1185,6 +1293,21 @@ void App::loadSettings() {
     else if (k == "folder") { lastFolder = v; while (!lastFolder.empty() && (lastFolder.back() == '\n' || lastFolder.back() == '\r')) lastFolder.pop_back(); }
     else if (k == "fill") sscanf(v, "%f %f", &fillTol, &wandTol);
     else if (k == "perf") showPerf = atoi(v) != 0;
+    else if (k == "preset") {
+      Preset p;
+      int tip = 0, ps = 1, po = 0, n2 = 0;
+      BrushSettings& b = p.b;
+      if (sscanf(v, "%d %f %f %f %f %f %f %f %d %f %d %f %n", &tip, &b.size, &b.opacity, &b.flow, &b.spacing, &b.hardness,
+                 &b.texStrength, &b.texScale, &ps, &b.minSize, &po, &b.gamma, &n2) >= 12) {
+        b.tip = Tip(std::clamp(tip, 0, 2));
+        b.pressureSize = ps != 0;
+        b.pressureOpacity = po != 0;
+        p.name = v + n2;
+        while (!p.name.empty() && (p.name.back() == '\n' || p.name.back() == '\r')) p.name.pop_back();
+        if (p.name.empty()) p.name = "Preset";
+        presets.push_back(p);
+      }
+    }
     else if (k.rfind("brush", 0) == 0 && k.size() == 6) {
       int i = std::clamp(k[5] - '0', 0, 2);
       BrushSettings& b = brushes[i];
@@ -1208,6 +1331,11 @@ void App::saveSettings() {
     const BrushSettings& b = brushes[i];
     fprintf(f, "brush%d %f %f %f %f %f %f %f %d %f %d %f\n", i, b.size, b.opacity, b.flow, b.spacing, b.hardness, b.texStrength,
             b.texScale, b.pressureSize ? 1 : 0, b.minSize, b.pressureOpacity ? 1 : 0, b.gamma);
+  }
+  for (auto& p : presets) {
+    const BrushSettings& b = p.b;
+    fprintf(f, "preset %d %f %f %f %f %f %f %f %d %f %d %f %s\n", int(b.tip), b.size, b.opacity, b.flow, b.spacing, b.hardness,
+            b.texStrength, b.texScale, b.pressureSize ? 1 : 0, b.minSize, b.pressureOpacity ? 1 : 0, b.gamma, p.name.c_str());
   }
   if (!lastFolder.empty()) fprintf(f, "folder %s\n", lastFolder.c_str());
   fclose(f);
@@ -1506,7 +1634,7 @@ int App::run() {
 
   bool wantShot = !opt.screenshot.empty();
   while (running) {
-    bool animating = bench.running || saving || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
+    bool animating = bench.running || saving || flooding || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
                      (wantShot && !screenshotTaken);
     SDL_Event e;
     if (!animating) {
@@ -1516,6 +1644,7 @@ int App::run() {
     while (SDL_PollEvent(&e)) handleEvent(e);
     if (!running) break;
     processDialogResults();
+    pollFlood();
     tickBenchmark();
     tickDemo();
     if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && engine.active() && (!wantShot || screenshotTaken))

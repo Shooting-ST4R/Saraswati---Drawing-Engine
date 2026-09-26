@@ -161,9 +161,23 @@ void App::resetSelection() {
   R.setSelectionActive(false);
 }
 
+// Stores the current selection inside [x0,x1) x [y0,y1) (plus its bbox state) as an undo step.
+void App::snapshotSelection(int x0, int y0, int x1, int y1) {
+  int W = int(R.docW), H = int(R.docH);
+  if (selCpu.size() != size_t(W) * H) selCpu.assign(size_t(W) * H, 0);
+  if (selActive) { x0 = std::min(x0, selX0); y0 = std::min(y0, selY0); x1 = std::max(x1, selX1); y1 = std::max(y1, selY1); }
+  x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::min(x1, W); y1 = std::min(y1, H);
+  if (x0 >= x1 || y0 >= y1) return;
+  std::vector<uint8_t> data(size_t(x1 - x0) * (y1 - y0));
+  for (int yy = y0; yy < y1; ++yy) memcpy(&data[size_t(yy - y0) * (x1 - x0)], &selCpu[size_t(yy) * W + x0], size_t(x1 - x0));
+  int st[5] = {selX0, selY0, selX1, selY1, selActive ? 1 : 0};
+  R.pushSelectionUndo(std::move(data), x0, y0, x1 - x0, y1 - y0, st);
+}
+
 void App::combineSelection(int x, int y, uint32_t w, uint32_t h, const std::vector<uint8_t>& cov, int op) {
   if (!R.hasDocument()) return;
   int W = int(R.docW), H = int(R.docH);
+  snapshotSelection(x, y, x + int(w), y + int(h));
   if (selCpu.size() != size_t(W) * H) selCpu.assign(size_t(W) * H, 0);
   int ux0 = x, uy0 = y, ux1 = x + int(w), uy1 = y + int(h);
   if (op == 0 && selActive) {  // replace: clear the old area
@@ -205,6 +219,7 @@ void App::selectAll() {
 
 void App::deselect() {
   if (!selActive) return;
+  snapshotSelection(selX0, selY0, selX1, selY1);
   std::vector<uint8_t> none;
   int W = int(R.docW);
   for (int yy = selY0; yy < selY1; ++yy) memset(selCpu.data() + size_t(yy) * W + selX0, 0, size_t(selX1 - selX0));
@@ -236,56 +251,130 @@ void App::fillSelection(bool erase) {
   if (!R.paintCoverage(active, x0, y0, uint32_t(x1 - x0), uint32_t(y1 - y0), cov.data(), st, err) && !err.empty()) error(err);
 }
 
-// Flood fill on the active layer (premultiplied RGBA compared per channel).
-bool App::floodMask(double dx, double dy, float tol, bool contiguous, std::vector<uint8_t>& mask, int& bx0, int& by0,
-                    int& bx1, int& by1) {
+// Flood fill on the active layer or on all visible layers (premultiplied RGBA compared per
+// channel). Only the painted bounds are read back; everything outside them has one known value
+// (transparent, or the paper colour when sampling all layers).
+void App::startFlood(double dx, double dy, bool isFill) {
+  if (flooding || !R.hasDocument()) return;
   int W = int(R.docW), H = int(R.docH);
   int sx = int(std::floor(dx)), sy = int(std::floor(dy));
-  if (sx < 0 || sy < 0 || sx >= W || sy >= H) return false;
-  std::vector<uint8_t> px;
+  if (sx < 0 || sy < 0 || sx >= W || sy >= H) return;
+  bool all = isFill ? fillSampleAll : wandSampleAll;
+  int bx0 = W, by0 = H, bx1 = 0, by1 = 0;
+  auto grow = [&](const Layer& l) {
+    if (l.bx0 >= l.bx1) return;
+    bx0 = std::min(bx0, l.bx0); by0 = std::min(by0, l.by0); bx1 = std::max(bx1, l.bx1); by1 = std::max(by1, l.by1);
+  };
+  if (all) { for (auto& l : R.layers) if (l.visible) grow(l); }
+  else grow(R.layers[active]);
+  uint8_t outside[4] = {0, 0, 0, 0};
+  if (all && R.whitePaper) outside[0] = outside[1] = outside[2] = outside[3] = 255;
+  auto px = std::make_shared<std::vector<uint8_t>>();
   std::string err;
   R.waitIdle();
-  if (!R.readLayerRegion(active, 0, 0, uint32_t(W), uint32_t(H), px, err)) { error(err); return false; }
-  const uint8_t* seed = &px[(size_t(sy) * W + sx) * 4];
-  int t = int(tol * 255 + 0.5f);
-  auto match = [&](size_t i) {
-    const uint8_t* p = &px[i * 4];
-    for (int k = 0; k < 4; ++k) if (std::abs(int(p[k]) - int(seed[k])) > t) return false;
-    return true;
-  };
-  mask.assign(size_t(W) * H, 0);
-  bx0 = W; by0 = H; bx1 = 0; by1 = 0;
-  auto grow = [&](int x, int y) { bx0 = std::min(bx0, x); bx1 = std::max(bx1, x + 1); by0 = std::min(by0, y); by1 = std::max(by1, y + 1); };
-  if (!contiguous) {
-    for (int y = 0; y < H; ++y)
-      for (int x = 0; x < W; ++x)
-        if (match(size_t(y) * W + x)) { mask[size_t(y) * W + x] = 255; grow(x, y); }
-  } else {
-    std::vector<std::pair<int, int>> stack{{sx, sy}};
-    while (!stack.empty()) {
-      auto [x, y] = stack.back();
-      stack.pop_back();
-      size_t row = size_t(y) * W;
-      if (mask[row + x] || !match(row + x)) continue;
-      int l = x, r = x;
-      while (l > 0 && !mask[row + l - 1] && match(row + l - 1)) --l;
-      while (r + 1 < W && !mask[row + r + 1] && match(row + r + 1)) ++r;
-      memset(&mask[row + l], 255, size_t(r - l + 1));
-      grow(l, y);
-      grow(r, y);
-      for (int ny : {y - 1, y + 1}) {
-        if (ny < 0 || ny >= H) continue;
-        size_t nrow = size_t(ny) * W;
-        bool prev = false;
-        for (int i = l; i <= r; ++i) {
-          bool ok = !mask[nrow + i] && match(nrow + i);
-          if (ok && !prev) stack.push_back({i, ny});
-          prev = ok;
+  if (bx0 < bx1) {
+    bool ok = all ? R.readMergedRegion(bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), *px, err)
+                  : R.readLayerRegion(active, bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), *px, err);
+    if (!ok) { error(err); return; }
+  }
+  float tol = isFill ? fillTol : wandTol;
+  bool contiguous = isFill ? fillContiguous : wandContiguous;
+  bool grow1 = isFill && fillGrow;
+  int op = selOp;
+  uint32_t layerId = R.layers[active].id;
+  std::array<uint8_t, 4> out{outside[0], outside[1], outside[2], outside[3]};
+  flooding = true;
+  floodJob = std::async(std::launch::async, [=]() {
+    FloodResult res;
+    res.isFill = isFill;
+    res.op = op;
+    res.layerId = layerId;
+    int bw = bx1 - bx0;
+    auto pix = [&](int x, int y) -> const uint8_t* {
+      if (x >= bx0 && x < bx1 && y >= by0 && y < by1) return &(*px)[(size_t(y - by0) * bw + (x - bx0)) * 4];
+      return out.data();
+    };
+    const uint8_t* s0 = pix(sx, sy);
+    uint8_t seed[4] = {s0[0], s0[1], s0[2], s0[3]};
+    int t = int(tol * 255 + 0.5f);
+    auto match = [&](int x, int y) {
+      const uint8_t* p = pix(x, y);
+      for (int k = 0; k < 4; ++k) if (std::abs(int(p[k]) - int(seed[k])) > t) return false;
+      return true;
+    };
+    std::vector<uint8_t> mask(size_t(W) * H, 0);
+    int mx0 = W, my0 = H, mx1 = 0, my1 = 0;
+    auto mark = [&](int l, int r, int y) {
+      memset(&mask[size_t(y) * W + l], 255, size_t(r - l + 1));
+      mx0 = std::min(mx0, l); mx1 = std::max(mx1, r + 1); my0 = std::min(my0, y); my1 = std::max(my1, y + 1);
+    };
+    if (!contiguous) {
+      for (int y = 0; y < H; ++y) {
+        int run = -1;
+        for (int x = 0; x <= W; ++x) {
+          bool m = x < W && match(x, y);
+          if (m && run < 0) run = x;
+          if (!m && run >= 0) { mark(run, x - 1, y); run = -1; }
+        }
+      }
+    } else {
+      std::vector<std::pair<int, int>> stack{{sx, sy}};
+      while (!stack.empty()) {
+        auto [x, y] = stack.back();
+        stack.pop_back();
+        size_t row = size_t(y) * W;
+        if (mask[row + x] || !match(x, y)) continue;
+        int l = x, r = x;
+        while (l > 0 && !mask[row + l - 1] && match(l - 1, y)) --l;
+        while (r + 1 < W && !mask[row + r + 1] && match(r + 1, y)) ++r;
+        mark(l, r, y);
+        for (int ny : {y - 1, y + 1}) {
+          if (ny < 0 || ny >= H) continue;
+          size_t nrow = size_t(ny) * W;
+          bool prev = false;
+          for (int i = l; i <= r; ++i) {
+            bool ok = !mask[nrow + i] && match(i, ny);
+            if (ok && !prev) stack.push_back({i, ny});
+            prev = ok;
+          }
         }
       }
     }
+    if (mx0 >= mx1) return res;
+    if (grow1) {  // grow 1 px under anti-aliased line art so no halo is left
+      mx0 = std::max(0, mx0 - 1); my0 = std::max(0, my0 - 1); mx1 = std::min(W, mx1 + 1); my1 = std::min(H, my1 + 1);
+    }
+    res.x = mx0; res.y = my0; res.w = uint32_t(mx1 - mx0); res.h = uint32_t(my1 - my0);
+    res.cov.assign(size_t(res.w) * res.h, 0);
+    for (int y = my0; y < my1; ++y)
+      for (int x = mx0; x < mx1; ++x) {
+        uint8_t v = mask[size_t(y) * W + x];
+        if (!v && grow1)
+          for (int oy = -1; oy <= 1 && !v; ++oy)
+            for (int ox = -1; ox <= 1 && !v; ++ox) {
+              int xx = x + ox, yy = y + oy;
+              if (xx >= 0 && yy >= 0 && xx < W && yy < H && mask[size_t(yy) * W + xx]) v = 255;
+            }
+        res.cov[size_t(y - my0) * res.w + (x - mx0)] = v;
+      }
+    res.ok = true;
+    return res;
+  });
+}
+
+void App::pollFlood() {
+  if (!flooding || floodJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+  flooding = false;
+  FloodResult r = floodJob.get();
+  if (!r.ok || !r.w) return;
+  if (r.isFill) {
+    int li = R.indexOf(r.layerId);
+    if (li < 0) return;
+    std::string err;
+    if (!R.paintCoverage(li, r.x, r.y, r.w, r.h, r.cov.data(), currentStyle(eraserToggle), err) && !err.empty()) error(err);
+  } else {
+    combineSelection(r.x, r.y, r.w, r.h, r.cov, r.op);
   }
-  return bx0 < bx1;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +488,7 @@ bool App::toolDown(double dx, double dy, float sx, float sy) {
     case ToolId::Brush:  // Alt+click
     case ToolId::Eyedropper:
       picking = true;
+      for (int k = 0; k < 3; ++k) pickPrev[k] = color[k];
       R.requestPick(int(sx), int(sy));
       return true;
     case ToolId::Hand:
@@ -407,45 +497,11 @@ bool App::toolDown(double dx, double dy, float sx, float sy) {
       dragY = sy;
       toolDrag = false;
       return true;
-    case ToolId::Fill: {
+    case ToolId::Fill:
+    case ToolId::Wand:
       toolDrag = false;
-      std::vector<uint8_t> m;
-      int x0, y0, x1, y1;
-      if (!floodMask(dx, dy, fillTol, fillContiguous, m, x0, y0, x1, y1)) return true;
-      int W = int(R.docW), H = int(R.docH);
-      if (fillGrow) {  // grow 1 px under anti-aliased line art so no halo is left
-        x0 = std::max(0, x0 - 1); y0 = std::max(0, y0 - 1); x1 = std::min(W, x1 + 1); y1 = std::min(H, y1 + 1);
-      }
-      uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
-      std::vector<uint8_t> cov(size_t(w) * h);
-      for (int y = y0; y < y1; ++y)
-        for (int x = x0; x < x1; ++x) {
-          uint8_t v = m[size_t(y) * W + x];
-          if (!v && fillGrow)
-            for (int oy = -1; oy <= 1 && !v; ++oy)
-              for (int ox = -1; ox <= 1 && !v; ++ox) {
-                int xx = x + ox, yy = y + oy;
-                if (xx >= 0 && yy >= 0 && xx < W && yy < H && m[size_t(yy) * W + xx]) v = 255;
-              }
-          cov[size_t(y - y0) * w + (x - x0)] = v;
-        }
-      StrokeStyle st = currentStyle(false);
-      std::string err;
-      if (!R.paintCoverage(active, x0, y0, w, h, cov.data(), st, err) && !err.empty()) error(err);
+      startFlood(dx, dy, tool == ToolId::Fill);
       return true;
-    }
-    case ToolId::Wand: {
-      toolDrag = false;
-      std::vector<uint8_t> m;
-      int x0, y0, x1, y1;
-      if (!floodMask(dx, dy, wandTol, wandContiguous, m, x0, y0, x1, y1)) return true;
-      int W = int(R.docW);
-      uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
-      std::vector<uint8_t> cov(size_t(w) * h);
-      for (uint32_t y = 0; y < h; ++y) memcpy(&cov[size_t(y) * w], &m[size_t(y0 + int(y)) * W + x0], w);
-      combineSelection(x0, y0, w, h, cov, selOp);
-      return true;
-    }
     case ToolId::Lasso:
       lasso = {dx, dy};
       return true;
@@ -772,11 +828,14 @@ void App::drawToolOptions() {
       ImGui::SliderFloat("Tolerance", &fillTol, 0.0f, 1.0f, "%.2f");
       ImGui::Checkbox("Contiguous", &fillContiguous);
       ImGui::Checkbox("Grow 1 px under line art", &fillGrow);
+      ImGui::Checkbox("Refer to all visible layers", &fillSampleAll);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Find the area from the whole picture (e.g. line art on another layer)\nand fill it on the current layer");
       ImGui::TextDisabled("Fills on the active layer. Alt+Backspace fills the selection.");
       break;
     case ToolId::Wand:
       ImGui::SliderFloat("Tolerance", &wandTol, 0.0f, 1.0f, "%.2f");
       ImGui::Checkbox("Contiguous", &wandContiguous);
+      ImGui::Checkbox("Refer to all visible layers##w", &wandSampleAll);
       [[fallthrough]];
     case ToolId::SelRect:
     case ToolId::SelEllipse:
@@ -816,6 +875,32 @@ void App::drawToolOptions() {
         int m[4] = {3, 2, 1, 0};
         for (int k = 0; k < 4; ++k) { xf.q[k][0] = q[m[k]][0]; xf.q[k][1] = q[m[k]][1]; }
       }
+      {
+        // numeric scale / rotation (resets any corner distortion)
+        double cx = 0, cy = 0;
+        for (auto& c : xf.q) { cx += c[0] / 4; cy += c[1] / 4; }
+        double ex = xf.q[1][0] - xf.q[0][0], ey = xf.q[1][1] - xf.q[0][1];
+        double fx = xf.q[3][0] - xf.q[0][0], fy = xf.q[3][1] - xf.q[0][1];
+        float sw = float(std::hypot(ex, ey) / std::max(1u, xf.fl.w) * 100), sh = float(std::hypot(fx, fy) / std::max(1u, xf.fl.h) * 100);
+        float ang = float(std::atan2(ey, ex) * 180 / kPi);
+        bool ch = false;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x / 3 - 4);
+        ch |= ImGui::DragFloat("##tw", &sw, 0.5f, 1, 2000, "W %.1f %%");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x / 2 - 4);
+        ch |= ImGui::DragFloat("##th", &sh, 0.5f, 1, 2000, "H %.1f %%");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ch |= ImGui::DragFloat("##ta", &ang, 0.5f, -360, 360, "%.1f deg");
+        if (ch) {
+          double hw = xf.fl.w * sw / 200.0, hh = xf.fl.h * sh / 200.0, a = ang * kPi / 180, c = std::cos(a), s = std::sin(a);
+          double loc[4][2] = {{-hw, -hh}, {hw, -hh}, {hw, hh}, {-hw, hh}};
+          for (int k = 0; k < 4; ++k) {
+            xf.q[k][0] = cx + c * loc[k][0] - s * loc[k][1];
+            xf.q[k][1] = cy + s * loc[k][0] + c * loc[k][1];
+          }
+        }
+      }
       if (ImGui::Button("Apply (Enter)")) applyTransform();
       ImGui::SameLine();
       if (ImGui::Button("Cancel (Esc)")) cancelTransform();
@@ -851,6 +936,17 @@ void App::drawToolOverlay() {
       case ToolId::Lasso: poly(lasso, false); break;
       default: break;
     }
+  }
+  if (picking) {  // eyedropper ring: new colour on top, previous colour below
+    ImVec2 c(lastX / s, lastY / s);
+    ImU32 nc = ImGui::ColorConvertFloat4ToU32(ImVec4(color[0], color[1], color[2], 1));
+    ImU32 pc = ImGui::ColorConvertFloat4ToU32(ImVec4(pickPrev[0], pickPrev[1], pickPrev[2], 1));
+    dl->PathArcTo(c, 34, float(kPi), float(2 * kPi), 24);
+    dl->PathStroke(nc, 14.0f);
+    dl->PathArcTo(c, 34, 0, float(kPi), 24);
+    dl->PathStroke(pc, 14.0f);
+    dl->AddCircle(c, 42, IM_COL32(0, 0, 0, 160), 48, 1.0f);
+    dl->AddCircle(c, 26, IM_COL32(0, 0, 0, 160), 48, 1.0f);
   }
   if (xf.active) {
     ImVec2 p[4];

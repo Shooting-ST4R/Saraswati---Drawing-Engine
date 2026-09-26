@@ -121,10 +121,19 @@ class Renderer {
   void recordLayerProps(int index);  // call before changing name/visibility/opacity/mode/lock (undo step)
   void updateThumbnails(int maxCount);
   int heldLayers() const;            // deleted layers kept alive by undo
-  uint64_t revision = 0;             // increases with every change to the document
+  uint64_t revision = 0;             // id of the current document state (undo restores earlier ids)
+  void bumpRevision() { revision = ++revCounter; }
+  uint64_t revCounter = 0;
+  // Selection snapshots live in the app; the renderer keeps them in the shared undo history.
+  // swap(data, x, y, w, h, bbox/active) exchanges the stored region with the current one.
+  std::function<void(std::vector<uint8_t>&, int, int, int, int, int*)> selectionSwap;
+  void pushSelectionUndo(std::vector<uint8_t>&& region, int x, int y, int w, int h, const int bbox[5]);
   bool uploadLayerPixels(int index, int x, int y, uint32_t w, uint32_t h, const uint8_t* premulRgba, std::string& err);
   bool readLayerPixels(int index, std::vector<uint8_t>& premulRgba, std::string& err);  // whole layer
-  bool readMergedPixels(std::vector<uint8_t>& premulRgba, std::string& err);            // flattened doc
+  bool readMergedPixels(std::vector<uint8_t>& premulRgba, std::string& err) {             // flattened doc
+    return readMergedRegion(0, 0, docW, docH, premulRgba, err);
+  }
+  bool readMergedRegion(int x, int y, uint32_t w, uint32_t h, std::vector<uint8_t>& premulRgba, std::string& err);
 
   // ---- strokes ----
   void beginStroke(int layerIndex, const StrokeStyle& style);
@@ -208,7 +217,7 @@ class Renderer {
 
  private:
   struct Chunk { GpuBuffer buf; uint32_t firstTile = 0, tileCount = 0; };
-  enum class UndoKind { Tiles, Props, Order, Deleted, Added };
+  enum class UndoKind { Tiles, Props, Order, Deleted, Added, Selection };
   struct UndoEntry {
     UndoKind kind = UndoKind::Tiles;
     uint32_t layerId = 0;
@@ -219,6 +228,10 @@ class Renderer {
     std::vector<uint32_t> order;  // Order: layer ids bottom to top
     Layer held;                   // Deleted: the layer, kept alive for undo
     int index = 0;                // Deleted: where it was
+    uint64_t revBefore = 0, revAfter = 0;
+    std::vector<uint8_t> sel;     // Selection: 8-bit region x, y, w, h (in rect)
+    int rect[4] = {};
+    int selState[5] = {};         // Selection: bbox x0, y0, x1, y1 + active
   };
   void growBounds(Layer& l, int x0, int y0, int x1, int y1);
   bool applyLayerUndo(UndoEntry& e);  // non-tile kinds; swaps the entry with the current state
