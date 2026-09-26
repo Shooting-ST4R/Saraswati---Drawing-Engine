@@ -4,3 +4,6 @@ imgui            https://github.com/ocornut/imgui.git               aa0181478b18
 Vulkan-Headers   https://github.com/KhronosGroup/Vulkan-Headers.git 3c65a01745e4a1134d32b9c2c456472212dba16d
 volk             https://github.com/zeux/volk.git                   7f46f79751d7e3b3a6df20e38d3e3986585bcdf4
 glslang          https://github.com/KhronosGroup/glslang.git        2ff6f609379ce43c4291c732cf6a19dd2461a680
+stb              https://github.com/nothings/stb.git                2c980bb59875b0d32144a71867fbdebb2f77cd20
+nanosvg          https://github.com/memononen/nanosvg.git           239e102ec2c691f2902e20ace2ed36ee4a35cfe6
+libwebp          https://github.com/webmproject/libwebp.git         4fa21912338357f89e4fd51cf2368325b59e9bd9

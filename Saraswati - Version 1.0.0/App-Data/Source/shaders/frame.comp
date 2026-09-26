@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define WITH_STROKE
+#include "common.glsl"
+#include "view.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// This frame's picture: blend(below, active layer with live stroke), then the "above"
+// cache on top when every layer above is Normal (else the app dispatches them one by one).
+void main() {
+  ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(workImg);
+  if (px.x >= size.x || px.y >= size.y) return;
+  vec2 s = vec2(px) + 0.5;
+  vec4 c = imageLoad(belowImg, px);
+  if ((pc.flags & FLAG_LAYER) != 0) c = blendLayer(c, sampleLayer(s) * pc.layerOpacity, pc.mode);
+  if ((pc.flags & FLAG_ABOVE_CACHE) != 0) {
+    vec4 a = imageLoad(aboveImg, px);
+    c = a + c * (1.0 - a.a);
+  }
+  imageStore(workImg, px, c);
+}

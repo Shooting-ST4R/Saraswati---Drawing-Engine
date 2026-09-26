@@ -1,0 +1,27 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Stroke end: blend the stroke mask into the layer over the stroke bbox, and clear the mask.
+layout(push_constant) uniform CommitPC {
+  ivec2 origin;
+  ivec2 size;
+  vec4 color;   // straight rgb + stroke opacity
+  int eraser;
+} pc;
+
+void main() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= pc.size.x || local.y >= pc.size.y) return;
+  ivec2 px = pc.origin + local;
+  float m = imageLoad(maskImg, px).r;
+  if (m <= 0.0) return;
+  float a = m * pc.color.a;
+  vec4 c = imageLoad(layerImg, px);
+  if (pc.eraser != 0) c *= (1.0 - a);
+  else c = vec4(pc.color.rgb, 1.0) * a + c * (1.0 - a);
+  imageStore(layerImg, px, c);
+  imageStore(maskImg, px, vec4(0.0));
+}

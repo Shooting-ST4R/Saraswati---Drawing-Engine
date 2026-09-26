@@ -1,0 +1,67 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// One dispatch per group of consecutive dabs over the group's bounding box.
+// Each pixel applies the group's dabs in order to the stroke mask.
+layout(push_constant) uniform DabPC {
+  ivec2 origin;
+  ivec2 size;
+  int first;
+  int count;
+  int tip;            // 0 hard round, 1 textured pen, 2 soft round
+  float hardness;     // soft round: inner radius fraction with full coverage
+  float texStrength;  // textured pen
+  float texScale;     // textured pen: grain size in document px
+} pc;
+
+uint hashu(ivec2 p) {
+  uint h = uint(p.x) * 0x8da6b343u ^ uint(p.y) * 0xd8163841u;
+  h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+  return h;
+}
+float hashf(ivec2 p) { return float(hashu(p)) * (1.0 / 4294967295.0); }
+
+float valueNoise(vec2 x) {
+  ivec2 i = ivec2(floor(x));
+  vec2 f = x - vec2(i);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = mix(hashf(i), hashf(i + ivec2(1, 0)), f.x);
+  float b = mix(hashf(i + ivec2(0, 1)), hashf(i + ivec2(1, 1)), f.x);
+  return mix(a, b, f.y);
+}
+
+// Paper grain fixed in canvas space: 3-octave value-noise fBm.
+float grain(vec2 p) {
+  vec2 q = p / max(pc.texScale, 0.25);
+  float n = 0.5 * valueNoise(q) + 0.25 * valueNoise(q * 2.03 + 17.1) + 0.125 * valueNoise(q * 4.01 + 31.7);
+  return smoothstep(0.25, 0.75, n / 0.875);
+}
+
+void main() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= pc.size.x || local.y >= pc.size.y) return;
+  ivec2 px = pc.origin + local;
+  vec2 p = vec2(px) + 0.5;
+  float m = imageLoad(maskImg, px).r;
+  float texMul = 1.0;
+  if (pc.tip == 1) texMul = mix(1.0, grain(p), pc.texStrength);
+  for (int i = 0; i < pc.count; ++i) {
+    Dab d = dabs[pc.first + i];
+    float dist = distance(p, d.pos);
+    if (dist >= d.radius + 0.5) continue;
+    float cov;
+    if (pc.tip == 2) {
+      float inner = pc.hardness * d.radius;
+      cov = 1.0 - smoothstep(inner, d.radius + 1e-3, dist);
+    } else {
+      cov = clamp(d.radius - dist + 0.5, 0.0, 1.0) * texMul;
+    }
+    float a = cov * d.alpha;
+    if (pc.tip == 2) m = m + a * (1.0 - m);   // build-up (airbrush)
+    else m = max(m, a);                       // even strokes (pen)
+  }
+  imageStore(maskImg, px, vec4(m, 0.0, 0.0, 0.0));
+}

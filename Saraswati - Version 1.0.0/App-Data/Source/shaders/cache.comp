@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "view.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Builds the window-size "below" / "above" caches: an init pass, then one dispatch per
+// visible layer blending it (with its blend mode) into the target image. Also used to
+// blend non-Normal layers above the active one into the frame's work image.
+void main() {
+  ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(belowImg);
+  if (px.x >= size.x || px.y >= size.y) return;
+  vec2 s = vec2(px) + 0.5;
+  if ((pc.flags & FLAG_INIT) != 0) {
+    imageStore(belowImg, px, insideDoc(screenToDoc(s)) ? pc.paper : vec4(0.0));
+    if ((pc.flags & FLAG_ONLY_BELOW) == 0) imageStore(aboveImg, px, vec4(0.0));
+    return;
+  }
+  vec4 c = sampleLayer(s) * pc.layerOpacity;
+  if ((pc.flags & FLAG_WORK) != 0) imageStore(workImg, px, blendLayer(imageLoad(workImg, px), c, pc.mode));
+  else if ((pc.flags & FLAG_ABOVE) != 0) imageStore(aboveImg, px, c + imageLoad(aboveImg, px) * (1.0 - c.a));
+  else imageStore(belowImg, px, blendLayer(imageLoad(belowImg, px), c, pc.mode));
+}
