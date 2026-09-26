@@ -23,7 +23,7 @@ static const ToolInfo kTools[] = {
     {ToolId::Ellipse, "Ellipse", "U"},      {ToolId::SelRect, "Rectangle select", "M"},
     {ToolId::SelEllipse, "Ellipse select", "M"}, {ToolId::Lasso, "Lasso select", "L"},
     {ToolId::Wand, "Magic wand", "W"},      {ToolId::Transform, "Move / Transform", "V, Ctrl+T"},
-    {ToolId::Hand, "Hand (pan)", "H, Space"}};
+    {ToolId::Hand, "Hand (pan)", "H, Space"}, {ToolId::Text, "Text", "T"}};
 
 // ---------------------------------------------------------------------------
 // Rasterisation (CPU): polygon coverage with 4 sub-scanlines and fractional span ends.
@@ -149,6 +149,7 @@ StrokeStyle App::currentStyle(bool eraser) {
 }
 
 void App::setTool(ToolId t) {
+  if (t != ToolId::Text && textEdit.active) commitText();
   if (t != tool) {
     cancelPreviews();
     hoverResult = FloodResult{};
@@ -516,6 +517,7 @@ void App::cancelTransform() {
 // Pointer handling (document coordinates + framebuffer-pixel screen position)
 
 bool App::toolDown(double dx, double dy, float sx, float sy) {
+  if (tool == ToolId::Text) { t0x = t1x = dx; t0y = t1y = dy; return textDown(dx, dy); }
   if (tool == ToolId::Brush && !altDown) return false;
   selOp = shiftDown ? 1 : altDown ? 2 : 0;
   t0x = t1x = dx;
@@ -708,6 +710,7 @@ void App::showHoverPreview() {
 
 void App::toolMove(double dx, double dy, float sx, float sy) {
   if (!toolDrag) return;
+  if (tool == ToolId::Text) { t1x = dx; t1y = dy; textMove(dx, dy); return; }
   if (previewing) previewDirty = true;
   t1x = dx;
   t1y = dy;
@@ -770,6 +773,7 @@ void App::toolMove(double dx, double dy, float sx, float sy) {
 }
 
 void App::toolUp(double dx, double dy) {
+  if (tool == ToolId::Text) { textUp(dx, dy); return; }
   if (!toolDrag) return;
   toolDrag = false;
   picking = false;
@@ -991,6 +995,7 @@ void App::drawToolbar() {
       {Act::ToolLine, "slash", nullptr, 1},
       {Act::ToolRect, "square", nullptr, 1},
       {Act::ToolEllipse, "circle", nullptr, 1},
+      {Act::ToolText, "type", nullptr, 1},
       {Act::ToolSelRect, "square-dashed", nullptr, 2},
       {Act::ToolSelEllipse, "circle-dashed", nullptr, 2},
       {Act::ToolLasso, "lasso", nullptr, 2},
@@ -1158,6 +1163,7 @@ void App::drawToolOverlay() {
   dl->PushClipRect(clip0, clip1, true);
   ImGui::GetBackgroundDrawList()->PushClipRect(clip0, clip1, true);
   struct PopClips { ImDrawList* a; ~PopClips() { a->PopClipRect(); ImGui::GetBackgroundDrawList()->PopClipRect(); } } popClips{dl};
+  if (tool == ToolId::Text || textEdit.active) drawTextOverlay(dl);
   auto S = [&](double dx, double dy) { float x, y; docToScreen(dx, dy, x, y); return ImVec2(x / s, y / s); };
   ImU32 white = IM_COL32(255, 255, 255, 220), black = IM_COL32(0, 0, 0, 220);
   auto poly = [&](const std::vector<double>& p, bool closed) {
@@ -1307,6 +1313,34 @@ void App::buildToolTest() {
             selX1 - selX0, selY1 - selY0);
   });
   demo.push_back([this] { deselect(); transformLayer(0); });
+  // text: a committed line, then a text frame still being edited (live preview + caret)
+  demo.push_back([this] {
+    fprintf(stderr, "texttest: %zu font families\n", fonts.families().size());
+    for (const FontFamily& f : fonts.families())
+      if (f.name.find("Serif") != std::string::npos) { textStyle.family = f.name; break; }
+    textStyle.style = "Bold";
+    textStyle.size = 72;
+    textStyle.tracking = 40;
+    textStyle.underline = true;
+    setTool(ToolId::Text);
+    textDown(1000, 470);
+    textUp(1000, 470);
+    textInsert(U"Saraswati Text");
+  });
+  demo.push_back([] {});
+  demo.push_back([this] {
+    commitText();
+    textStyle = TextStyle{};
+    textStyle.size = 30;
+    textStyle.align = 3;
+    textStyle.skew = 12;
+    textDown(980, 560);
+    t1x = 1480; t1y = 700;
+    textUp(1480, 700);
+    textInsert(U"A text frame wraps its lines at the frame width and this paragraph is justified.\nSecond paragraph");
+    fprintf(stderr, "texttest: layers %zu, active '%s'\n", R.layers.size(), R.layers[active].name.c_str());
+  });
+  demo.push_back([] {});
   // keyboard: tap switches tools, hold (used on the canvas) returns to the previous tool
   demo.push_back([this] {
     auto key = [&](SDL_Keycode k, bool down, SDL_Keymod mod = 0) {

@@ -7,7 +7,7 @@
 enum class Act : int {
   // tools (tap = switch, hold = temporary)
   ToolBrush, ToolEraser, ToolEyedropper, ToolFill, ToolGradient, ToolLine, ToolRect, ToolEllipse, ToolSelRect,
-  ToolSelEllipse, ToolLasso, ToolWand, ToolTransform, ToolHand,
+  ToolSelEllipse, ToolLasso, ToolWand, ToolTransform, ToolHand, ToolText,
   // held while dragging on the canvas
   PanHold, RotateHold,
   // commands
@@ -19,7 +19,7 @@ enum class Act : int {
   Count
 };
 constexpr int kActCount = int(Act::Count);
-constexpr bool isToolAct(Act a) { return int(a) <= int(Act::ToolHand); }
+constexpr bool isToolAct(Act a) { return int(a) <= int(Act::ToolText); }
 
 enum : int { KM_CTRL = 1, KM_SHIFT = 2, KM_ALT = 4 };
 

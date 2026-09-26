@@ -277,6 +277,7 @@ void App::drawToolGroup() {
                                  {Act::ToolLasso, "lasso"}, {Act::ToolWand, "wand-sparkles"}};
     static const Row pick[] = {{Act::ToolEyedropper, "pipette"}};
     static const Row move[] = {{Act::ToolTransform, "move"}, {Act::ToolHand, "hand"}};
+    static const Row text[] = {{Act::ToolText, "type"}};
     const Row* rows = pick;
     int n = 1;
     const char* title = "Eyedropper";
@@ -285,6 +286,7 @@ void App::drawToolGroup() {
       case ToolId::Line: case ToolId::Rect: case ToolId::Ellipse: rows = figure; n = 3; title = "Figure"; break;
       case ToolId::SelRect: case ToolId::SelEllipse: case ToolId::Lasso: case ToolId::Wand: rows = select; n = 4; title = "Selection"; break;
       case ToolId::Transform: case ToolId::Hand: rows = move; n = 2; title = "Move & view"; break;
+      case ToolId::Text: rows = text; n = 1; title = "Text"; break;
       default: break;
     }
     ImGui::SeparatorText(title);

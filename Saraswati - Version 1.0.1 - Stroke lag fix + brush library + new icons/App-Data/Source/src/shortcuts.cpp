@@ -17,6 +17,7 @@ const ActionInfo kActions[kActCount] = {
     {"tool.wand", "Magic wand", "Tools", {{SDLK_W, 0}, {}}},
     {"tool.transform", "Move / Transform", "Tools", {{SDLK_V, 0}, {SDLK_T, C}}},
     {"tool.hand", "Hand", "Tools", {{SDLK_H, 0}, {}}},
+    {"tool.text", "Text", "Tools", {{SDLK_T, 0}, {}}},
     {"view.panhold", "Pan view (hold and drag)", "View", {{SDLK_SPACE, 0}, {}}},
     {"view.rotatehold", "Rotate view (hold and drag)", "View", {{SDLK_SPACE, S}, {}}},
     {"edit.undo", "Undo", "Edit", {{SDLK_Z, C}, {}}},

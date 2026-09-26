@@ -279,6 +279,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
   ctrlDown = (k.mod & SDL_KMOD_CTRL) != 0;
   altDown = (k.mod & SDL_KMOD_ALT) != 0;
   if (down && captureAct >= 0) { captureKey(k); return; }
+  if (down && textEdit.active && !ImGui::GetIO().WantTextInput && textKey(k)) return;
   if (!down) {  // releases always count, even while a panel has the keyboard
     if (panKeyHeld && k.key == panKeyHeld) { panKeyHeld = 0; spaceDown = false; }
     if (rotateKeyHeld && k.key == rotateKeyHeld) { rotateKeyHeld = 0; rotateDown = false; }
@@ -306,6 +307,9 @@ void App::handleEvent(const SDL_Event& e) {
     case SDL_EVENT_QUIT:
       if (opt.exitAfter) running = false;
       else requestAction(PA_Quit);
+      break;
+    case SDL_EVENT_TEXT_INPUT:
+      if (textEdit.active && !ImGui::GetIO().WantTextInput && !ctrlDown) textInsert(utf8ToU32(e.text.text));
       break;
     case SDL_EVENT_CLIPBOARD_UPDATE:
       if (!e.clipboard.owner) clipExternal = true;  // another app copied something after us
@@ -529,6 +533,7 @@ void App::drawBrushLibraryButtons() {
 void App::drawBrushPanel() {
   if (!ImGui::Begin("Tool Settings", &showBrush)) { ImGui::End(); return; }
   drawToolOptions();
+  if (tool == ToolId::Text) { drawTextSettings(); ImGui::End(); return; }
   bool usesBrush = tool == ToolId::Brush || tool == ToolId::Line || ((tool == ToolId::Rect || tool == ToolId::Ellipse) && !shapeFilled);
   if (!usesBrush) {
     if (tool == ToolId::Fill || tool == ToolId::Gradient || tool == ToolId::Rect || tool == ToolId::Ellipse) {
@@ -1255,11 +1260,11 @@ void App::updateTitle() {
 
 void App::drawStatusBar() {
   static const char* kToolNames[] = {"Brush", "Eyedropper", "Fill", "Gradient", "Line", "Rectangle", "Ellipse",
-                                     "Rectangle select", "Ellipse select", "Lasso", "Magic wand", "Transform", "Hand"};
+                                     "Rectangle select", "Ellipse select", "Lasso", "Magic wand", "Transform", "Hand", "Text"};
   ImGuiWindowFlags f = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
   if (ImGui::BeginViewportSideBar("##status", ImGui::GetMainViewport(), ImGuiDir_Down, ImGui::GetFrameHeight(), f)) {
     if (ImGui::BeginMenuBar()) {
-      const char* toolName = kToolNames[std::clamp(int(tool), 0, 12)];
+      const char* toolName = kToolNames[std::clamp(int(tool), 0, 13)];
       if (tool == ToolId::Brush) ImGui::Text("%s%s", brushes[tipIndex].name.c_str(), eraserToggle ? " (eraser)" : "");
       else ImGui::TextUnformatted(toolName);
       ImGui::Separator();
@@ -1703,7 +1708,7 @@ void App::buildBrushTest() {
 void App::tickDemo() {
   if (demoDone || demo.empty()) return;
   // wait for the GPU to finish the previous step (the last step leaves a stroke open on purpose)
-  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn) || flooding || clipping || hoverDirty) && !(demoStep == demo.size())) return;
+  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn && !textPreviewOn) || flooding || clipping || hoverDirty || !fonts.ready() || textEdit.dirty) && !(demoStep == demo.size())) return;
   if (demoStep < demo.size()) {
     demo[demoStep++]();
     framesToRender = std::max(framesToRender, 3);
@@ -2092,12 +2097,14 @@ int App::run() {
   bool testRun = opt.demo || opt.benchmark || !opt.screenshot.empty() || !opt.save.empty();
   if (testRun) {
     io.IniFilename = nullptr;  // tests always use the default layout
+    fonts.startScan("");
   } else {
     std::error_code ec;
     fs::create_directories(fs::path(userData) / "settings", ec);
     iniPath = (fs::path(userData) / "settings" / "layout.ini").string();
     io.IniFilename = iniPath.c_str();
     settingsPath = (fs::path(userData) / "settings" / "settings.txt").string();
+    fonts.startScan((fs::path(userData) / "settings" / "fontcache.txt").string());
     loadSettings();
     applyPrefs();
     if (prefs.perfAtStart) showPerf = true;
@@ -2133,7 +2140,7 @@ int App::run() {
 
   bool wantShot = !opt.screenshot.empty();
   while (running) {
-    bool animating = bench.running || saving || flooding || hoverDirty || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
+    bool animating = bench.running || saving || flooding || hoverDirty || textEdit.active || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
                      (wantShot && !screenshotTaken);
     SDL_Event e;
     if (!animating) {
@@ -2150,6 +2157,12 @@ int App::run() {
     processDialogResults();
     pollFlood();
     pollClipboard();
+    if (textEdit.active) {
+      if (textEdit.dirty || !(textEdit.shownStyle == textStyle) || textEdit.shownColor[0] != color[0] ||
+          textEdit.shownColor[1] != color[1] || textEdit.shownColor[2] != color[2])
+        updateTextPreview();
+      if (!ImGui::GetIO().WantTextInput && !SDL_TextInputActive(window)) SDL_StartTextInput(window);
+    }
     if (previewing && previewDirty) updateShapePreview();
     if (hoverDirty && !flooding && hoverX >= 0) {
       hoverDirty = false;

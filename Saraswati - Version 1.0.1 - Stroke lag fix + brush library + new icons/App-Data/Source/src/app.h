@@ -4,6 +4,8 @@
 #include <imgui.h>
 #include "renderer.h"
 #include "shortcuts.h"
+#include "text.h"
+#include <map>
 #include <array>
 #include <cstring>
 #include <atomic>
@@ -37,7 +39,7 @@ struct Options {
 };
 
 enum class ToolId : int {
-  Brush, Eyedropper, Fill, Gradient, Line, Rect, Ellipse, SelRect, SelEllipse, Lasso, Wand, Transform, Hand, Count
+  Brush, Eyedropper, Fill, Gradient, Line, Rect, Ellipse, SelRect, SelEllipse, Lasso, Wand, Transform, Hand, Text, Count
 };
 
 void applyUiScale(float scale);  // main.cpp
@@ -349,6 +351,45 @@ class App {
   int selGrowShrink = 1, selGrowPx = 5;
   bool growPopup = false;
   void drawSelectionBar();
+  // Text tool (text_tool.cpp)
+  FontLibrary fonts;
+  TextStyle textStyle;
+  struct TextEditState {
+    bool active = false, dirty = false, erasedOld = false;
+    uint32_t layerId = 0;  // editing text made earlier on this layer (0 = new text)
+    TextBox box;
+    TextLayout lay;
+    int caret = 0, anchor = 0;
+    uint64_t blinkNs = 0;
+    std::vector<std::pair<std::u32string, int>> history;
+    TextStyle shownStyle;
+    float shownColor[3] = {-1, -1, -1};
+  } textEdit;
+  struct TextObject {
+    TextBox box;
+    TextStyle style;
+    float color[3] = {0, 0, 0};
+    uint64_t docSerial = 0;
+  };
+  std::map<uint32_t, TextObject> textObjects;  // text layers stay editable while the document is open
+  bool textPreviewOn = false, textCreating = false, textSelecting = false;
+  char fontSearch[64] = {};
+  std::shared_ptr<LoadedFont> textFontCache;
+  std::string textFontKey;
+  std::shared_ptr<LoadedFont> textFont();
+  int textHit(double x, double y) const;
+  void textRelayout();
+  void updateTextPreview();
+  void beginTextInput();
+  void commitText();
+  void cancelText();
+  bool textDown(double dx, double dy);
+  void textMove(double dx, double dy);
+  void textUp(double dx, double dy);
+  void textInsert(const std::u32string& s);
+  bool textKey(const SDL_KeyboardEvent& k);
+  void drawTextOverlay(ImDrawList* dl);
+  void drawTextSettings();
   void drawUnsavedDialog();
   // brush size drag (Ctrl+Alt+drag)
   bool sizeDrag = false;

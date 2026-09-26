@@ -131,6 +131,11 @@ void applyUiScale(float scale) {
   st.FontScaleDpi = scale;
 }
 
+const unsigned char* uiFontData(size_t* size) {
+  *size = sizeof kFontUi;
+  return kFontUi;
+}
+
 static void loadUiFont() {
   ImFontConfig fc;
   fc.FontDataOwnedByAtlas = false;

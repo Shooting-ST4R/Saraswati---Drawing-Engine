@@ -5,7 +5,7 @@
 
 static const ToolId kToolOfAct[] = {ToolId::Brush,  ToolId::Brush,      ToolId::Eyedropper, ToolId::Fill,    ToolId::Gradient,
                                     ToolId::Line,   ToolId::Rect,       ToolId::Ellipse,    ToolId::SelRect, ToolId::SelEllipse,
-                                    ToolId::Lasso,  ToolId::Wand,       ToolId::Transform,  ToolId::Hand};
+                                    ToolId::Lasso,  ToolId::Wand,       ToolId::Transform,  ToolId::Hand,    ToolId::Text};
 
 void App::resetShortcuts() {
   for (int a = 0; a < kActCount; ++a)
