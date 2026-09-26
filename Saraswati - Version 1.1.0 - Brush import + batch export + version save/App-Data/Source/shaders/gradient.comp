@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Linear gradient written into the stroke mask (1 at p0 -> 0 at p1); the normal stroke
+// commit then blends the colour into the layer (with selection clipping and undo).
+layout(push_constant) uniform GradPC {
+  ivec2 origin;
+  ivec2 size;
+  vec2 p0;
+  vec2 p1;
+  int clearMask;  // 1: just clear the mask over the rect (live previews are redrawn from scratch)
+} pc;
+
+void main() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= pc.size.x || local.y >= pc.size.y) return;
+  ivec2 px = pc.origin + local;
+  if (pc.clearMask != 0) { imageStore(maskImg, px, vec4(0.0)); return; }
+  vec2 d = pc.p1 - pc.p0;
+  float t = dot(vec2(px) + 0.5 - pc.p0, d) / max(dot(d, d), 1e-6);
+  imageStore(maskImg, px, vec4(1.0 - clamp(t, 0.0, 1.0)));
+}

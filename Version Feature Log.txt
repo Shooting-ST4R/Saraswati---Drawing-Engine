@@ -28,8 +28,8 @@ Version 1.0.0  (first beta)
 * Windows release folder with a ready-to-run exe
 
 
-Version 1.0.1  (in progress)
-----------------------------
+Version 1.0.1  (development folder - its work continues in 1.1.0)
+-----------------------------------------------------------------
 Fixed:
 * Short lag spike (~0.5 s) after every stroke and every undo: undo data is now copied bit by bit
   while you draw, into memory that is reserved in advance, and layer thumbnails no longer make
@@ -51,3 +51,40 @@ Added:
 
 Changed:
 * Version folders no longer use commas in their names (they broke the Linux build)
+
+
+Version 1.1.0  (in progress - everything from 1.0.1 plus the following)
+-----------------------------------------------------------------------
+Added:
+* Keyboard shortcut settings (every command rebindable) with spring-loaded tools: hold a tool
+  key to use it temporarily, release to return to the previous tool; Space always pans
+* Text tool with all installed system fonts and InDesign-style formatting (size, leading,
+  kerning, tracking, scaling, baseline shift, skew, caps, underline, strike, alignment, indents,
+  paragraph spacing); text stays editable after saving
+* Speech bubbles in the text tool (manga): live settings (shape, distance, fill, border, opacity),
+  tails drawn straight or by hand; the bubble is a sublayer of its text layer
+* Manga tone layer effect (like Clip Studio Paint's Layer Property > Tone): 30 dot shapes incl.
+  round, oval, square, diamond, line, cross, noise; frequency, angle, density, posterize
+* Layer colour effect (non-destructive, like CSP's "Layer colour")
+* Folders with their own blend mode and opacity (or pass-through); clipping ("clip to layer
+  below") for layers and folders
+* Paper layer: one colour, always at the bottom; new files start with Paper + empty Layer 1
+* Navigator and Tool Group panels, Layer Properties panel, CSP-style selection action bar
+* Brush import: Photoshop .abr and Clip Studio Paint .sut, also .zip brush packs; sampled tips,
+  textures, dual tips and dynamics are converted; a report lists anything approximated
+* Drag and drop: brushes and brush packs are imported; images (also from a web browser) become a
+  new layer where they are dropped (canvas or Layers panel)
+* Version Save: files are named "YYYY MM DD - name - Version N.psd" (date = when the picture was
+  started); one click writes the next version next to the current one
+* Batch Export: one click writes a user-configurable, saved list of JPEG / PNG / WebP files
+  (size %, quality, lossless) next to the .psd, e.g. "... - Version 2 - S50% Q95.jpg"
+* WebP export; automatic versioned backups every 5 minutes (no interruption) with crash restore
+* FPS limit (120 by default, adjustable) to save GPU power; view-only canvas flip
+* Chinese / Japanese / Korean characters shown in the interface (brush and layer names)
+
+Fixed / hardened:
+* Saving: every save is written to a temporary file, read back and compared layer by layer
+  before it replaces the old file - a failed save never damages the existing file
+* Damaged or hostile PSD files can no longer hang or crash the app (found by fuzz testing);
+  damaged backups restore everything up to the damage
+* Restoring a backup now asks to save the open picture first

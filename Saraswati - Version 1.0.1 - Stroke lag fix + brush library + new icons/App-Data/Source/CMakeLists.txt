@@ -25,7 +25,7 @@ set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(${TP}/SDL EXCLUDE_FROM_ALL)
 
-# ---- libwebp (decoder only, for WebP import) ----
+# ---- libwebp (WebP import and export) ----
 foreach(opt WEBP_BUILD_ANIM_UTILS WEBP_BUILD_CWEBP WEBP_BUILD_DWEBP WEBP_BUILD_GIF2WEBP WEBP_BUILD_IMG2WEBP
             WEBP_BUILD_VWEBP WEBP_BUILD_WEBPINFO WEBP_BUILD_LIBWEBPMUX WEBP_BUILD_WEBPMUX WEBP_BUILD_EXTRAS)
   set(${opt} OFF CACHE BOOL "" FORCE)
@@ -126,6 +126,7 @@ add_executable(Saraswati WIN32
   src/tips.cpp
   src/brush_import.cpp
   src/drop_import.cpp
+  src/batch_export.cpp
   src/brush.cpp
   src/vk_util.cpp
   src/png_write.cpp
@@ -151,7 +152,7 @@ if(WIN32)
   target_compile_definitions(Saraswati PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
   target_link_libraries(Saraswati PRIVATE urlmon)  # images dropped from a web browser
 endif()
-target_link_libraries(Saraswati PRIVATE SDL3::SDL3-static webpdecoder ${CMAKE_DL_LIBS})
+target_link_libraries(Saraswati PRIVATE SDL3::SDL3-static webp ${CMAKE_DL_LIBS})
 if(MSVC)
   target_compile_options(Saraswati PRIVATE /W3 /utf-8)
 else()
