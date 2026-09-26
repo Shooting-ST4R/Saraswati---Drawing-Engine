@@ -68,6 +68,7 @@ struct StrokeStyle {
   float color[3] = {0, 0, 0};
   float opacity = 1.0f;
   bool eraser = false;
+  bool overlay = false;  // preview highlight only (magic wand): never clipped by selection / lock
 };
 
 struct RendererOptions {
@@ -174,6 +175,12 @@ class Renderer {
   bool paintCoverage(int layer, int x, int y, uint32_t w, uint32_t h, const uint8_t* cov, const StrokeStyle& st, std::string& err);
   // Linear gradient (colour at p0 -> transparent at p1) over the given rect, next frame.
   bool paintGradient(int layer, float x0, float y0, float x1, float y1, int rx0, int ry0, int rx1, int ry1, const StrokeStyle& st);
+  // ---- live previews: the tool redraws the stroke mask while dragging / hovering; it is shown
+  // exactly like the final result and committed by endStroke() or discarded by abortStroke() ----
+  void previewClear();  // drop queued dabs and clear the preview (next frame, on the GPU)
+  bool previewCoverage(int x, int y, uint32_t w, uint32_t h, const uint8_t* cov, std::string& err);
+  void previewGradient(float x0, float y0, float x1, float y1, int rx0, int ry0, int rx1, int ry1);
+  void abortStroke();
   bool uploadSelection(const uint8_t* docSizeSel, int x, int y, uint32_t w, uint32_t h, std::string& err);
   void setSelectionActive(bool on) { if (selectionActive != on) { selectionActive = on; } }
   bool selectionActive = false;
@@ -233,7 +240,8 @@ class Renderer {
   bool maskR16 = true;
   VkDeviceSize layerBytesTotal() const;
   VkDeviceSize memoryBudgetBytes = 0;   // device-local heap (or budget)
-  VkDeviceSize undoBudgetBytes = 0;
+  VkDeviceSize undoBudgetBytes = 0, undoBudgetAuto = 0;
+  int maxUndoSteps = 50;
   std::string lastError;               // e.g. out of memory during a stroke commit
 
   VkInstance instance = VK_NULL_HANDLE;
@@ -315,6 +323,11 @@ class Renderer {
   void prewarmChunks();
   // the stroke's undo entry, filled tile by tile while the stroke is drawn (spreads the copy cost)
   void copyPendingUndo(VkCommandBuffer cmd, Layer& layer);
+  void recordPreviewOps(VkCommandBuffer cmd);
+  void clearMaskRect(VkCommandBuffer cmd, int x0, int y0, int x1, int y1);
+  bool maskClearPending = false, gradPending = false;
+  float gradP[4] = {};
+  int gradR[4] = {};
   void releaseStrokeUndo();
   int findLayer(uint32_t id) const;
   void pushView(VkCommandBuffer cmd, const View& v, VkExtent2D ext, int flags, float opacity, BlendMode mode);

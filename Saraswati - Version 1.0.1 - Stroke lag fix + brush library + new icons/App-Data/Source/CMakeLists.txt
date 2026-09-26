@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 # Static CRT on MSVC so Saraswati.exe is a single self-contained file.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-project(Saraswati VERSION 1.0.0 LANGUAGES C CXX)
+project(Saraswati VERSION 1.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -92,7 +92,7 @@ add_custom_command(
   COMMAND ${CMAKE_COMMAND} -DIN=${TP}/imgui/misc/fonts/Roboto-Medium.ttf -DOUT=${SHADER_OUT}/font_ui.h -DNAME=kFontUi -P ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
   DEPENDS ${TP}/imgui/misc/fonts/Roboto-Medium.ttf ${CMAKE_CURRENT_SOURCE_DIR}/embed.cmake
   COMMENT "embedding UI font")
-file(GLOB ICON_SVGS ${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg)
+file(GLOB ICON_SVGS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg)
 add_custom_command(
   OUTPUT ${SHADER_OUT}/icons_lucide.h
   COMMAND ${CMAKE_COMMAND} -DDIR=${CMAKE_CURRENT_SOURCE_DIR}/icons -DOUT=${SHADER_OUT}/icons_lucide.h -P ${CMAKE_CURRENT_SOURCE_DIR}/embed_icons.cmake

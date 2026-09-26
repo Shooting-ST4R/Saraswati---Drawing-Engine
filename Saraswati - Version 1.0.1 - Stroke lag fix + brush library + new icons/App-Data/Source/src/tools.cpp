@@ -149,6 +149,11 @@ StrokeStyle App::currentStyle(bool eraser) {
 }
 
 void App::setTool(ToolId t) {
+  if (t != tool) {
+    cancelPreviews();
+    hoverResult = FloodResult{};
+    hoverX = hoverY = -1;
+  }
   if (xf.active && t != ToolId::Transform) applyTransform();
   tool = t;
   if (t == ToolId::Transform && !xf.active) startTransform();
@@ -257,7 +262,7 @@ void App::fillSelection(bool erase) {
 // Flood fill on the active layer or on all visible layers (premultiplied RGBA compared per
 // channel). Only the painted bounds are read back; everything outside them has one known value
 // (transparent, or the paper colour when sampling all layers).
-void App::startFlood(double dx, double dy, bool isFill) {
+void App::startFlood(double dx, double dy, bool isFill, bool hover) {
   if (flooding || !R.hasDocument()) return;
   int W = int(R.docW), H = int(R.docH);
   int sx = int(std::floor(dx)), sy = int(std::floor(dy));
@@ -273,11 +278,22 @@ void App::startFlood(double dx, double dy, bool isFill) {
   uint8_t outside[4] = {0, 0, 0, 0};
   if (all && R.whitePaper) outside[0] = outside[1] = outside[2] = outside[3] = 255;
   // GPU copies the painted area into host memory; the worker waits for it (the UI never does)
+  // the read-back is cached while the picture does not change (hovering re-floods instantly)
   std::shared_ptr<AsyncRead> rd;
   std::string err;
+  char key[160];
+  snprintf(key, sizeof key, "%llu %llu %u %d %d %d %d %d", (unsigned long long)R.revision, (unsigned long long)R.docSerial,
+           R.layers[active].id, all ? 1 : 0, bx0, by0, bx1, by1);
   if (bx0 < bx1) {
-    rd = R.readRegionAsync(all, active, bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), err);
-    if (!rd) { error(err.empty() ? "Read-back failed" : err); return; }
+    if (floodCache && floodCacheKey == key) {
+      rd = floodCache;
+    } else {
+      R.finishAsyncRead(floodCache);
+      rd = R.readRegionAsync(all, active, bx0, by0, uint32_t(bx1 - bx0), uint32_t(by1 - by0), err);
+      if (!rd) { error(err.empty() ? "Read-back failed" : err); return; }
+      floodCache = rd;
+      floodCacheKey = key;
+    }
   }
   float tol = isFill ? fillTol : wandTol;
   bool contiguous = isFill ? fillContiguous : wandContiguous;
@@ -292,6 +308,7 @@ void App::startFlood(double dx, double dy, bool isFill) {
   floodJob = std::async(std::launch::async, [=]() {
     FloodResult res;
     res.isFill = isFill;
+    res.hover = hover;
     res.op = op;
     res.layerId = layerId;
     if (rd && !rd->wait()) return res;
@@ -371,7 +388,15 @@ void App::pollFlood() {
   if (!flooding || floodJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
   flooding = false;
   FloodResult r = floodJob.get();
-  R.finishAsyncRead(floodRead);
+  floodRead.reset();  // the read-back stays in floodCache for the next hover / click
+  if (r.hover) {
+    if (R.docSerial != floodDoc || R.revision != floodRevision || !(tool == ToolId::Fill || tool == ToolId::Wand)) return;
+    hoverResult = r;
+    hoverRevision = floodRevision;
+    hoverDoc = floodDoc;
+    showHoverPreview();
+    return;
+  }
   if (!r.ok || !r.w) return;
   // the canvas changed (or another document was opened) while computing: the result is stale
   if (R.docSerial != floodDoc || R.revision != floodRevision) {
@@ -510,10 +535,30 @@ bool App::toolDown(double dx, double dy, float sx, float sy) {
       toolDrag = false;
       return true;
     case ToolId::Fill:
-    case ToolId::Wand:
+    case ToolId::Wand: {
       toolDrag = false;
+      // apply exactly what the hover preview shows (if it is current and under the cursor)
+      int px = int(std::floor(dx)), py = int(std::floor(dy));
+      bool inside = hoverResult.ok && px >= hoverResult.x && py >= hoverResult.y && px < hoverResult.x + int(hoverResult.w) &&
+                    py < hoverResult.y + int(hoverResult.h) &&
+                    hoverResult.cov[size_t(py - hoverResult.y) * hoverResult.w + size_t(px - hoverResult.x)] > 0;
+      if (inside && hoverPreviewOn && hoverRevision == R.revision && hoverDoc == R.docSerial) {
+        if (tool == ToolId::Fill) {
+          noteColorUsed();
+          R.endStroke();  // commits the previewed fill (with undo)
+          hoverPreviewOn = false;
+        } else {
+          FloodResult r = hoverResult;
+          cancelPreviews();
+          combineSelection(r.x, r.y, r.w, r.h, r.cov, selOp);
+        }
+        hoverResult = FloodResult{};
+        return true;
+      }
+      cancelPreviews();
       startFlood(dx, dy, tool == ToolId::Fill);
       return true;
+    }
     case ToolId::Lasso:
       lasso = {dx, dy};
       return true;
@@ -551,12 +596,119 @@ bool App::toolDown(double dx, double dy, float sx, float sy) {
       return true;
     }
     default:
+      if (isShapePreviewTool()) startShapePreview();
       return true;  // drag tools: gradient, line, shapes, rect/ellipse select
   }
 }
 
+// ---- live previews ----
+
+void App::startShapePreview() {
+  cancelPreviews();
+  StrokeStyle st = currentStyle(eraserToggle || brushes[tipIndex].eraser);
+  if (tool == ToolId::Gradient || (shapeFilled && tool != ToolId::Line)) st.buildUp = false;
+  R.beginStroke(active, st);
+  previewing = true;
+  previewDirty = true;
+  previewSeed = strokeSeed++;
+}
+
+// Redraws the preview from scratch into the stroke mask (GPU); shown exactly like the result.
+void App::updateShapePreview() {
+  if (!previewing) return;
+  previewDirty = false;
+  int W = int(R.docW), H = int(R.docH);
+  std::string err;
+  switch (tool) {
+    case ToolId::Gradient: {
+      int x0 = 0, y0 = 0, x1 = W, y1 = H;
+      if (selActive) { x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1; }
+      if (std::hypot(t1x - t0x, t1y - t0y) >= 1) R.previewGradient(float(t0x), float(t0y), float(t1x), float(t1y), x0, y0, x1, y1);
+      else R.previewClear();
+      break;
+    }
+    case ToolId::Line:
+    case ToolId::Rect:
+    case ToolId::Ellipse: {
+      std::vector<double> poly;
+      if (tool == ToolId::Line) poly = {t0x, t0y, t1x, t1y};
+      else if (std::abs(t1x - t0x) >= 1 && std::abs(t1y - t0y) >= 1)
+        poly = tool == ToolId::Rect ? rectPoly(t0x, t0y, t1x, t1y) : ellipsePoly(t0x, t0y, t1x, t1y);
+      if (poly.size() < 4) { R.previewClear(); break; }
+      if (tool != ToolId::Line && shapeFilled) {
+        int ox, oy;
+        uint32_t ow, oh;
+        std::vector<uint8_t> cov;
+        rasterPolygon(poly, W, H, ox, oy, ow, oh, cov);
+        if (ow) R.previewCoverage(ox, oy, ow, oh, cov.data(), err);
+        break;
+      }
+      R.previewClear();
+      size_t n = poly.size() / 2;
+      BrushEngine e;
+      e.begin({poly[0], poly[1], 1.0f}, brushes[tipIndex], previewSeed, false);
+      size_t steps = tool == ToolId::Line ? 1 : n;
+      for (size_t i = 1; i <= steps; ++i) e.add({poly[2 * (i % n)], poly[2 * (i % n) + 1], 1.0f});
+      e.end();
+      R.queueDabs(e.out);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void App::cancelPreviews() {
+  if (previewing || hoverPreviewOn) R.abortStroke();
+  previewing = false;
+  hoverPreviewOn = false;
+}
+
+// Fill / magic wand: flood from the hovered pixel (worker thread, cached read-back) and preview it.
+void App::updateHover(double dx, double dy) {
+  if (!(tool == ToolId::Fill || tool == ToolId::Wand) || !R.hasDocument()) return;
+  int px = int(std::floor(dx)), py = int(std::floor(dy));
+  if (px < 0 || py < 0 || px >= int(R.docW) || py >= int(R.docH)) return;
+  if (px == hoverX && py == hoverY) return;
+  hoverX = px;
+  hoverY = py;
+  // still inside the area already previewed (and nothing changed)? then it is the same result
+  const FloodResult& r = hoverResult;
+  if (r.ok && hoverRevision == R.revision && hoverDoc == R.docSerial && r.isFill == (tool == ToolId::Fill) && px >= r.x &&
+      py >= r.y && px < r.x + int(r.w) && py < r.y + int(r.h) && r.cov[size_t(py - r.y) * r.w + size_t(px - r.x)] > 0)
+    return;
+  hoverDirty = true;
+}
+
+void App::showHoverPreview() {
+  const FloodResult& r = hoverResult;
+  if (R.stroking() && !hoverPreviewOn) return;  // a real stroke is in progress
+  if (hoverPreviewOn) R.abortStroke();
+  hoverPreviewOn = false;
+  if (!r.ok || !r.w) return;
+  int li = R.indexOf(r.layerId);
+  if (li < 0) return;
+  StrokeStyle st;
+  if (r.isFill) {
+    const BrushSettings& b = brushes[tipIndex];
+    st.color[0] = color[0]; st.color[1] = color[1]; st.color[2] = color[2];
+    st.opacity = b.opacity;
+    st.eraser = eraserToggle;
+  } else {  // wand: translucent highlight of the area that would be selected
+    st.color[0] = 0.35f; st.color[1] = 0.62f; st.color[2] = 1.0f;
+    st.opacity = 0.45f;
+    st.overlay = true;
+  }
+  hoverColor[0] = st.color[0]; hoverColor[1] = st.color[1]; hoverColor[2] = st.color[2]; hoverColor[3] = st.opacity;
+  R.beginStroke(li, st);
+  std::string err;
+  R.previewCoverage(r.x, r.y, r.w, r.h, r.cov.data(), err);
+  hoverPreviewOn = true;
+}
+
 void App::toolMove(double dx, double dy, float sx, float sy) {
   if (!toolDrag) return;
+  if (previewing) previewDirty = true;
   t1x = dx;
   t1y = dy;
   if (shiftDown && (tool == ToolId::Rect || tool == ToolId::Ellipse || tool == ToolId::SelRect || tool == ToolId::SelEllipse) &&
@@ -624,34 +776,22 @@ void App::toolUp(double dx, double dy) {
   std::string err;
   int W = int(R.docW), H = int(R.docH);
   switch (tool) {
-    case ToolId::Gradient: {
-      if (std::hypot(t1x - t0x, t1y - t0y) < 1) break;
-      int x0 = 0, y0 = 0, x1 = W, y1 = H;
-      if (selActive) { x0 = selX0; y0 = selY0; x1 = selX1; y1 = selY1; }
-      R.paintGradient(active, float(t0x), float(t0y), float(t1x), float(t1y), x0, y0, x1, y1, currentStyle(eraserToggle));
-      break;
-    }
+    case ToolId::Gradient:
     case ToolId::Line:
-      strokeBegin({t0x, t0y, 1.0f}, false, false);
-      strokeAdd({t1x, t1y, 1.0f});
-      strokeEnd();
-      break;
     case ToolId::Rect:
     case ToolId::Ellipse: {
-      if (std::abs(t1x - t0x) < 1 || std::abs(t1y - t0y) < 1) break;
-      std::vector<double> poly = tool == ToolId::Rect ? rectPoly(t0x, t0y, t1x, t1y) : ellipsePoly(t0x, t0y, t1x, t1y);
-      if (shapeFilled) {
-        int ox, oy;
-        uint32_t ow, oh;
-        std::vector<uint8_t> cov;
-        rasterPolygon(poly, W, H, ox, oy, ow, oh, cov);
-        if (ow && !R.paintCoverage(active, ox, oy, ow, oh, cov.data(), currentStyle(eraserToggle), err) && !err.empty()) error(err);
-      } else {
-        size_t n = poly.size() / 2;
-        strokeBegin({poly[0], poly[1], 1.0f}, false, false);
-        for (size_t i = 1; i <= n; ++i) strokeAdd({poly[2 * (i % n)], poly[2 * (i % n) + 1], 1.0f});
-        strokeEnd();
+      // the live preview already shows the exact result: just commit it
+      if (!previewing) startShapePreview();
+      updateShapePreview();
+      bool empty = tool == ToolId::Gradient ? std::hypot(t1x - t0x, t1y - t0y) < 1
+                 : tool == ToolId::Line    ? false
+                                           : (std::abs(t1x - t0x) < 1 || std::abs(t1y - t0y) < 1);
+      if (empty) R.abortStroke();
+      else {
+        if (!eraserToggle) noteColorUsed();
+        R.endStroke();
       }
+      previewing = false;
       break;
     }
     case ToolId::SelRect:
@@ -692,6 +832,11 @@ void App::toolKey(SDL_Keycode key, bool ctrl, bool shift, bool alt) {
   if (xf.active) {
     if (key == SDLK_RETURN || key == SDLK_KP_ENTER) { applyTransform(); return; }
     if (key == SDLK_ESCAPE) { cancelTransform(); return; }
+  }
+  if (key == SDLK_ESCAPE && (previewing || hoverPreviewOn)) {
+    cancelPreviews();
+    toolDrag = false;
+    return;
   }
   if (ctrl) {
     if (key == SDLK_A) selectAll();
@@ -794,7 +939,7 @@ static void drawToolGlyph(ImDrawList* dl, ToolId t, ImVec2 c, float s, ImU32 col
 // ---- icons: Lucide (ISC licence), rasterised once into a texture atlas ----
 
 void App::loadIcons() {
-  const int S = 48;  // raster size (icons are drawn at ~20-28 px, so they stay crisp on high-DPI)
+  const int S = 64;  // raster size (icons are drawn at ~20-28 px, so they stay crisp on high-DPI)
   int n = int(sizeof kLucideIcons / sizeof kLucideIcons[0]);
   int cols = 8, rows = (n + cols - 1) / cols;
   std::vector<uint8_t> atlas(size_t(cols * S) * rows * S * 4, 0);
@@ -1028,6 +1173,11 @@ void App::drawToolOptions() {
 void App::drawToolOverlay() {
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   float s = ImGui::GetIO().DisplayFramebufferScale.x;
+  // everything drawn here belongs to the canvas: never over the panels
+  ImVec2 clip0(canvasX / s, canvasY / s), clip1((canvasX + canvasW) / s, (canvasY + canvasH) / s);
+  dl->PushClipRect(clip0, clip1, true);
+  ImGui::GetBackgroundDrawList()->PushClipRect(clip0, clip1, true);
+  struct PopClips { ImDrawList* a; ~PopClips() { a->PopClipRect(); ImGui::GetBackgroundDrawList()->PopClipRect(); } } popClips{dl};
   auto S = [&](double dx, double dy) { float x, y; docToScreen(dx, dy, x, y); return ImVec2(x / s, y / s); };
   ImU32 white = IM_COL32(255, 255, 255, 220), black = IM_COL32(0, 0, 0, 220);
   auto poly = [&](const std::vector<double>& p, bool closed) {
@@ -1158,4 +1308,7 @@ void App::buildToolTest() {
   // lasso selection left active: marching ants
   demo.push_back(drag(ToolId::Lasso, 1350, 700, 0, 0));
   demo.push_back([this] { tool = ToolId::Brush; });
+  // magic-wand hover preview over the red rectangle (tinted, not yet selected)
+  demo.push_back([this] { setTool(ToolId::Wand); wandSampleAll = true; updateHover(230, 300); });
+  demo.push_back([] {});
 }

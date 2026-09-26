@@ -31,11 +31,14 @@ struct Options {
   std::vector<std::string> imports;  // import as layers at startup (test helper)
   std::string save;             // save as PSD when the demo / startup is done (test helper)
   int windowW = 1600, windowH = 1000;
+  bool windowSet = false;
 };
 
 enum class ToolId : int {
   Brush, Eyedropper, Fill, Gradient, Line, Rect, Ellipse, SelRect, SelEllipse, Lasso, Wand, Transform, Hand, Count
 };
+
+void applyUiScale(float scale);  // main.cpp
 
 class App {
  public:
@@ -135,6 +138,7 @@ class App {
   double lastLatencyMs = 0, avgLatencyMs = 0;
   double cpuFrameMs = 0;
   uint64_t lastFrameNs = 0;
+  uint64_t lastActivityNs = 0;
 
   // ---- tools (tools.cpp) ----
   ToolId tool = ToolId::Brush;
@@ -162,7 +166,7 @@ class App {
   // Fill / magic wand: the pixels are read back on the main thread (only the painted bounds),
   // the flood runs on a worker thread, and the result is applied when it is ready.
   struct FloodResult {
-    bool ok = false, isFill = false;
+    bool ok = false, isFill = false, hover = false;
     int op = 0;
     uint32_t layerId = 0;
     int x = 0, y = 0;
@@ -173,7 +177,25 @@ class App {
   std::shared_ptr<AsyncRead> floodRead;
   uint64_t floodRevision = 0, floodDoc = 0;
   bool flooding = false;
-  void startFlood(double dx, double dy, bool isFill);
+  void startFlood(double dx, double dy, bool isFill, bool hover = false);
+  // live previews: line / shapes / gradient while dragging; fill / wand while hovering
+  bool previewing = false, previewDirty = false;
+  uint32_t previewSeed = 1;
+  bool isShapePreviewTool() const {
+    return tool == ToolId::Line || tool == ToolId::Rect || tool == ToolId::Ellipse || tool == ToolId::Gradient;
+  }
+  void startShapePreview();
+  void updateShapePreview();
+  void cancelPreviews();
+  int hoverX = -1, hoverY = -1;
+  bool hoverDirty = false, hoverPreviewOn = false;
+  FloodResult hoverResult;
+  uint64_t hoverRevision = 0, hoverDoc = 0;
+  float hoverColor[4] = {-1, 0, 0, 0};
+  void updateHover(double dx, double dy);
+  void showHoverPreview();
+  std::shared_ptr<AsyncRead> floodCache;
+  std::string floodCacheKey;
   void pollFlood();
   bool fillSampleAll = false, wandSampleAll = false;
   void snapshotSelection(int x0, int y0, int x1, int y1);  // selection undo step for this area
@@ -209,6 +231,29 @@ class App {
   float pickPrev[3] = {};
 
   bool hideUI = false;          // Tab: canvas only
+  // ---- preferences (Edit > Preferences, Ctrl+K) ----
+  struct Prefs {
+    bool startMaximized = true, perfAtStart = true, confirmUnsaved = true;
+    int uiScalePct = 0;            // 0 = follow Windows display scaling
+    bool smoothStrokes = true, mousePixelFix = true;
+    int barrelLower = 1, barrelUpper = 2;  // 0 nothing, 1 pan, 2 pick colour, 3 toggle eraser
+    float wheelZoom = 1.2f;
+    int undoSteps = 50;
+    float undoGB = 0;              // 0 = automatic (25 % of RAM, max 16 GB)
+  } prefs;
+  bool showPrefs = false;
+  int prefsPage = 0;
+  void drawPrefs();
+  void applyPrefs();
+  float uiScaleNow() const;
+  void penButton(int action, float x, float y, bool down);
+  // borderless window: draggable part of the menu bar (window coordinates), read by the hit test
+  float dragX0 = 0, dragX1 = 0, dragH = 0;
+  void drawWindowButtons();
+  // brush-size preview in the middle of the canvas
+  float lastSizeSeen = -1;
+  uint64_t sizePreviewUntil = 0;
+  void drawSizePreview();
   // unsaved-changes guard
   uint64_t savedRevision = 0;
   enum PendingAction { PA_None, PA_Quit, PA_New, PA_OpenDialog, PA_OpenPath };

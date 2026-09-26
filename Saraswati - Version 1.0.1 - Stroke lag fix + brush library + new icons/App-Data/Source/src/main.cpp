@@ -42,7 +42,12 @@ static const char* kUsage =
 
 // Neutral grey theme: every UI colour has R = G = B so the interface does not shift the
 // painter's colour perception on the canvas. Only the colour picker shows colour.
-static void setupStyle(float scale) {
+// Rebuilt from scratch whenever the display scale changes (2K <-> 4K, moving between monitors),
+// so sizes never accumulate rounding and text stays crisp (fonts are rasterised at the scale).
+void applyUiScale(float scale) {
+  if (!(scale > 0)) scale = 1.0f;
+  ImGui::GetStyle() = ImGuiStyle();
+  ImGui::StyleColorsDark();
   ImGuiStyle& st = ImGui::GetStyle();
   st.WindowRounding = 5;
   st.ChildRounding = 4;
@@ -123,10 +128,13 @@ static void setupStyle(float scale) {
   c[ImGuiCol_NavWindowingDimBg] = g(0.1f, 0.4f);
   c[ImGuiCol_ModalWindowDimBg] = g(0.05f, 0.5f);
   st.ScaleAllSizes(scale);
+  st.FontScaleDpi = scale;
+}
+
+static void loadUiFont() {
   ImFontConfig fc;
   fc.FontDataOwnedByAtlas = false;
   ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)kFontUi, int(sizeof kFontUi), 15.0f, &fc);
-  st.FontScaleDpi = scale;
 }
 
 static bool parseSize(const char* s, uint32_t& w, uint32_t& h) {
@@ -176,7 +184,7 @@ int main(int argc, char** argv) {
     else if (a == "--frames") opt.frames = atoi(next());
     else if (a == "--window") {
       uint32_t w, h;
-      if (parseSize(next(), w, h)) { opt.windowW = int(w); opt.windowH = int(h); }
+      if (parseSize(next(), w, h)) { opt.windowW = int(w); opt.windowH = int(h); opt.windowSet = true; }
     }
     else if (a == "--exit") opt.exitAfter = true;
     else if (a == "--help" || a == "-h") { printf("%s", kUsage); return 0; }
@@ -196,8 +204,12 @@ int main(int argc, char** argv) {
     SDL_Quit();
     return 1;
   }
-  SDL_Window* window = SDL_CreateWindow("Saraswati " SARASWATI_VERSION, opt.windowW, opt.windowH,
-                                        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+  // Borderless: minimise / maximise / close live in the app's own menu bar (more vertical space).
+  // Normal runs start maximised; test runs (fixed size screenshots) and --window keep a window.
+  bool testRun = opt.demo || opt.toolTest || opt.brushTest || opt.splineTest || opt.benchmark || !opt.screenshot.empty();
+  SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS;
+  if (!testRun && !opt.windowSet) wflags |= SDL_WINDOW_MAXIMIZED;
+  SDL_Window* window = SDL_CreateWindow("Saraswati " SARASWATI_VERSION, opt.windowW, opt.windowH, wflags);
   if (!window) {
     fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
     SDL_Quit();
@@ -211,9 +223,8 @@ int main(int argc, char** argv) {
             renderer.cpuEmulation ? " [CPU emulation]" : "");
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
-    float scale = SDL_GetWindowDisplayScale(window) / std::max(1.0f, SDL_GetWindowPixelDensity(window));
-    setupStyle(scale > 0 ? scale : 1.0f);
+    loadUiFont();
+    applyUiScale(SDL_GetWindowDisplayScale(window) / std::max(1.0f, SDL_GetWindowPixelDensity(window)));
     renderer.initImGui();
     {
       App app(window, renderer, opt);

@@ -405,3 +405,94 @@ void Renderer::finishAsyncRead(std::shared_ptr<AsyncRead>& r) {
   destroyImage(device, r->tile);
   r.reset();
 }
+
+// ---------------------------------------------------------------------------
+// Live previews
+
+void Renderer::clearMaskRect(VkCommandBuffer cmd, int x0, int y0, int x1, int y1) {
+  x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::min(x1, int(docW)); y1 = std::min(y1, int(docH));
+  if (x0 >= x1 || y0 >= y1) return;
+  struct { int32_t origin[2], size[2]; float p0[2], p1[2]; int32_t clear; } pc{{x0, y0}, {x1 - x0, y1 - y0}, {0, 0}, {1, 0}, 1};
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradPipe);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &slots[0].set0, 0, nullptr);
+  vkCmdPushConstants(cmd, pipeLayout, kPcStages, 0, sizeof pc, &pc);
+  vkCmdDispatch(cmd, uint32_t(pc.size[0] + 15) / 16, uint32_t(pc.size[1] + 15) / 16, 1);
+  memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+}
+
+void Renderer::previewClear() {
+  if (!strokeActive) return;
+  pendingDabs.clear();
+  pendingOffset = 0;
+  maskClearPending = true;
+}
+
+void Renderer::recordPreviewOps(VkCommandBuffer cmd) {
+  if (!strokeActive) { maskClearPending = gradPending = false; return; }
+  if (maskClearPending) {
+    clearMaskRect(cmd, sx0, sy0, sx1, sy1);
+    maskClearPending = false;
+  }
+  if (gradPending) {
+    struct { int32_t origin[2], size[2]; float p0[2], p1[2]; int32_t clear; } pc{
+        {gradR[0], gradR[1]}, {gradR[2] - gradR[0], gradR[3] - gradR[1]}, {gradP[0], gradP[1]}, {gradP[2], gradP[3]}, 0};
+    if (pc.size[0] > 0 && pc.size[1] > 0) {
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradPipe);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &slots[frameCounter % kFrames].set0, 0, nullptr);
+      vkCmdPushConstants(cmd, pipeLayout, kPcStages, 0, sizeof pc, &pc);
+      vkCmdDispatch(cmd, uint32_t(pc.size[0] + 15) / 16, uint32_t(pc.size[1] + 15) / 16, 1);
+      memoryBarrier(cmd, kCS, kRW, kCS, kRW);
+    }
+    gradPending = false;
+  }
+}
+
+void Renderer::previewGradient(float x0, float y0, float x1, float y1, int rx0, int ry0, int rx1, int ry1) {
+  if (!strokeActive) return;
+  rx0 = std::max(rx0, 0); ry0 = std::max(ry0, 0); rx1 = std::min(rx1, int(docW)); ry1 = std::min(ry1, int(docH));
+  gradP[0] = x0; gradP[1] = y0; gradP[2] = x1; gradP[3] = y1;
+  gradR[0] = rx0; gradR[1] = ry0; gradR[2] = rx1; gradR[3] = ry1;
+  gradPending = true;
+  markDirtyRect(rx0, ry0, rx1, ry1);  // the gradient overwrites the whole rect every time
+}
+
+bool Renderer::previewCoverage(int x, int y, uint32_t w, uint32_t h, const uint8_t* cov, std::string& err) {
+  if (!strokeActive) return false;
+  pendingDabs.clear();
+  pendingOffset = 0;
+  VkCommandBuffer cmd = beginOneShot();  // ordered after the frames already submitted
+  clearMaskRect(cmd, sx0, sy0, sx1, sy1);
+  endOneShot(cmd);
+  maskClearPending = false;
+  int x0 = std::max(x, 0), y0 = std::max(y, 0);
+  int x1 = std::min<int64_t>(int64_t(x) + w, docW), y1 = std::min<int64_t>(int64_t(y) + h, docH);
+  if (x0 >= x1 || y0 >= y1) return true;
+  uint32_t cw = uint32_t(x1 - x0), ch = uint32_t(y1 - y0);
+  bool ok = uploadRegion(mask.image, x0, y0, cw, ch, maskR16 ? 2 : 4, [&](uint32_t row, uint8_t* dst) {
+    const uint8_t* src = cov + (size_t(y0 - y + int(row)) * w + size_t(x0 - x));
+    if (maskR16) {
+      uint16_t* d = reinterpret_cast<uint16_t*>(dst);
+      for (uint32_t i = 0; i < cw; ++i) d[i] = uint16_t(src[i] * 257);
+    } else {
+      float* d = reinterpret_cast<float*>(dst);
+      for (uint32_t i = 0; i < cw; ++i) d[i] = src[i] / 255.0f;
+    }
+  }, err);
+  markDirtyRect(x0, y0, x1, y1);
+  return ok;
+}
+
+void Renderer::abortStroke() {
+  if (!strokeActive) return;
+  pendingDabs.clear();
+  pendingOffset = 0;
+  VkCommandBuffer cmd = beginOneShot();
+  clearMaskRect(cmd, sx0, sy0, sx1, sy1);
+  endOneShot(cmd);
+  for (uint32_t t : dirtyTiles) tileDirty[t] = 0;
+  dirtyTiles.clear();
+  undoCopied = 0;
+  releaseStrokeUndo();
+  strokeActive = strokeEnding = false;
+  maskClearPending = gradPending = false;
+}

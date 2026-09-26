@@ -70,7 +70,7 @@ struct CommitPC {
 
 enum : int {
   FLAG_STROKE = 1, FLAG_ERASER = 2, FLAG_LAYER = 4, FLAG_ABOVE_CACHE = 8, FLAG_ABOVE = 16,
-  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512
+  FLAG_INIT = 32, FLAG_WORK = 64, FLAG_ONLY_BELOW = 128, FLAG_SEL = 256, FLAG_LOCK = 512, FLAG_NOCLIP = 1024
 };
 
 static constexpr VkImageUsageFlags kLayerUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -341,7 +341,7 @@ void Renderer::createDevice(const RendererOptions& opt) {
     uint32_t t = findMemoryType(memProps, ~0u, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceSize heap = t != UINT32_MAX ? memProps.memoryHeaps[memProps.memoryTypes[t].heapIndex].size : (1ull << 30);
-    undoBudgetBytes = std::min<VkDeviceSize>(heap / 4, 16ull << 30);
+    undoBudgetBytes = undoBudgetAuto = std::min<VkDeviceSize>(heap / 4, 16ull << 30);
   }
 
   // Surface format (UNORM so pixel values go to the screen unchanged) and present modes.
@@ -1562,7 +1562,7 @@ void Renderer::pushUndo(UndoEntry&& e) {
   redoStack.clear();
   undoStack.push_back(std::move(e));
   size_t total = undoBytes();
-  while (!undoStack.empty() && (undoStack.size() > 50 || total > undoBudgetBytes)) {
+  while (!undoStack.empty() && (int(undoStack.size()) > maxUndoSteps || total > undoBudgetBytes)) {
     total -= undoStack.front().bytes;
     dropUndo(undoStack.front());
     undoStack.pop_front();
@@ -1660,7 +1660,7 @@ void Renderer::recordFrameComposite(VkCommandBuffer cmd, const FrameParams& p) {
   if (act) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 1, 1, &act->set, 0, nullptr);
     if (act->visible) flags |= FLAG_LAYER;
-    if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0);
+    if (strokeActive && act->id == strokeLayerId) flags |= FLAG_STROKE | (style.eraser ? FLAG_ERASER : 0) | (style.overlay ? FLAG_NOCLIP : 0);
     if (act->lockAlpha) flags |= FLAG_LOCK;
   }
   if (selectionActive) flags |= FLAG_SEL;
@@ -1740,6 +1740,7 @@ bool Renderer::renderFrame(const FrameParams& p) {
   FrameParams q = p;
   if (hasDocument()) {
     recordUndoOps(cmd);
+    recordPreviewOps(cmd);
     q.activeLayer = std::clamp(p.activeLayer, 0, int(layers.size()) - 1);
     recordDabs(cmd, s);
     if (timestampsSupported) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, q0 + 1);

@@ -43,6 +43,29 @@ App::App(SDL_Window* w, Renderer& r, const Options& o) : window(w), R(r), opt(o)
   userData = findUserData();
   // per-tip defaults
   brushes = builtInBrushes();
+  // borderless window: drag by the empty part of the menu bar, resize at the edges
+  SDL_SetWindowHitTest(window, [](SDL_Window* win, const SDL_Point* pt, void* data) -> SDL_HitTestResult {
+    App* a = static_cast<App*>(data);
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+    bool maximized = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) != 0;
+    const int e = 6;
+    if (!maximized) {
+      bool l = pt->x < e, r = pt->x >= w - e, t = pt->y < e, b = pt->y >= h - e;
+      if (t && l) return SDL_HITTEST_RESIZE_TOPLEFT;
+      if (t && r) return SDL_HITTEST_RESIZE_TOPRIGHT;
+      if (b && l) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+      if (b && r) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+      if (t) return SDL_HITTEST_RESIZE_TOP;
+      if (b) return SDL_HITTEST_RESIZE_BOTTOM;
+      if (l) return SDL_HITTEST_RESIZE_LEFT;
+      if (r) return SDL_HITTEST_RESIZE_RIGHT;
+    }
+    float d = a->density > 0 ? a->density : 1.0f, fs = ImGui::GetIO().DisplayFramebufferScale.x;
+    float px = pt->x * d / (fs > 0 ? fs : 1.0f), py = pt->y * d / (fs > 0 ? fs : 1.0f);
+    if (py < a->dragH && px >= a->dragX0 && px < a->dragX1 && !ImGui::IsAnyItemHovered()) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+  }, this);
   tipIndex = brushIndex("G-Pen");
   // selection undo: swap a stored region (and bbox state) with the current selection
   R.selectionSwap = [this](std::vector<uint8_t>& data, int x, int y, int w, int h, int* st) {
@@ -119,9 +142,9 @@ void App::strokeBegin(const PenSample& s, bool eraser, bool spline) {
   st.eraser = eraser || eraserToggle || b.eraser;
   if (!st.eraser) noteColorUsed();
   R.beginStroke(active, st);
-  engine.begin(s, b, strokeSeed++, spline);
+  engine.begin(s, b, strokeSeed++, spline && prefs.smoothStrokes);
   // mouse positions are whole screen pixels (pen positions are sub-pixel via Windows Ink HIMETRIC)
-  engine.setQuantization(strokeFromPen ? 0.0 : 0.5 / std::max(1e-6, view.zoom));
+  engine.setQuantization(strokeFromPen || !prefs.mousePixelFix ? 0.0 : 0.5 / std::max(1e-6, view.zoom));
 }
 
 void App::strokeAdd(const PenSample& s) {
@@ -142,7 +165,9 @@ void App::flushDabs(uint64_t inputNs) {
   if (engine.out.empty()) return;
   R.queueDabs(engine.out);
   engine.out.clear();
-  if (inputNs && !pendingInputNs) pendingInputNs = inputNs;
+  // latency is measured from when the app received the event: SDL's Windows event timestamps come
+  // from the OS message clock, which only ticks every ~15.6 ms and made the numbers jump around
+  if (inputNs && !pendingInputNs) pendingInputNs = SDL_GetTicksNS();
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +238,16 @@ void App::pointerMove(float x, float y, float pressure, bool pen, uint64_t tNs) 
     toolMove(dx, dy, sx, sy);
     return;
   }
+  if (!engine.active() && !toolDrag && (tool == ToolId::Fill || tool == ToolId::Wand)) {
+    if (ImGui::GetIO().WantCaptureMouse) {
+      if (hoverPreviewOn) cancelPreviews();
+      hoverX = hoverY = -1;
+    } else {
+      double dx, dy;
+      screenToDoc(sx, sy, dx, dy);
+      updateHover(dx, dy);
+    }
+  }
   if (engine.active() && strokeFromPen == pen) {
     double dx, dy;
     screenToDoc(sx, sy, dx, dy);
@@ -258,13 +293,17 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
     case SDLK_LEFTBRACKET: brushes[tipIndex].size = std::max(1.0f, brushes[tipIndex].size / 1.15f); break;
     case SDLK_RIGHTBRACKET: brushes[tipIndex].size = std::min(5000.0f, brushes[tipIndex].size * 1.15f); break;
     case SDLK_Z:
+      if (ctrl && hoverPreviewOn) cancelPreviews();
       if (ctrl) {
         if (xf.active) cancelTransform();  // undo while transforming = cancel the transform
         else if (shift) R.redo();
         else R.undo();
       }
       break;
-    case SDLK_Y: if (ctrl && !xf.active) R.redo(); break;
+    case SDLK_Y:
+      if (ctrl && hoverPreviewOn) cancelPreviews();
+      if (ctrl && !xf.active) R.redo();
+      break;
     case SDLK_TAB: hideUI = !hideUI; break;
     case SDLK_X: if (!ctrl) for (int c = 0; c < 3; ++c) std::swap(color[c], bgColor[c]); break;
     case SDLK_EQUALS:
@@ -274,6 +313,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
     case SDLK_KP_MINUS: zoomAt(canvasX + canvasW / 2, canvasY + canvasH / 2, 0.8); break;
     case SDLK_R: if (!ctrl) view.rotation = 0; break;
     case SDLK_N: if (ctrl) requestAction(PA_New); break;
+    case SDLK_K: if (ctrl) showPrefs = !showPrefs; break;
     case SDLK_O: if (ctrl && !saving) requestAction(PA_OpenDialog); break;
     case SDLK_I: if (ctrl && !shift && !saving && R.hasDocument()) showDialog(DlgImport); break;
     case SDLK_S:
@@ -287,6 +327,7 @@ void App::handleKey(const SDL_KeyboardEvent& k, bool down) {
 }
 
 void App::handleEvent(const SDL_Event& e) {
+  lastActivityNs = SDL_GetTicksNS();
   ImGui_ImplSDL3_ProcessEvent(&e);
   framesToRender = std::max(framesToRender, 2);
   switch (e.type) {
@@ -300,6 +341,9 @@ void App::handleEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
       density = SDL_GetWindowPixelDensity(window);
+      if (density <= 0) density = 1;
+      applyUiScale(uiScaleNow());
+      R.onResize();
       break;
     case SDL_EVENT_PEN_AXIS:
       if (e.paxis.axis == SDL_PEN_AXIS_PRESSURE) {
@@ -351,18 +395,12 @@ void App::handleEvent(const SDL_Event& e) {
     case SDL_EVENT_PEN_BUTTON_DOWN:
       // barrel buttons: lower (1) = hold to pan, upper (2) = pick colour
       if (ImGui::GetIO().WantCaptureMouse) break;
-      if (e.pbutton.button == 1) {
-        drag = Drag::Pan;
-        dragFromPen = true;
-        dragX = e.pbutton.x * density;
-        dragY = e.pbutton.y * density;
-      } else if (e.pbutton.button == 2) {
-        for (int k = 0; k < 3; ++k) pickPrev[k] = color[k];
-        R.requestPick(int(e.pbutton.x * density), int(e.pbutton.y * density));
-      }
+      penButton(e.pbutton.button == 1 ? prefs.barrelLower : e.pbutton.button == 2 ? prefs.barrelUpper : 0, e.pbutton.x,
+                e.pbutton.y, true);
       break;
     case SDL_EVENT_PEN_BUTTON_UP:
-      if (e.pbutton.button == 1 && drag == Drag::Pan && dragFromPen) drag = Drag::None;
+      penButton(e.pbutton.button == 1 ? prefs.barrelLower : e.pbutton.button == 2 ? prefs.barrelUpper : 0, e.pbutton.x,
+                e.pbutton.y, false);
       break;
     case SDL_EVENT_PEN_PROXIMITY_OUT:
       penDownPending = false;
@@ -394,7 +432,7 @@ void App::handleEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_MOUSE_WHEEL:
       if (!ImGui::GetIO().WantCaptureMouse && e.wheel.y != 0)
-        zoomAt(e.wheel.mouse_x * density, e.wheel.mouse_y * density, std::pow(1.2, e.wheel.y));
+        zoomAt(e.wheel.mouse_x * density, e.wheel.mouse_y * density, std::pow(double(prefs.wheelZoom), e.wheel.y));
       break;
     case SDL_EVENT_DROP_FILE:
       if (e.drop.data) {
@@ -685,21 +723,27 @@ void App::noteColorUsed() {
 }
 
 void App::buildDefaultLayout(unsigned int dockId) {
-  // [tools] [ canvas ............................ ] [ colour / tool settings / layers ]
+  // [tools] [navigator / tool group] [ canvas ....... ] [ colour / tool settings / layers / performance ]
   ImGui::DockBuilderRemoveNode(dockId);
   ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
   ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->WorkSize);
   ImGuiID centre = dockId;
   ImGuiID tools = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.032f, nullptr, &centre);
-  ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.21f, nullptr, &centre);
-  ImGuiID rightMid, rightBottom;
-  ImGuiID rightTop = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.38f, nullptr, &rightMid);
-  rightBottom = ImGui::DockBuilderSplitNode(rightMid, ImGuiDir_Down, 0.48f, nullptr, &rightMid);
+  ImGuiID left = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.17f, nullptr, &centre);
+  ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.22f, nullptr, &centre);
+  ImGuiID leftBottom;
+  ImGuiID leftTop = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.36f, nullptr, &leftBottom);
+  ImGuiID rightRest;
+  ImGuiID rightTop = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.33f, nullptr, &rightRest);
+  ImGuiID rightPerf = ImGui::DockBuilderSplitNode(rightRest, ImGuiDir_Down, 0.27f, nullptr, &rightRest);
+  ImGuiID rightLayers = ImGui::DockBuilderSplitNode(rightRest, ImGuiDir_Down, 0.48f, nullptr, &rightRest);
   ImGui::DockBuilderDockWindow("Tools", tools);
+  ImGui::DockBuilderDockWindow("Navigator", leftTop);
+  ImGui::DockBuilderDockWindow("Tool Group", leftBottom);
   ImGui::DockBuilderDockWindow("Colour", rightTop);
-  ImGui::DockBuilderDockWindow("Tool Settings", rightMid);
-  ImGui::DockBuilderDockWindow("Layers", rightBottom);
-  ImGui::DockBuilderDockWindow("Performance", rightBottom);  // tab next to Layers when opened
+  ImGui::DockBuilderDockWindow("Tool Settings", rightRest);
+  ImGui::DockBuilderDockWindow("Layers", rightLayers);
+  ImGui::DockBuilderDockWindow("Performance", rightPerf);
   ImGui::DockBuilderFinish(dockId);
 }
 
@@ -872,7 +916,11 @@ void App::drawPerfPanel() {
   ImGui::TextDisabled("%s", R.driverInfo.c_str());
   if (R.cpuEmulation) ImGui::TextWrapped("CPU emulation - timings are not representative.");
   ImGui::Separator();
-  ImGui::Text("FPS %.1f   CPU frame %.2f ms", ImGui::GetIO().Framerate, cpuFrameMs);
+  if (SDL_GetTicksNS() - lastActivityNs > 700000000ull && !bench.running && !R.busy())
+    ImGui::TextWrapped("Idle - the canvas redraws only when something changes (0 %% CPU); this panel refreshes "
+                       "twice a second. Numbers below are from the last real frame.");
+  else
+    ImGui::Text("FPS %.1f   CPU frame %.2f ms", ImGui::GetIO().Framerate, cpuFrameMs);
   const GpuTimings& t = R.lastTimings;
   if (R.timestampsSupported) {
     ImGui::Text("GPU  total %.2f ms", t.total);
@@ -961,7 +1009,7 @@ void App::drawNewDocDialog() {
 void App::requestAction(int a, const std::string& path) {
   pendingAction = a;
   pendingPath = path;
-  if (modified()) askUnsaved = true;
+  if (modified() && prefs.confirmUnsaved) askUnsaved = true;
   else performAction();
 }
 
@@ -998,6 +1046,231 @@ void App::drawUnsavedDialog() {
     ImGui::CloseCurrentPopup();
   }
   ImGui::EndPopup();
+}
+
+// Title and minimise / maximise / close in the app's own menu bar (the window has no OS frame).
+void App::drawWindowButtons() {
+  float h = ImGui::GetFrameHeight();
+  float bw = h * 1.6f;
+  float x0 = ImGui::GetCursorScreenPos().x + 8;
+  float right = ImGui::GetWindowPos().x + ImGui::GetWindowWidth();
+  float bx = right - bw * 3;
+  // document title, centred in the free space (the free space also drags the window)
+  std::string name = documentPath.empty() ? std::string("Untitled")
+                                          : fs::path(reinterpret_cast<const char8_t*>(documentPath.c_str())).filename().string();
+  std::string title = name + (modified() ? " *" : "") + "  -  Saraswati " SARASWATI_VERSION;
+  ImVec2 ts = ImGui::CalcTextSize(title.c_str());
+  float tx = std::max(x0, (x0 + bx - ts.x) * 0.5f);
+  if (tx + ts.x < bx - 8)
+    ImGui::GetWindowDrawList()->AddText(ImVec2(tx, ImGui::GetWindowPos().y + (h - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                        title.c_str());
+  dragX0 = x0;
+  dragX1 = bx;
+  dragH = h;
+  bool maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+  ImGui::SetCursorScreenPos(ImVec2(bx, ImGui::GetWindowPos().y));
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0);
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+  auto btn = [&](const char* id, const char* icon, bool danger) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, danger ? ImVec4(0.78f, 0.17f, 0.17f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, danger ? ImVec4(0.6f, 0.12f, 0.12f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    bool r = ImGui::Button(id, ImVec2(bw, h));
+    ImGui::PopStyleColor(3);
+    ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    drawIcon(ImGui::GetWindowDrawList(), icon, ImVec2((mn.x + mx.x) / 2, (mn.y + mx.y) / 2), h * 0.62f, ImGui::GetColorU32(ImGuiCol_Text));
+    ImGui::SameLine();
+    return r;
+  };
+  if (btn("##min", "minus", false)) SDL_MinimizeWindow(window);
+  if (btn("##max", maximized ? "copy" : "square", false)) {
+    if (maximized) SDL_RestoreWindow(window);
+    else SDL_MaximizeWindow(window);
+  }
+  if (btn("##close", "x", true)) requestAction(PA_Quit);
+  ImGui::PopStyleVar(2);
+}
+
+// Live preview of the brush size in the middle of the canvas while it is being changed.
+void App::drawSizePreview() {
+  float size = brushes[tipIndex].size;
+  uint64_t now = SDL_GetTicksNS();
+  if (lastSizeSeen >= 0 && std::abs(size - lastSizeSeen) > 1e-4f && !R.stroking() && !bench.running && opt.exitAfter == false)
+    sizePreviewUntil = now + 900000000ull;
+  lastSizeSeen = size;
+  if (now >= sizePreviewUntil || !R.hasDocument()) return;
+  float s = ImGui::GetIO().DisplayFramebufferScale.x;
+  float fade = std::min(1.0f, float(sizePreviewUntil - now) / 300000000.0f);
+  ImVec2 c((canvasX + canvasW * 0.5f) / s, (canvasY + canvasH * 0.5f) / s);
+  const BrushSettings& b = brushes[tipIndex];
+  float r = std::max(1.0f, float(size * 0.5 * view.zoom) / s);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  dl->PushClipRect(ImVec2(canvasX / s, canvasY / s), ImVec2((canvasX + canvasW) / s, (canvasY + canvasH) / s), true);
+  float ang = float(b.angle * 3.14159265 / 180.0 + view.rotation);
+  ImVec2 rad(r, std::max(1.0f, r * b.roundness));
+  dl->AddEllipseFilled(c, rad, IM_COL32(0, 0, 0, int(60 * fade)), ang);
+  dl->AddEllipse(c, ImVec2(rad.x + 1, rad.y + 1), IM_COL32(255, 255, 255, int(200 * fade)), ang, 0, 1.5f);
+  dl->AddEllipse(c, rad, IM_COL32(0, 0, 0, int(230 * fade)), ang, 0, 1.5f);
+  char t[48];
+  snprintf(t, sizeof t, "%.1f px", size);
+  ImVec2 ts = ImGui::CalcTextSize(t);
+  ImVec2 tp(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f);
+  dl->AddRectFilled(ImVec2(tp.x - 6, tp.y - 3), ImVec2(tp.x + ts.x + 6, tp.y + ts.y + 3), IM_COL32(30, 30, 30, int(200 * fade)), 4);
+  dl->AddText(tp, IM_COL32(240, 240, 240, int(255 * fade)), t);
+  dl->PopClipRect();
+}
+
+float App::uiScaleNow() const {
+  if (prefs.uiScalePct > 0) return prefs.uiScalePct / 100.0f;
+  float d = SDL_GetWindowPixelDensity(window);
+  return SDL_GetWindowDisplayScale(window) / std::max(1.0f, d > 0 ? d : 1.0f);
+}
+
+void App::applyPrefs() {
+  applyUiScale(uiScaleNow());
+  R.maxUndoSteps = prefs.undoSteps;
+  R.undoBudgetBytes = prefs.undoGB > 0 ? VkDeviceSize(double(prefs.undoGB) * (1ull << 30)) : R.undoBudgetAuto;
+}
+
+// Pen barrel buttons (actions chosen in Preferences > Pen & input).
+void App::penButton(int action, float x, float y, bool down) {
+  if (action == 1) {  // hold to pan
+    if (down && !ImGui::GetIO().WantCaptureMouse) {
+      drag = Drag::Pan;
+      dragFromPen = true;
+      dragX = x * density;
+      dragY = y * density;
+    } else if (!down && drag == Drag::Pan && dragFromPen) {
+      drag = Drag::None;
+    }
+  } else if (action == 2 && down && !ImGui::GetIO().WantCaptureMouse) {  // pick colour
+    for (int k = 0; k < 3; ++k) pickPrev[k] = color[k];
+    R.requestPick(int(x * density), int(y * density));
+  } else if (action == 3 && down) {
+    eraserToggle = !eraserToggle;
+  }
+}
+
+// Preferences window, laid out like Claude Code's settings: sections on the left, settings on
+// the right as rows of name + explanation + control.
+void App::drawPrefs() {
+  if (!showPrefs) return;
+  float sc = ImGui::GetStyle().FontScaleDpi;
+  ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowSize(ImVec2(780 * sc, 520 * sc), ImGuiCond_Appearing);
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f), ImGuiCond_Appearing,
+                          ImVec2(0.5f, 0.5f));
+  if (!ImGui::Begin("Preferences", &showPrefs, ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
+  static const char* pages[] = {"General", "Interface", "Pen & input", "Canvas", "Performance", "About"};
+  ImGui::BeginChild("nav", ImVec2(170 * sc, 0), ImGuiChildFlags_Borders);
+  for (int i = 0; i < 6; ++i)
+    if (ImGui::Selectable(pages[i], prefsPage == i, 0, ImVec2(0, ImGui::GetFrameHeight()))) prefsPage = i;
+  ImGui::EndChild();
+  ImGui::SameLine();
+  ImGui::BeginChild("page", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.25f);
+  ImGui::TextUnformatted(pages[prefsPage]);
+  ImGui::PopFont();
+  ImGui::Separator();
+  ImGui::Spacing();
+  bool changed = false;
+  auto row = [&](const char* title, const char* desc, const std::function<bool()>& control) {
+    ImGui::PushID(title);
+    float w = ImGui::GetContentRegionAvail().x;
+    float cw = std::min(230 * sc, w * 0.42f);
+    ImGui::BeginGroup();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w - cw - 20 * sc);
+    ImGui::TextUnformatted(title);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", desc);
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
+    float h = ImGui::GetItemRectSize().y;
+    ImGui::SameLine(w - cw);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.0f, (h - ImGui::GetFrameHeight()) * 0.5f));
+    ImGui::SetNextItemWidth(cw);
+    changed |= control();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PopID();
+  };
+  auto toggle = [](bool* v) { return [v] { return ImGui::Checkbox("##t", v); }; };
+  switch (prefsPage) {
+    case 0:
+      row("Start maximised", "Open the window maximised on start-up.", toggle(&prefs.startMaximized));
+      row("Show Performance panel at start", "Useful while testing: FPS, GPU time, latency and memory are visible right away.",
+          toggle(&prefs.perfAtStart));
+      row("Ask before discarding changes", "When quitting, creating or opening a document with unsaved changes.",
+          toggle(&prefs.confirmUnsaved));
+      break;
+    case 1: {
+      row("Interface size", "Automatic follows the Windows display scaling of the monitor the window is on (e.g. 150 % on a "
+                            "2K laptop, 200 % on a 4K screen) and adapts when the window moves to another monitor.",
+          [&] {
+            const char* items[] = {"Automatic", "75 %", "100 %", "125 %", "150 %", "175 %", "200 %", "250 %"};
+            const int vals[] = {0, 75, 100, 125, 150, 175, 200, 250};
+            int cur = 0;
+            for (int i = 0; i < 8; ++i) if (vals[i] == prefs.uiScalePct) cur = i;
+            if (ImGui::Combo("##s", &cur, items, 8)) { prefs.uiScalePct = vals[cur]; return true; }
+            return false;
+          });
+      row("Reset panel layout", "Put all panels back to the default arrangement.", [&] {
+        if (ImGui::Button("Reset layout", ImVec2(-FLT_MIN, 0))) { resetLayout = true; showBrush = showColor = showLayers = true; }
+        return false;
+      });
+      break;
+    }
+    case 2: {
+      row("Smooth strokes", "Draw a smooth curve through the pen samples (no stabiliser: the line still goes through every "
+                            "sample; adds one sample of delay, about 4 ms).", toggle(&prefs.smoothStrokes));
+      row("Mouse pixel correction", "Mouse positions come in whole screen pixels; zoomed out that makes steps in the line. "
+                                    "This corrects for it (pens already report sub-pixel positions).", toggle(&prefs.mousePixelFix));
+      const char* acts[] = {"Nothing", "Hold to pan", "Pick colour", "Toggle eraser"};
+      row("Pen lower button", "Action of the barrel button closer to the tip. In the Wacom settings, leave the button on its "
+                              "default function so the app receives it.", [&] { return ImGui::Combo("##l", &prefs.barrelLower, acts, 4); });
+      row("Pen upper button", "Action of the barrel button further from the tip.",
+          [&] { return ImGui::Combo("##u", &prefs.barrelUpper, acts, 4); });
+      break;
+    }
+    case 3: {
+      row("Mouse-wheel zoom step", "How much one wheel notch zooms.",
+          [&] { return ImGui::SliderFloat("##w", &prefs.wheelZoom, 1.05f, 2.0f, "x %.2f per notch"); });
+      const char* names[] = {"Immediate (lowest latency, may tear)", "Mailbox (low latency)", "FIFO (vsync)", "FIFO relaxed"};
+      row("Display mode", "How finished frames reach the screen. Mailbox is the best default for drawing.", [&] {
+        bool c = false;
+        if (ImGui::BeginCombo("##p", int(R.presentMode) < 4 ? names[R.presentMode] : "?")) {
+          for (VkPresentModeKHR m : R.presentModes)
+            if (int(m) < 3 && ImGui::Selectable(names[m], m == R.presentMode)) { R.setPresentMode(m); c = true; }
+          ImGui::EndCombo();
+        }
+        return c;
+      });
+      break;
+    }
+    case 4: {
+      row("Undo steps", "How many steps back you can go. More steps use more system memory.",
+          [&] { return ImGui::SliderInt("##us", &prefs.undoSteps, 5, 500); });
+      char auto_[64];
+      snprintf(auto_, sizeof auto_, "Automatic (%s)", fmtBytes(double(R.undoBudgetAuto)).c_str());
+      row("Undo memory limit", "Oldest steps are dropped when the undo history would use more system memory than this.", [&] {
+        return ImGui::SliderFloat("##ug", &prefs.undoGB, 0.0f, 64.0f, prefs.undoGB <= 0 ? auto_ : "%.1f GB");
+      });
+      row("GPU", R.driverInfo.c_str(), [&] { ImGui::TextWrapped("%s", R.deviceName.c_str()); return false; });
+      break;
+    }
+    default:
+      ImGui::Text("Saraswati %s", SARASWATI_VERSION);
+      ImGui::TextDisabled("A lag-free painting engine (Vulkan, SDL3, Dear ImGui).");
+      ImGui::Spacing();
+      ImGui::TextDisabled("Icons: Lucide (ISC licence). Font: Roboto (Apache 2.0).");
+      ImGui::TextDisabled("Settings file: %s", settingsPath.empty() ? "(not saved in test runs)" : settingsPath.c_str());
+      break;
+  }
+  ImGui::EndChild();
+  if (changed) applyPrefs();
+  ImGui::End();
 }
 
 void App::updateTitle() {
@@ -1062,6 +1335,8 @@ void App::drawUI() {
       if (ImGui::MenuItem("Select all", "Ctrl+A")) selectAll();
       if (ImGui::MenuItem("Deselect", "Ctrl+D", false, selActive)) deselect();
       if (ImGui::MenuItem("Invert selection", "Ctrl+Shift+I")) invertSelection();
+      ImGui::Separator();
+      if (ImGui::MenuItem("Preferences...", "Ctrl+K")) showPrefs = true;
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -1083,12 +1358,13 @@ void App::drawUI() {
       if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showBrush = showColor = showLayers = true; hideUI = false; }
       ImGui::EndMenu();
     }
+    drawWindowButtons();
     ImGui::EndMainMenuBar();
   }
   drawStatusBar();
   // Dockspace: panels snap to the edges, resize, and combine into tab stacks; the central
   // node is see-through and is the canvas.
-  ImGuiID dockId = ImGui::GetID("MainDock");
+  ImGuiID dockId = ImGui::GetID("MainDock2");
   if (resetLayout || !ImGui::DockBuilderGetNode(dockId)) { buildDefaultLayout(dockId); resetLayout = false; }
   ImGui::DockSpaceOverViewport(dockId, ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
   if (ImGuiDockNode* c = ImGui::DockBuilderGetCentralNode(dockId)) {
@@ -1106,6 +1382,7 @@ void App::drawUI() {
   }
   drawNewDocDialog();
   drawUnsavedDialog();
+  drawPrefs();
   if (!R.lastError.empty()) { error(R.lastError); R.lastError.clear(); }
   if (errorOpen) { ImGui::OpenPopup("Message"); errorOpen = false; }
   if (ImGui::BeginPopupModal("Message", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1116,6 +1393,7 @@ void App::drawUI() {
     ImGui::EndPopup();
   }
   drawToolOverlay();
+  drawSizePreview();
   {
     float rgba[4];
     if (R.takePick(rgba) && rgba[3] > 0.01f)
@@ -1129,6 +1407,7 @@ void App::drawUI() {
     float r = float(brushes[tipIndex].size * 0.5 * view.zoom) / s;
     ImVec2 c = sizeDrag ? ImVec2(sizeDragX / s, sizeDragY / s) : ImVec2(lastX / s, lastY / s);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->PushClipRect(ImVec2(canvasX / s, canvasY / s), ImVec2((canvasX + canvasW) / s, (canvasY + canvasH) / s), true);
     dl->AddCircle(c, std::max(r, 1.5f) + 1, IM_COL32(255, 255, 255, 160), 0, 1.0f);
     dl->AddCircle(c, std::max(r, 1.5f), IM_COL32(0, 0, 0, 200), 0, 1.0f);
     if (sizeDrag) {
@@ -1136,6 +1415,7 @@ void App::drawUI() {
       snprintf(t, sizeof t, "%.1f px", brushes[tipIndex].size);
       dl->AddText(ImVec2(c.x + 6, c.y + 6), IM_COL32(255, 255, 255, 255), t);
     }
+    dl->PopClipRect();
   }
 }
 
@@ -1398,7 +1678,7 @@ void App::buildBrushTest() {
 void App::tickDemo() {
   if (demoDone || demo.empty()) return;
   // wait for the GPU to finish the previous step (the last step leaves a stroke open on purpose)
-  if (demoStep > 0 && (R.busy() || flooding) && !(demoStep == demo.size())) return;
+  if (demoStep > 0 && ((R.busy() && !hoverPreviewOn) || flooding || hoverDirty) && !(demoStep == demo.size())) return;
   if (demoStep < demo.size()) {
     demo[demoStep++]();
     framesToRender = std::max(framesToRender, 3);
@@ -1421,7 +1701,9 @@ static const SDL_DialogFileFilter kSaveFilters[] = {{"Photoshop document", "psd;
 App::~App() {
   if (saveThread.joinable()) saveThread.join();
   if (flooding) floodJob.wait();
+  if (floodRead == floodCache) floodRead.reset();  // same read-back: release it once
   R.finishAsyncRead(floodRead);
+  R.finishAsyncRead(floodCache);
   if (xf.active) R.destroyFloating(xf.fl);
   R.destroyFloating(iconAtlas);
   saveSettings();
@@ -1445,6 +1727,15 @@ void App::loadSettings() {
     else if (k == "folder") { lastFolder = v; while (!lastFolder.empty() && (lastFolder.back() == '\n' || lastFolder.back() == '\r')) lastFolder.pop_back(); }
     else if (k == "fill") sscanf(v, "%f %f", &fillTol, &wandTol);
     else if (k == "perf") showPerf = atoi(v) != 0;
+    else if (k == "prefs") {
+      int a[9] = {1, 1, 1, 0, 1, 1, 1, 2, 50};
+      float wz = 1.2f, ug = 0;
+      if (sscanf(v, "%d %d %d %d %d %d %d %d %d %f %f", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6], &a[7], &a[8], &wz, &ug) >= 9) {
+        prefs.startMaximized = a[0]; prefs.perfAtStart = a[1]; prefs.confirmUnsaved = a[2]; prefs.uiScalePct = a[3];
+        prefs.smoothStrokes = a[4]; prefs.mousePixelFix = a[5]; prefs.barrelLower = a[6]; prefs.barrelUpper = a[7];
+        prefs.undoSteps = std::clamp(a[8], 5, 500); prefs.wheelZoom = std::clamp(wz, 1.05f, 2.0f); prefs.undoGB = std::max(0.0f, ug);
+      }
+    }
     else if (k == "brush2") {
       // fields ... | group | name   (built-in brushes are matched by name, others are custom)
       BrushSettings b;
@@ -1483,6 +1774,9 @@ void App::saveSettings() {
   fprintf(f, "tool %d\ncolor %f %f %f\nbg %f %f %f\nfill %f %f\nperf %d\nbrushsel %s\n",
           int(tool == ToolId::Transform ? ToolId::Brush : tool), color[0], color[1], color[2], bgColor[0], bgColor[1],
           bgColor[2], fillTol, wandTol, showPerf ? 1 : 0, brushes[tipIndex].name.c_str());
+  fprintf(f, "prefs %d %d %d %d %d %d %d %d %d %f %f\n", prefs.startMaximized, prefs.perfAtStart, prefs.confirmUnsaved,
+          prefs.uiScalePct, prefs.smoothStrokes, prefs.mousePixelFix, prefs.barrelLower, prefs.barrelUpper, prefs.undoSteps,
+          prefs.wheelZoom, prefs.undoGB);
   for (const BrushSettings& b : brushes)
     fprintf(f, "brush2 %f %f %f %f %f %f %f %d %f %f %f %f %f %d %d %f %d %f %d %f %d |%s|%s\n", b.size, b.opacity, b.flow,
             b.spacing, b.hardness, b.roundness, b.angle, b.followStroke ? 1 : 0, b.texStrength, b.texScale, b.scatter,
@@ -1757,6 +2051,9 @@ int App::run() {
     io.IniFilename = iniPath.c_str();
     settingsPath = (fs::path(userData) / "settings" / "settings.txt").string();
     loadSettings();
+    applyPrefs();
+    if (prefs.perfAtStart) showPerf = true;
+    if (!prefs.startMaximized && !opt.windowSet) SDL_RestoreWindow(window);
   }
   R.onResize();
   loadIcons();
@@ -1788,17 +2085,37 @@ int App::run() {
 
   bool wantShot = !opt.screenshot.empty();
   while (running) {
-    bool animating = bench.running || saving || flooding || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
+    bool animating = bench.running || saving || flooding || hoverDirty || (!opt.save.empty() && !savedForTest) || (!demo.empty() && !demoDone) || framesToRender > 0 || R.busy() ||
                      (wantShot && !screenshotTaken);
     SDL_Event e;
     if (!animating) {
-      if (!SDL_WaitEventTimeout(&e, 250)) continue;
-      handleEvent(e);
+      // idle: sleep until input (0 % CPU). With the Performance panel open, refresh it twice a second.
+      bool perfVisible = showPerf && !hideUI;
+      if (!SDL_WaitEventTimeout(&e, perfVisible ? 500 : 250)) {
+        if (!perfVisible) continue;
+      } else {
+        handleEvent(e);
+      }
     }
     while (SDL_PollEvent(&e)) handleEvent(e);
     if (!running) break;
     processDialogResults();
     pollFlood();
+    if (previewing && previewDirty) updateShapePreview();
+    if (hoverDirty && !flooding && hoverX >= 0) {
+      hoverDirty = false;
+      startFlood(hoverX + 0.5, hoverY + 0.5, tool == ToolId::Fill, true);
+    }
+    // the previewed fill follows colour / opacity changes
+    if (hoverPreviewOn && tool == ToolId::Fill &&
+        (hoverColor[0] != color[0] || hoverColor[1] != color[1] || hoverColor[2] != color[2] ||
+         hoverColor[3] != brushes[tipIndex].opacity))
+      showHoverPreview();
+    // the picture changed under a hover preview (e.g. undo): recompute it
+    if (hoverPreviewOn && (hoverRevision != R.revision || hoverDoc != R.docSerial) && !R.stroking()) {
+      hoverPreviewOn = false;
+      hoverDirty = true;
+    }
     tickBenchmark();
     tickDemo();
     if (!opt.save.empty() && !savedForTest && (!opt.demo || demoDone) && engine.active() && (!wantShot || screenshotTaken))
