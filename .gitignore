@@ -3,6 +3,8 @@
 **/App-Data/Source/build*/
 **/App-Data/App/*
 !**/App-Data/App/.gitkeep
+# ...except the built app inside release folders (see CLAUDE.md, Release Rule)
+!/Saraswati - Version * - Release/App-Data/App/Saraswati.exe
 # the user's own drawings and app logs never go into git
 **/User-Data/documents/*
 !**/User-Data/documents/.gitkeep

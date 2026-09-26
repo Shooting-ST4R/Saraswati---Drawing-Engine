@@ -38,6 +38,43 @@ is delivered). After that it is frozen like every other past version.
 - If unsure which folder is the current highest version, list the project directory and check before doing anything else.
 - After creating a new version, all further work in that session (further edits, building, running, testing) happens inside the newest folder.
 - Git (below) records history too, but it does **not** replace this rule.
+- `… - Release` folders (see the Release Rule) are **not** version folders: they never
+  count as the "current highest version", and nothing is ever developed in them.
+
+## Release Rule (MANDATORY — how every version is delivered)
+
+Every finished version gets a ready-to-run release folder next to its version folder,
+so the user can start the app directly after a `git pull` — no build step, no zip.
+
+1. When a version is finished (tested and handed to the user), build the Windows app from
+   that version's committed source.
+2. Create **`Saraswati - Version X.Y.Z - Release`** at the project root (same X.Y.Z as the
+   version folder it was built from; no description in the name).
+3. Put the **unzipped** portable app in it — never a zip, never the source:
+   ```
+   Saraswati - Version X.Y.Z - Release/
+     App-Data/App/Saraswati.exe       the built app (single static exe)
+     User-Data/documents/.gitkeep     empty; the user's drawings go here
+     User-Data/logs/.gitkeep          empty; benchmark reports go here
+     Run Saraswati.bat
+     Run Saraswati (CPU Vulkan).bat
+     README.md                        how to start / test, plus build info: version, source
+                                      commit, compiler, what was verified and what was not
+   ```
+4. **Commit it to git including the exe** (the only place binaries are committed) and push.
+5. Release folders are read-only once created. A fix never goes into a release folder: make
+   a new version folder (X.Y.Z+1), then a new release folder from it. Old releases stay.
+6. Before committing, the release is smoke-tested (Windows PC if available; otherwise
+   Wine + CPU Vulkan in the cloud), and any test output is removed from its `User-Data/`.
+
+How to build the exe:
+- **On Windows:** `Build Saraswati.bat` in the version folder (MSVC), then copy
+  `App-Data/App/Saraswati.exe` into the release folder.
+- **In a Linux cloud session:** cross-compile with MinGW-w64
+  (`x86_64-w64-mingw32-g++-posix`, CMake toolchain file with `CMAKE_SYSTEM_NAME Windows`,
+  `-DCMAKE_EXE_LINKER_FLAGS=-static`, and `-DSARASWATI_GLSLANG=<host-built glslang>` so the
+  shaders compile on the host), then run `Saraswati.exe --tooltest --screenshot … --exit`
+  under Wine with `VK_DRIVER_FILES` pointing at lavapipe to verify it.
 
 ## Folder Layout (inside every version folder)
 
@@ -83,7 +120,7 @@ The same Vulkan code runs on a CPU Vulkan driver for development/testing:
 
 - Repo: `https://github.com/Shooting-ST4R/Saraswati---Drawing-Engine` (private). The repo root is this project folder (all version folders + `Testing-Data/` + this file).
 - Commit identity (repo-local config): `Shooting-ST4R <153090773+Shooting-ST4R@users.noreply.github.com>`.
-- Never commit `third_party/`, `build*/`, binaries in `App-Data/App/`, or the contents of `User-Data/documents/` and `User-Data/logs/`.
+- Never commit `third_party/`, `build*/`, binaries in a version folder's `App-Data/App/`, or the contents of `User-Data/documents/` and `User-Data/logs/`. **Exception:** the exe in a `… - Release` folder is committed (see the Release Rule).
 - **Cloud sessions spend the user's cloud credits.** Ask the user before starting one, respect the budget cap they give, and work in milestones that each leave the repo in a building, committed state.
 - Never log in or handle credentials for the user; GitHub logins on the VM go through Git Credential Manager's own window.
 
